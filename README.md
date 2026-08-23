@@ -17,16 +17,8 @@
 
 ## Installation
 
-Install it as a standalone CLI tool:
-
 ```bash
-uv tool install smclipy
-```
-
-or, if you prefer pipx:
-
-```bash
-pipx install smclipy
+pip install smclipy
 ```
 
 ## Configuration
