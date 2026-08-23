@@ -10,7 +10,12 @@ DEFAULT_CONFIG = {
     "description_max_lines": 5,
 }
 CONFIG_PATH = Path(
-    os.environ.get("SMCLIPY_CONFIG", Path(__file__).parent.parent / "config.json")
+    os.environ.get(
+        "SMCLIPY_CONFIG",
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        / "smclipy"
+        / "config.json",
+    )
 )
 
 
@@ -43,6 +48,7 @@ _settings: Settings | None = None
 
 def _load_raw_config() -> dict:
     if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=4), encoding="utf-8")
         print(
             "Looks like its your first time executing the script, "

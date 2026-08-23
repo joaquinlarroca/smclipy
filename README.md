@@ -15,11 +15,25 @@
 - **FFmpeg** — required by yt-dlp to extract the audio to MP3 and embed the cover art.
 - **[Deno](https://docs.deno.com/runtime/getting_started/installation/)** — required by yt-dlp (2025.11+) to solve YouTube's JavaScript challenges during extraction. Without it, downloads may fail or have limited format availability.
 
+## Installation
+
+Install it as a standalone CLI tool:
+
+```bash
+uv tool install smclipy
+```
+
+or, if you prefer pipx:
+
+```bash
+pipx install smclipy
+```
+
 ## Configuration
 
-The script relies on a configuration file to know where to organize your files.
+smclipy relies on a configuration file to know where to organize your files.
 
-Create a config file (e.g., `config.json`, see `config.example.json`) with the following structure:
+On first run, a default config file is created at `~/.config/smclipy/config.json` and the program exits so you can edit it to your liking. To store it somewhere else, set the `SMCLIPY_CONFIG` environment variable to your preferred path (respects `$XDG_CONFIG_HOME`).
 
 ```json
 {
@@ -32,12 +46,16 @@ Create a config file (e.g., `config.json`, see `config.example.json`) with the f
 ### Config Breakdown
 
 - `name`: The master folder name (`smclipy`) that will be created inside your music folder to hold all the organized artists.
-- `path_to_music_folder`: The base directory where your music library lives (default is `./Music`).
+- `path_to_music_folder`: The base directory where your music library lives (default is `./Music`, relative to wherever you run the command from).
 - `description_max_lines`: How many lines of the video description to show while tagging (default is 5).
 
 ## Usage
 
-The project is a Python package. Run it with `uv run smclipy <command>` (or `python -m smclipy <command>` inside the virtualenv).
+Run it from your music library's parent directory:
+
+```bash
+smclipy <command>
+```
 
 ### Commands
 
@@ -67,4 +85,12 @@ After running the script and tagging a few songs, your output directory will loo
 ├──🎵 artist2-title1.mp3
 ├──🎵 artist3-title1.mp3
 └── ...
+```
+
+## Development
+
+Clone the repo and run it from the project root with uv (set `SMCLIPY_CONFIG` to use your existing `config.json`):
+
+```bash
+uv run smclipy <command>
 ```
