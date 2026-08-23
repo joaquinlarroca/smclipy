@@ -1,0 +1,5 @@
+{
+    "name": "smclipy",
+    "path_to_music_folder": "./Music",
+    "description_max_lines": 5
+}
