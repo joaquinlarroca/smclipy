@@ -1,11 +1,21 @@
 from PIL import Image
 
-from smclipy.images import crop_image_1_to_1, is_image_pillarbox
+from smclipy.images import crop_image_1_to_1, is_image_1_to_1, is_image_pillarbox
 
 
 def _write_image(path, size, color):
     Image.new("RGB", size, color).save(path)
     return path
+
+
+def test_is_image_1_to_1_square(tmp_path):
+    img = _write_image(tmp_path / "square.png", (100, 100), "red")
+    assert is_image_1_to_1(img) is True
+
+
+def test_is_image_1_to_1_non_square(tmp_path):
+    img = _write_image(tmp_path / "wide.png", (200, 100), "red")
+    assert is_image_1_to_1(img) is False
 
 
 def test_crop_image_1_to_1_produces_square(tmp_path):

@@ -10,6 +10,12 @@ def crop_image_1_to_1(path: Path) -> None:
         ImageOps.fit(image, (height, height)).save(str(path))
 
 
+def is_image_1_to_1(path: Path) -> bool:
+    with Image.open(str(path)) as image:
+        width, height = image.size
+    return width == height
+
+
 def is_image_pillarbox(path: Path) -> bool:
     std_threshold = 5
     color_diff_threshold = 10

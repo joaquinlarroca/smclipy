@@ -5,14 +5,18 @@ from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.shortcuts import choice
 
 from smclipy.config import settings
+from smclipy.downloader import get_author
 
 
-def show_yt_video_info(info_dictionary: dict[str, Any]) -> None:
+def show_video_info(info_dictionary: dict[str, Any]) -> None:
     print("---------- TITLE ----------")
     print(info_dictionary.get("title", "No title"))
-    print("---------- CHANNEL ----------")
-    print(info_dictionary.get("channel", "No channel"))
-    print(info_dictionary.get("creators", "No creators"))
+    print("---------- ARTIST/S ----------")
+    authors = get_author(info_dictionary)
+    if authors:
+        print(", ".join(authors))
+    else:
+        print("No artists")
     print("---------- DESCRIPTION ----------")
     description = str(info_dictionary.get("description", "No description"))
     description_lines = description.splitlines()[: settings().description_max_lines]
@@ -38,8 +42,21 @@ def prompt_resume() -> bool:
     return result == "Yes"
 
 
+def prompt_overwrite() -> bool:
+    result = choice(
+        message="File already exists. Overwrite?",
+        options=[("Cancel", "Cancel"), ("Overwrite", "Overwrite")],
+        default="Cancel",
+    )
+    return result == "Overwrite"
+
+
 def prompt_title(default: str) -> str:
     return prompt("Enter Title: ", default=default)
+
+
+def prompt_album(default: str) -> str:
+    return prompt("Enter Album: ", default=default)
 
 
 def prompt_authors(authors_list: list[str], default: str = "") -> str:

@@ -7,7 +7,7 @@
 - **Batch Downloading:** Queue up as many YouTube URLs as you want before processing.
 - **Interactive Tagging:** Prompts you for the track Title and Artists (has autocompletion). Both come prefilled: the title from the video's title, and the artists from the channel name, corrected against your known authors.
 - **Cover Art Cropping:** Easily crop your cover art to a perfect 1:1 square ratio during the tagging process.
-- **Clean Cleanup:** Uses a `.temp` directory during the download and tagging process to keep your main library clean.
+- **Clean Cleanup:** Uses a `.temp` directory (inside your music folder's `smclipy` subfolder) during the download and tagging process to keep your main library clean.
 
 ## Requirements
 
@@ -58,7 +58,7 @@ smclipy <command>
 
 1. **Queue URLs:** Paste your YouTube URLs one by one (enter an empty line to finish).
 2. **Tagging Flow (Per Track):**
-   - The script will download the current track to `.temp`.
+   - The script will download the current track to `Music/smclipy/.temp`.
    - If a cover image is found, you will be prompted to crop it to a 1:1 ratio.
    - Enter the **Title** of the track (prefilled with the video's title).
    - Enter the **Artist/s** (prefilled from the channel name; if it matches an author already in `authors.txt` — ignoring case and spaces — your existing spelling is kept). To tag multiple artists, separate them using a backslash `\` (e.g., `Artist 1\Artist 2\Artist 3`).
@@ -70,13 +70,16 @@ smclipy <command>
 After running the script and tagging a few songs, your output directory will look something like this:
 
 ```text
-📁 ./.temp                 <-- (Used temporarily during processing)
 📁 ./Music
-├──🎵 artist1-title1.mp3
-├──🎵 artist1-title2.mp3
-├──🎵 artist2-title1.mp3
-├──🎵 artist3-title1.mp3
-└── ...
+├── 🎵 artist1-title1.mp3
+├── 🎵 artist1-title2.mp3
+├── 🎵 artist2-title1.mp3
+├── 🎵 artist3-title1.mp3
+└── 📁 smclipy
+    ├── 📁 .temp         <-- (Used temporarily during processing)
+    ├── 📁 covers
+    ├── 📄 authors.txt
+    └── 📄 songs_info.txt
 ```
 
 ## Development

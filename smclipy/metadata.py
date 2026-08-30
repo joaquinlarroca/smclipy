@@ -2,13 +2,14 @@ import os
 from pathlib import Path
 
 from mutagen.easyid3 import EasyID3
-from mutagen.id3 import APIC, ID3, TIT2, TPE1, ID3NoHeaderError
+from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1, ID3NoHeaderError
 from mutagen.mp3 import MP3, error
 from PIL import Image as PILImage
 
 from smclipy.config import settings
 from smclipy.helpers import get_list_from_split_str, sanitize_filename
 from smclipy.storage import append_unique_lines, read_lines
+from smclipy.ui import prompt_overwrite
 
 
 def get_title(file: EasyID3) -> str:
@@ -31,19 +32,26 @@ def get_image_from_file(file: Path, save_to_path: Path, save_as: str) -> bool:
     return save_image(sanitize_filename(save_as), file_id3, save_to_path)
 
 
-def save_song_temp_to_main(file: Path, image: Path, title: str, authors: str) -> None:
+def save_song_temp_to_main(
+    file: Path, image: Path, title: str, authors: str, album: str
+) -> bool:
     authors_list = get_list_from_split_str(authors, "\\")
     first_author = authors_list[0]
     target = settings().music_folder.joinpath(
         sanitize_filename(f"{first_author}-{title}.mp3")
     )
     if target.is_file():
-        print(f"Warning: '{target.name}' already exists, overwriting")
-    _tag_file(file, title, authors_list, image)
+        print(f"Warning: '{target.name}' already exists")
+        if not prompt_overwrite():
+            return False
+    _tag_file(file, title, authors_list, album, image)
     os.replace(str(file), str(target))
+    return True
 
 
-def _tag_file(target: Path, title: str, authors: list[str], image: Path) -> None:
+def _tag_file(
+    target: Path, title: str, authors: list[str], album: str, image: Path
+) -> None:
     try:
         audio: MP3 = MP3(target, ID3=ID3)
     except error:
@@ -55,6 +63,7 @@ def _tag_file(target: Path, title: str, authors: list[str], image: Path) -> None
     assert audio.tags is not None
     audio.tags.add(TIT2(encoding=3, text=title))
     audio.tags.add(TPE1(encoding=3, text=authors))
+    audio.tags.add(TALB(encoding=3, text=album))
     _set_cover(audio, image)
     audio.save()
 

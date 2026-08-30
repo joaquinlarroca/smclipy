@@ -18,7 +18,6 @@ wheels/
 htmlcov/
 
 # smclipy
-.temp/
 Music/
 config.json
 temp.txt

@@ -22,15 +22,15 @@ CONFIG_PATH = Path(
 class Settings:
     """Resolved, per-run configuration."""
 
-    def __init__(self, raw: dict, base_dir: Path = Path(".")) -> None:
+    def __init__(self, raw: dict) -> None:
         self.raw = raw
         self.music_folder = Path(str(raw.get("path_to_music_folder", ".")))
-        self.temp_folder = base_dir.joinpath(".temp")
-        self.pending_ids_file = self.temp_folder.joinpath("pending_ids.txt")
-        self.processed_ids_file = self.temp_folder.joinpath("processed_ids.txt")
         self.script_folder = self.music_folder.joinpath(
             sanitize_filename(str(raw.get("name", "smclipy")))
         )
+        self.temp_folder = self.script_folder.joinpath(".temp")
+        self.pending_ids_file = self.temp_folder.joinpath("pending_ids.txt")
+        self.processed_ids_file = self.temp_folder.joinpath("processed_ids.txt")
         self.authors_file = self.script_folder.joinpath("authors.txt")
         self.songs_info = self.script_folder.joinpath("songs_info.txt")
         self.false_positives_file = self.script_folder.joinpath(

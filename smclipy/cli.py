@@ -1,19 +1,25 @@
 import argparse
 import sys
 
-from smclipy.config import Settings, init, settings
+from smclipy.config import CONFIG_PATH, Settings, _load_raw_config, init, settings
 from smclipy.downloader import (
     VideoDownloadError,
     download,
-    extract_video_ids,
-    get_yt_channel_author,
+    extract_urls,
+    get_album,
+    get_author,
 )
 from smclipy.helpers import (
     get_list_from_split_str,
     get_unique_items,
     resolve_known_authors,
 )
-from smclipy.images import crop_image_1_to_1, display_image, is_image_pillarbox
+from smclipy.images import (
+    crop_image_1_to_1,
+    display_image,
+    is_image_1_to_1,
+    is_image_pillarbox,
+)
 from smclipy.metadata import (
     change_cover,
     get_all_names,
@@ -25,30 +31,31 @@ from smclipy.metadata import (
 )
 from smclipy.storage import append_unique_lines, read_lines, write_lines
 from smclipy.ui import (
+    prompt_album,
     prompt_authors,
     prompt_crop,
     prompt_resume,
     prompt_title,
-    show_yt_video_info,
+    show_video_info,
 )
 
 
-def collect_video_ids() -> list[str]:
+def collect_urls() -> list[str]:
     print("Enter '' as url to finish inputting url's")
-    videos_id_list: list[str] = []
+    urls_list: list[str] = []
     while True:
         try:
             url = input("Enter your URL: ")
             if url == "":
                 break
-            videos_id_list.extend(extract_video_ids(url))
+            urls_list.extend(extract_urls(url))
         except KeyboardInterrupt:
             print("\nExiting...")
             sys.exit(0)
-    return videos_id_list
+    return urls_list
 
 
-def process_video(video_id: str, authors_list: list[str]) -> None:
+def process_video(url: str, authors_list: list[str]) -> None:
     s = settings()
     temp_mp3 = s.temp_folder.joinpath("temp.mp3")
     temp_png = s.temp_folder.joinpath("temp.png")
@@ -57,23 +64,28 @@ def process_video(video_id: str, authors_list: list[str]) -> None:
         if temp_file.is_file():
             temp_file.unlink()
 
-    info_dictionary = download(video_id)
+    info_dictionary = download(url)
     has_cover = get_image_from_file(temp_mp3, s.temp_folder, "temp.png")
 
     if has_cover:
         print("\n\n")
         display_image(temp_png)
 
-        if prompt_crop(default="False"):
+        if is_image_1_to_1(temp_png):
+            print("Already 1:1")
+        elif prompt_crop(default="False"):
             crop_image_1_to_1(temp_png)
 
     print("\n\n")
     title = prompt_title(default=str(info_dictionary.get("title", "")))
 
     print("\n\n")
-    show_yt_video_info(info_dictionary)
+    album = prompt_album(default=get_album(info_dictionary))
 
-    yt_artists = get_yt_channel_author(info_dictionary)
+    print("\n\n")
+    show_video_info(info_dictionary)
+
+    yt_artists = get_author(info_dictionary)
     authors_default = "\\".join(resolve_known_authors(yt_artists, authors_list))
     authors = prompt_authors(authors_list, default=authors_default)
 
@@ -81,10 +93,11 @@ def process_video(video_id: str, authors_list: list[str]) -> None:
     for item in get_unique_items(current_authors_list, authors_list):
         authors_list.append(item)
 
-    save_song_temp_to_main(temp_mp3, temp_png, title, authors)
-
-    append_unique_lines(s.authors_file, current_authors_list)
-    append_unique_lines(s.songs_info, [f"{title} - {', '.join(current_authors_list)}"])
+    if save_song_temp_to_main(temp_mp3, temp_png, title, authors, album):
+        append_unique_lines(s.authors_file, current_authors_list)
+        append_unique_lines(
+            s.songs_info, [f"{title} - {', '.join(current_authors_list)}"]
+        )
 
 
 def filter_processed_ids(pending_ids: list[str], processed_ids: list[str]) -> list[str]:
@@ -93,7 +106,7 @@ def filter_processed_ids(pending_ids: list[str], processed_ids: list[str]) -> li
 
 
 def _collect_new_queue(s: Settings) -> tuple[list[str], list[str]]:
-    pending_ids = collect_video_ids()
+    pending_ids = collect_urls()
     write_lines(s.pending_ids_file, pending_ids)
     write_lines(s.processed_ids_file, [])
     return pending_ids, []
@@ -177,20 +190,36 @@ def cmd_crop(args: argparse.Namespace) -> None:
     append_unique_lines(s.false_positives_file, false_positives)
 
 
+def cmd_directories(args: argparse.Namespace) -> None:
+    s = Settings(_load_raw_config())
+    print(f"Config dir:  {CONFIG_PATH.parent.resolve()}")
+    print(f"Music:       {s.music_folder.resolve()}")
+    print(f"Library:     {s.script_folder.resolve()}")
+    print(f"Temp:        {s.temp_folder.resolve()}")
+    print(f"Covers:      {s.covers_folder.resolve()}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="smclipy",
-        description="Download, tag, and organize music from YouTube.",
+        description="Download, tag, and organize music from YouTube and SoundCloud.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser(
         "download",
-        help="Batch download songs from YouTube and tag them interactively.",
+        help=(
+            "Batch download songs from YouTube or SoundCloud and tag them "
+            "interactively."
+        ),
     )
     subparsers.add_parser(
         "crop",
         help="Crop pillarboxed cover images to a 1:1 ratio and re-embed them.",
+    )
+    subparsers.add_parser(
+        "directories",
+        help="Print the directories smclipy uses.",
     )
 
     args = parser.parse_args(argv)
@@ -199,3 +228,5 @@ def main(argv: list[str] | None = None) -> None:
         cmd_download(args)
     elif args.command == "crop":
         cmd_crop(args)
+    elif args.command == "directories":
+        cmd_directories(args)

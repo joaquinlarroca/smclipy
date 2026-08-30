@@ -194,7 +194,7 @@ def test_save_song_temp_to_main_tags_then_moves(app_settings, tmp_path):
     image = tmp_path / "cover.png"
     image.write_bytes(make_png_bytes())
 
-    save_song_temp_to_main(source, image, "Song", "Artist A")
+    save_song_temp_to_main(source, image, "Song", "Artist A", "Great Album")
 
     assert not source.exists()
     target = app_settings.music_folder / "Artist A-Song.mp3"
@@ -202,19 +202,45 @@ def test_save_song_temp_to_main_tags_then_moves(app_settings, tmp_path):
     tags = EasyID3(target)
     assert tags["title"] == ["Song"]
     assert tags["artist"] == ["Artist A"]
+    assert tags["album"] == ["Great Album"]
     assert ID3(target).getall("APIC")
 
 
-def test_save_song_temp_to_main_warns_on_collision(app_settings, tmp_path, capsys):
+def test_save_song_temp_to_main_warns_on_collision(
+    app_settings, tmp_path, capsys, monkeypatch
+):
     app_settings.music_folder.mkdir(parents=True, exist_ok=True)
     source = tmp_path / "temp.mp3"
     source.write_bytes(MINIMAL_MP3)
     image = tmp_path / "cover.png"
     image.write_bytes(make_png_bytes())
 
-    save_song_temp_to_main(source, image, "Song", "Artist A")
+    monkeypatch.setattr("smclipy.metadata.prompt_overwrite", lambda: True)
+
+    save_song_temp_to_main(source, image, "Song", "Artist A", "Album")
     source = tmp_path / "temp.mp3"
     source.write_bytes(MINIMAL_MP3)
-    save_song_temp_to_main(source, image, "Song", "Artist A")
+    save_song_temp_to_main(source, image, "Song", "Artist A", "Album")
 
     assert "already exists" in capsys.readouterr().out
+
+
+def test_save_song_temp_to_main_cancel_keeps_existing(
+    app_settings, tmp_path, monkeypatch
+):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    target = app_settings.music_folder / "Artist A-Song.mp3"
+    target.write_bytes(b"original")
+
+    source = tmp_path / "temp.mp3"
+    source.write_bytes(MINIMAL_MP3)
+    image = tmp_path / "cover.png"
+    image.write_bytes(make_png_bytes())
+
+    monkeypatch.setattr("smclipy.metadata.prompt_overwrite", lambda: False)
+
+    saved = save_song_temp_to_main(source, image, "Song", "Artist A", "Album")
+
+    assert saved is False
+    assert target.read_bytes() == b"original"
+    assert source.exists()
