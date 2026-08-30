@@ -1,7 +1,7 @@
 [project]
 name = "smclipy"
-version = "0.1.0"
-description = "Simple music CLI to download, tag, and organize music from YouTube"
+version = "0.2.0"
+description = "Simple music CLI to download, tag, and organize music from YouTube and SoundCloud"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
