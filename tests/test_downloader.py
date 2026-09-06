@@ -93,6 +93,18 @@ def test_extract_urls_soundcloud_subdomain():
     ]
 
 
+def test_extract_urls_soundcloud_without_scheme():
+    assert extract_urls("soundcloud.com/artist/track text") == [
+        "https://soundcloud.com/artist/track"
+    ]
+
+
+def test_extract_urls_soundcloud_dotted_username():
+    assert extract_urls("https://soundcloud.com/artist.mc/track") == [
+        "https://soundcloud.com/artist.mc/track"
+    ]
+
+
 def test_extract_urls_soundcloud_mixes_platforms_and_dedupes():
     assert extract_urls(
         "https://soundcloud.com/artist/track https://youtu.be/abcdefghijk "
@@ -126,6 +138,14 @@ def test_get_author_falls_back_to_channel():
 
 def test_get_author_handles_creator_and_track_list():
     assert get_author({"track": ["A", "B"]}) == ["A", "B"]
+
+
+def test_get_author_ignores_string_track():
+    assert get_author({"track": "Some Song"}) == []
+
+
+def test_get_author_string_track_defers_to_uploader():
+    assert get_author({"track": "Some Song", "uploader": "UP"}) == ["UP"]
 
 
 def test_get_author_strips_whitespace():
@@ -184,4 +204,12 @@ def test_download_reraise_extractor_error(monkeypatch, app_settings):
     error = yt_dlp.utils.ExtractorError("Something went wrong, not an HTTP error")
     _patch_ytdlp(monkeypatch, FakeYDL(error=error))
     with pytest.raises(yt_dlp.utils.ExtractorError):
+        download("https://soundcloud.com/artist/track")
+
+
+def test_download_reraises_keyboard_interrupt_from_chain(monkeypatch, app_settings):
+    error = yt_dlp.utils.DownloadError("ERROR: interrupted")
+    error.__cause__ = KeyboardInterrupt()
+    _patch_ytdlp(monkeypatch, FakeYDL(error=error))
+    with pytest.raises(KeyboardInterrupt):
         download("https://soundcloud.com/artist/track")

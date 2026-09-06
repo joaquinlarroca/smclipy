@@ -37,7 +37,10 @@ class Settings:
             "cropping_tool_false_positives.txt"
         )
         self.covers_folder = self.script_folder.joinpath("covers")
-        self.description_max_lines = int(raw.get("description_max_lines", 5))
+        try:
+            self.description_max_lines = int(raw.get("description_max_lines", 5))
+        except (TypeError, ValueError):
+            self.description_max_lines = 5
 
 
 # Global settings singleton. This is a CLI: a single settings object lives for
@@ -55,7 +58,20 @@ def _load_raw_config() -> dict:
             "please modify config.json to your liking! and read the README.md file"
         )
         raise SystemExit(0)
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        print(f"Error: could not read config at {CONFIG_PATH}: {exc}")
+        print("Fix or delete the config file, then run smclipy again.")
+        raise SystemExit(1) from exc
+    if not isinstance(raw, dict):
+        print(
+            f"Error: config at {CONFIG_PATH} must contain a JSON object, "
+            f"found {type(raw).__name__}."
+        )
+        print("Fix or delete the config file, then run smclipy again.")
+        raise SystemExit(1)
+    return raw
 
 
 def setup_folders() -> None:

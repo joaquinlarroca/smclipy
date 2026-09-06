@@ -32,9 +32,9 @@ def _extract_soundcloud_urls(text: str) -> list[tuple[str, str]]:
     return cast(
         list[tuple[str, str]],
         re.findall(
-            r"https?://(?:\w+\.)?soundcloud\.com/"
+            r"(?:https?://)?(?:\w+\.)?soundcloud\.com/"
             r"(?!search|discover|you|upload|settings|messages|notifications|people)"
-            r"([\w-]+)/([\w-]+)(?:[/?#].*)?",
+            r"([\w.-]+)/([\w-]+)(?:[/?#].*)?",
             text,
         ),
     )
@@ -52,9 +52,11 @@ def extract_urls(text: str) -> list[str]:
 def get_author(info: dict[str, Any]) -> list[str]:
     artists: list[str] = []
 
-    creators = info.get("artist") or info.get("creator") or info.get("track")
+    creators = info.get("artist") or info.get("creator")
     if creators:
         artists.extend(creators if isinstance(creators, list) else [creators])
+    elif isinstance(info.get("track"), list):
+        artists.extend(info["track"])
     else:
         for key in ("uploader", "channel"):
             value = info.get(key)
@@ -62,9 +64,7 @@ def get_author(info: dict[str, Any]) -> list[str]:
                 artists.append(value.strip())
                 break
 
-    return list(
-        dict.fromkeys(a for a in artists if isinstance(a, str) and a.strip())
-    )
+    return list(dict.fromkeys(a for a in artists if isinstance(a, str) and a.strip()))
 
 
 def get_album(info: dict[str, Any]) -> str:
@@ -75,6 +75,15 @@ def get_album(info: dict[str, Any]) -> str:
 def _extract_http_status(exc: BaseException) -> int | None:
     match = re.search(r"HTTP Error (\d{3})", str(exc))
     return int(match.group(1)) if match else None
+
+
+def _contains_keyboard_interrupt(exc: BaseException) -> bool:
+    cause: BaseException | None = exc
+    while cause is not None:
+        if isinstance(cause, KeyboardInterrupt):
+            return True
+        cause = cause.__cause__
+    return False
 
 
 def _yt_dlp_opts() -> dict[str, Any]:
@@ -100,6 +109,8 @@ def download(url: str) -> dict[str, Any]:
         with yt_dlp.YoutubeDL(_yt_dlp_opts()) as ydl:  # type: ignore[attr-defined]
             return ydl.extract_info(url, download=True)
     except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
+        if _contains_keyboard_interrupt(exc):
+            raise KeyboardInterrupt from exc
         status_code = _extract_http_status(exc)
         if status_code is not None and 400 <= status_code < 500:
             raise VideoDownloadError(url, status_code) from exc

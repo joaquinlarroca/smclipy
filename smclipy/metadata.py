@@ -32,40 +32,57 @@ def get_image_from_file(file: Path, save_to_path: Path, save_as: str) -> bool:
     return save_image(sanitize_filename(save_as), file_id3, save_to_path)
 
 
+def _open_audio(file: Path) -> MP3 | None:
+    if not file.is_file():
+        return None
+    try:
+        audio: MP3 = MP3(file, ID3=ID3)
+    except (error, ID3NoHeaderError, OSError):
+        try:
+            audio = MP3(file)
+        except (error, OSError):
+            return None
+    if audio.tags is None:
+        audio.add_tags()
+    return audio
+
+
 def save_song_temp_to_main(
     file: Path, image: Path, title: str, authors: str, album: str
 ) -> bool:
     authors_list = get_list_from_split_str(authors, "\\")
-    first_author = authors_list[0]
-    target = settings().music_folder.joinpath(
-        sanitize_filename(f"{first_author}-{title}.mp3")
-    )
+    if not authors_list:
+        print("Warning: no artists provided, skipping save")
+        return False
+    target_name = sanitize_filename(f"{authors_list[0]}-{title}.mp3")
+    if not target_name:
+        print("Warning: artist/title produced an invalid filename, skipping save")
+        return False
+    target = settings().music_folder.joinpath(target_name)
     if target.is_file():
         print(f"Warning: '{target.name}' already exists")
         if not prompt_overwrite():
             return False
-    _tag_file(file, title, authors_list, album, image)
+    if not _tag_file(file, title, authors_list, album, image):
+        return False
     os.replace(str(file), str(target))
     return True
 
 
 def _tag_file(
     target: Path, title: str, authors: list[str], album: str, image: Path
-) -> None:
-    try:
-        audio: MP3 = MP3(target, ID3=ID3)
-    except error:
-        audio = MP3(target)
-        audio.add_tags()
-
-    if audio.tags is None:
-        audio.add_tags()
+) -> bool:
+    audio = _open_audio(target)
+    if audio is None:
+        print(f"Warning: could not read '{target.name}', skipping save")
+        return False
     assert audio.tags is not None
     audio.tags.add(TIT2(encoding=3, text=title))
     audio.tags.add(TPE1(encoding=3, text=authors))
     audio.tags.add(TALB(encoding=3, text=album))
     _set_cover(audio, image)
     audio.save()
+    return True
 
 
 def _get_image_mime(image: Path) -> str:
@@ -92,13 +109,24 @@ def _set_cover(audio: MP3, image: Path) -> None:
 
 
 def change_cover(image: Path, file: Path) -> None:
-    try:
-        audio: MP3 = MP3(file, ID3=ID3)
-    except (error, ID3NoHeaderError):
-        audio = MP3(file)
-        audio.add_tags()
+    audio = _open_audio(file)
+    if audio is None:
+        print(f"Warning: could not read '{file.name}', skipping cover re-embed")
+        return
     _set_cover(audio, image)
     audio.save()
+
+
+COVER_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def _mime_to_ext(mime: str) -> str:
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }.get(mime, ".png")
 
 
 def save_all_covers() -> None:
@@ -112,8 +140,10 @@ def save_all_covers() -> None:
             continue
         title = get_title(file_easyid3)
         artist = get_artists(file_easyid3)[0]
+        apic_key = next((key for key in file_id3 if key.startswith("APIC")), None)
+        ext = _mime_to_ext(file_id3[apic_key].mime) if apic_key else ".png"
         save_image(
-            sanitize_filename(f"{artist}-{title}.png"),
+            sanitize_filename(f"{artist}-{title}") + ext,
             file_id3,
             settings().covers_folder,
         )
@@ -151,16 +181,34 @@ def save_artist(song_file: EasyID3) -> None:
 
 
 def save_image(name_as: str, song_file: ID3, path: Path) -> bool:
-    cur_path = path.joinpath(name_as)
-    if cur_path.is_file():
-        return False
+    stem = Path(name_as).stem
     apic_key = next((key for key in song_file if key.startswith("APIC")), None)
     if not apic_key:
-        print(f"Couldn't find '{name_as.replace('.png', '')}' cover")
+        print(f"Couldn't find '{stem}' cover")
         return False
     artwork = song_file[apic_key].data
+    target = path.joinpath(name_as)
+    existing = next(
+        (
+            path.joinpath(f"{stem}{ext}")
+            for ext in COVER_EXTENSIONS
+            if path.joinpath(f"{stem}{ext}").is_file()
+        ),
+        None,
+    )
+    if existing is not None:
+        if existing == target:
+            if existing.read_bytes() == artwork:
+                return False
+            target.write_bytes(artwork)
+            print(f"Updated '{target.name}'")
+            return True
+        target.write_bytes(artwork)
+        existing.unlink()
+        print(f"Fixed '{existing.name}' -> '{target.name}'")
+        return True
     print(f"Saving '{name_as}'")
-    cur_path.write_bytes(artwork)
+    target.write_bytes(artwork)
     return True
 
 

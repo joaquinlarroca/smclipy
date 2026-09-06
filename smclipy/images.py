@@ -19,9 +19,16 @@ def is_image_1_to_1(path: Path) -> bool:
 def is_image_pillarbox(path: Path) -> bool:
     std_threshold = 5
     color_diff_threshold = 10
+    max_analysis_width = 1024
     with Image.open(str(path)) as image:
         img_rgb = image.convert("RGB")
         width, height = img_rgb.size
+        if width > max_analysis_width:
+            new_height = round(height * max_analysis_width / width)
+            img_rgb = img_rgb.resize(
+                (max_analysis_width, new_height), Image.Resampling.BILINEAR
+            )
+            width, height = img_rgb.size
 
     if height == width:
         return False

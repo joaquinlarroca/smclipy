@@ -48,3 +48,13 @@ def test_is_image_pillarbox_false_for_gradient_edges(tmp_path):
             picture.putpixel((x, y), (y, 0, 0))
     picture.save(img)
     assert is_image_pillarbox(img) is False
+
+
+def test_is_image_pillarbox_wide_image_detects_bars(tmp_path):
+    img = tmp_path / "wide.png"
+    picture = Image.new("RGB", (2000, 1000), "black")
+    for x in range(600, 1400):
+        for y in range(1000):
+            picture.putpixel((x, y), (255, 0, 0))
+    picture.save(img)
+    assert is_image_pillarbox(img) is True

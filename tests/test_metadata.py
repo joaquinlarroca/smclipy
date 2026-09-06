@@ -7,7 +7,10 @@ from PIL import Image
 
 from smclipy.metadata import (
     _get_image_mime,
+    _mime_to_ext,
+    _open_audio,
     _set_cover,
+    _tag_file,
     get_artists,
     get_image_from_file,
     get_title,
@@ -81,15 +84,15 @@ def test_save_image_writes_artwork(app_settings, tmp_path):
     assert (tmp_path / "artist-title.png").read_bytes() == b"image-bytes"
 
 
-def test_save_image_skips_existing(app_settings, tmp_path):
+def test_save_image_updates_existing_cover_when_changed(app_settings, tmp_path):
     class FakeArt:
         data = b"image-bytes"
 
     song_file = {"APIC:FrontCover": FakeArt()}
     target = tmp_path / "artist-title.png"
     target.write_bytes(b"old")
-    assert save_image("artist-title.png", song_file, tmp_path) is False
-    assert target.read_bytes() == b"old"
+    assert save_image("artist-title.png", song_file, tmp_path) is True
+    assert target.read_bytes() == b"image-bytes"
 
 
 def test_save_image_missing_cover(app_settings, tmp_path):
@@ -244,3 +247,95 @@ def test_save_song_temp_to_main_cancel_keeps_existing(
     assert saved is False
     assert target.read_bytes() == b"original"
     assert source.exists()
+
+
+def test_save_song_temp_to_main_empty_authors_skips(app_settings, tmp_path, capsys):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    source = tmp_path / "temp.mp3"
+    source.write_bytes(MINIMAL_MP3)
+    image = tmp_path / "cover.png"
+    image.write_bytes(make_png_bytes())
+
+    saved = save_song_temp_to_main(source, image, "Song", "   ", "Album")
+
+    assert saved is False
+    assert source.exists()
+    assert "no artists" in capsys.readouterr().out
+
+
+def test_save_song_temp_to_main_missing_file_skips(app_settings, tmp_path, capsys):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    image = tmp_path / "cover.png"
+    image.write_bytes(make_png_bytes())
+
+    saved = save_song_temp_to_main(tmp_path / "missing.mp3", image, "Song", "A", "Al")
+
+    assert saved is False
+    assert not (app_settings.music_folder / "A-Song.mp3").exists()
+
+
+def test_open_audio_missing_returns_none(tmp_path):
+    assert _open_audio(tmp_path / "missing.mp3") is None
+
+
+def test_open_audio_garbage_returns_none(tmp_path):
+    bad = tmp_path / "bad.mp3"
+    bad.write_bytes(b"not an mp3 at all")
+    assert _open_audio(bad) is None
+
+
+def test_tag_file_garbage_returns_false(tmp_path, capsys):
+    bad = tmp_path / "bad.mp3"
+    bad.write_bytes(b"not an mp3 at all")
+    assert _tag_file(bad, "Song", ["Artist"], "Album", tmp_path / "nope.png") is False
+
+
+def test_mime_to_ext_mapping():
+    assert _mime_to_ext("image/jpeg") == ".jpg"
+    assert _mime_to_ext("image/png") == ".png"
+    assert _mime_to_ext("image/webp") == ".webp"
+    assert _mime_to_ext("image/gif") == ".gif"
+    assert _mime_to_ext("application/octet-stream") == ".png"
+
+
+def test_save_all_covers_uses_real_format_extension(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    app_settings.covers_folder.mkdir(parents=True, exist_ok=True)
+    tagged = music / "tagged.mp3"
+    write_tagged_mp3(tagged, title="Song", artist="Artist A")
+    img = ID3(tagged)
+    img.add(
+        APIC(
+            encoding=3,
+            mime="image/jpeg",
+            type=3,
+            desc="Cover",
+            data=make_jpeg_bytes(),
+        )
+    )
+    img.save()
+    save_all_covers()
+    assert (app_settings.covers_folder / "Artist A-Song.jpg").is_file()
+    assert not (app_settings.covers_folder / "Artist A-Song.png").exists()
+
+
+def test_save_image_relabels_mislabeled_existing_cover(app_settings, tmp_path):
+    class FakeArt:
+        data = b"image-bytes"
+
+    song_file = {"APIC:FrontCover": FakeArt()}
+    (tmp_path / "artist-title.jpg").write_bytes(b"old")
+    assert save_image("artist-title.png", song_file, tmp_path) is True
+    assert not (tmp_path / "artist-title.jpg").exists()
+    assert (tmp_path / "artist-title.png").read_bytes() == b"image-bytes"
+
+
+def test_save_image_leaves_matching_existing_cover(app_settings, tmp_path):
+    class FakeArt:
+        data = b"image-bytes"
+
+    song_file = {"APIC:FrontCover": FakeArt()}
+    (tmp_path / "artist-title.png").write_bytes(b"image-bytes")
+    assert save_image("artist-title.png", song_file, tmp_path) is False
+    assert (tmp_path / "artist-title.png").read_bytes() == b"image-bytes"
