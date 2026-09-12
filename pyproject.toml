@@ -36,13 +36,38 @@ packages = ["smclipy"]
 target-version = "py312"
 line-length = 88
 
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
 
 [tool.mypy]
 python_version = "3.12"
-files = ["smclipy"]
+files = ["smclipy", "tests"]
+strict = true
 
 [[tool.mypy.overrides]]
-module = ["yt_dlp.*", "climage.*"]
+module = ["smclipy", "smclipy.*"]
+disallow_untyped_calls = false
+
+[[tool.mypy.overrides]]
+module = ["yt_dlp.*", "climage.*", "mutagen.*"]
 ignore_missing_imports = true
+no_implicit_reexport = false
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+check_untyped_defs = false
+disallow_any_generics = false
+disallow_incomplete_defs = false
+disallow_subclassing_any = false
+disallow_untyped_calls = false
+disallow_untyped_decorators = false
+disallow_untyped_defs = false
+no_implicit_reexport = false
+strict_equality = false
+warn_return_any = false
+warn_unused_ignores = false

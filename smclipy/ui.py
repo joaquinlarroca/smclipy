@@ -24,31 +24,40 @@ def show_video_info(info_dictionary: dict[str, Any]) -> None:
     print("")
 
 
-def prompt_crop(default: str = "False") -> bool:
-    result = choice(
-        message="Crop cover to 1:1?",
-        options=[("False", "False"), ("True", "True")],
-        default=default,
+def prompt_crop(default: bool = False) -> bool:
+    return (
+        choice(
+            message="Crop cover to 1:1?",
+            options=[("Yes", "Yes"), ("No", "No")],
+            default="Yes" if default else "No",
+        )
+        == "Yes"
     )
-    return result == "True"
 
 
 def prompt_resume() -> bool:
-    result = choice(
-        message="Found an interrupted download. Resume from where it stopped?",
-        options=[("Yes", "Yes"), ("No", "No")],
-        default="Yes",
+    return (
+        choice(
+            message="Found an interrupted download. Resume from where it stopped?",
+            options=[("Yes", "Yes"), ("No", "No")],
+            default="Yes",
+        )
+        == "Yes"
     )
-    return result == "Yes"
 
 
 def prompt_overwrite() -> bool:
-    result = choice(
-        message="File already exists. Overwrite?",
-        options=[("Cancel", "Cancel"), ("Overwrite", "Overwrite")],
-        default="Cancel",
+    return (
+        choice(
+            message="File already exists. Overwrite it?",
+            options=[
+                ("No (keep existing)", "No (keep existing)"),
+                ("Yes (overwrite)", "Yes (overwrite)"),
+            ],
+            default="No (keep existing)",
+        )
+        == "Yes (overwrite)"
     )
-    return result == "Overwrite"
 
 
 def prompt_title(default: str) -> str:

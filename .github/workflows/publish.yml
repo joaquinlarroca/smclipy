@@ -6,34 +6,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  checks-and-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Lint
-        run: uv run ruff check
-
-      - name: Typecheck
-        run: uv run mypy
-
-      - name: Test
-        run: uv run pytest
-
-      - name: Build distributions
-        run: uv build
-
-      - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
+  checks:
+    uses: ./.github/workflows/checks.yml
 
   publish-testpypi:
-    needs: checks-and-build
+    needs: checks
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
@@ -55,7 +32,7 @@ jobs:
           --check-url https://test.pypi.org/simple/
 
   publish-pypi:
-    needs: checks-and-build
+    needs: checks
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions:

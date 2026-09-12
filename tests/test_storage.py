@@ -49,3 +49,10 @@ def test_write_lines_creates_missing_dirs(tmp_path):
     path = tmp_path / "nested" / "data.txt"
     write_lines(path, ["A"])
     assert read_lines(path) == ["A"]
+
+
+def test_write_lines_leaves_no_tmp_file_behind(tmp_path):
+    path = tmp_path / "data.txt"
+    write_lines(path, ["A", "B"])
+    assert read_lines(path) == ["A", "B"]
+    assert list(tmp_path.glob("*")) == [path]

@@ -1,4 +1,7 @@
+import os
 from pathlib import Path
+
+_seen_cache: dict[Path, set[str]] = {}
 
 
 def read_lines(path: Path) -> list[str]:
@@ -10,8 +13,16 @@ def read_lines(path: Path) -> list[str]:
         return []
 
 
+def _cached_lines(path: Path) -> set[str]:
+    known = _seen_cache.get(path)
+    if known is None:
+        known = set(read_lines(path))
+        _seen_cache[path] = known
+    return known
+
+
 def append_unique_lines(path: Path, lines: list[str]) -> None:
-    existing = set(read_lines(path))
+    existing = _cached_lines(path)
     new_lines: list[str] = []
     for line in lines:
         stripped = line.strip()
@@ -29,4 +40,8 @@ def append_unique_lines(path: Path, lines: list[str]) -> None:
 def write_lines(path: Path, lines: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     cleaned = [line.strip() for line in lines if line.strip()]
-    path.write_text("\n".join(cleaned) + ("\n" if cleaned else ""), encoding="utf-8")
+    content = "\n".join(cleaned) + ("\n" if cleaned else "")
+    temp_path = path.with_name(f".{path.name}.tmp")
+    temp_path.write_text(content, encoding="utf-8")
+    os.replace(temp_path, path)
+    _seen_cache[path] = set(cleaned)

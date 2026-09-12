@@ -1,10 +1,12 @@
+import hashlib
 import re
 from typing import Any, cast
 
-import yt_dlp
+import yt_dlp as yt_dlp
 import yt_dlp.utils
 
 from smclipy.config import settings
+from smclipy.helpers import sanitize_filename
 
 
 class VideoDownloadError(Exception):
@@ -16,28 +18,34 @@ class VideoDownloadError(Exception):
         self.status_code = status_code
 
 
+_YOUTUBE_VIDEO_ID_RE = re.compile(
+    r"(?:"
+    r"(?:https?://)?(?:www\.|m\.|music\.)?youtube\.com/"
+    r"(?:watch\?(?:.*&)?v=|shorts/|embed/|live/)"
+    r"|(?:https?://)?youtu\.be/"
+    r")([a-zA-Z0-9_-]{11})(?![\w-])"
+)
+
+
 def _extract_youtube_urls(text: str) -> list[str]:
-    video_ids = re.findall(
-        r"(?:"
-        r"(?:https?://)?(?:www\.|m\.|music\.)?youtube\.com/"
-        r"(?:watch\?(?:.*&)?v=|shorts/|embed/|live/)"
-        r"|(?:https?://)?youtu\.be/"
-        r")([a-zA-Z0-9_-]{11})",
-        text,
-    )
+    video_ids = _YOUTUBE_VIDEO_ID_RE.findall(text)
     return [f"https://www.youtube.com/watch?v={video_id}" for video_id in video_ids]
 
 
+_FORBIDDEN_SOUNDCLOUD_SEGMENTS = (
+    "search|discover|you|upload|settings|messages|notifications|people"
+    "|sets|tracks|likes|albums|playlists|followers|following|comments|stream"
+)
+
+_SOUNDCLOUD_URL_RE = re.compile(
+    rf"(?:https?://)?(?:\w+\.)?soundcloud\.com/"
+    rf"(?!{_FORBIDDEN_SOUNDCLOUD_SEGMENTS})([\w.-]+)/"
+    rf"(?!{_FORBIDDEN_SOUNDCLOUD_SEGMENTS})([\w-]+)(?:[/?#].*)?"
+)
+
+
 def _extract_soundcloud_urls(text: str) -> list[tuple[str, str]]:
-    return cast(
-        list[tuple[str, str]],
-        re.findall(
-            r"(?:https?://)?(?:\w+\.)?soundcloud\.com/"
-            r"(?!search|discover|you|upload|settings|messages|notifications|people)"
-            r"([\w.-]+)/([\w-]+)(?:[/?#].*)?",
-            text,
-        ),
-    )
+    return cast(list[tuple[str, str]], _SOUNDCLOUD_URL_RE.findall(text))
 
 
 def extract_urls(text: str) -> list[str]:
@@ -47,6 +55,18 @@ def extract_urls(text: str) -> list[str]:
         for user, track in _extract_soundcloud_urls(text)
     ]
     return list(dict.fromkeys(youtube_urls + soundcloud_urls))
+
+
+def temp_stem(url: str) -> str:
+    video_ids = _YOUTUBE_VIDEO_ID_RE.findall(url)
+    if video_ids:
+        return f"yt-{video_ids[0]}"
+    soundcloud_urls = _extract_soundcloud_urls(url)
+    if soundcloud_urls:
+        user, track = soundcloud_urls[0]
+        return sanitize_filename(f"sc-{user}-{track}")
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+    return f"tmp-{digest}"
 
 
 def get_author(info: dict[str, Any]) -> list[str]:
@@ -86,11 +106,11 @@ def _contains_keyboard_interrupt(exc: BaseException) -> bool:
     return False
 
 
-def _yt_dlp_opts() -> dict[str, Any]:
+def _yt_dlp_opts(stem: str) -> dict[str, Any]:
     return {
         "format": "bestaudio/best",
         "writethumbnail": True,
-        "outtmpl": str(settings().temp_folder.joinpath("temp.%(ext)s")),
+        "outtmpl": str(settings().temp_folder.joinpath(f"{stem}.%(ext)s")),
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -104,10 +124,10 @@ def _yt_dlp_opts() -> dict[str, Any]:
     }
 
 
-def download(url: str) -> dict[str, Any]:
+def download(url: str, stem: str = "temp") -> dict[str, Any]:
     try:
-        with yt_dlp.YoutubeDL(_yt_dlp_opts()) as ydl:  # type: ignore[attr-defined]
-            return ydl.extract_info(url, download=True)
+        with yt_dlp.YoutubeDL(_yt_dlp_opts(stem)) as ydl:
+            return cast(dict[str, Any], ydl.extract_info(url, download=True))
     except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError) as exc:
         if _contains_keyboard_interrupt(exc):
             raise KeyboardInterrupt from exc

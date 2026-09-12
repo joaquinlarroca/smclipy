@@ -115,8 +115,61 @@ def test_extract_urls_soundcloud_mixes_platforms_and_dedupes():
     ]
 
 
+def test_extract_urls_youtube_ignores_longer_ids():
+    assert extract_urls("https://youtu.be/abcdefghijkl") == []
+    assert extract_urls("https://www.youtube.com/watch?v=abcdefghijkl") == []
+
+
 def test_extract_urls_soundcloud_ignores_non_track_paths():
     assert extract_urls("https://soundcloud.com/search?q=foo") == []
+
+
+def test_extract_urls_soundcloud_ignores_page_segments():
+    assert (
+        extract_urls(
+            "https://soundcloud.com/artist/tracks https://soundcloud.com/artist/sets "
+            "https://soundcloud.com/artist/likes https://soundcloud.com/artist/playlists"
+        )
+        == []
+    )
+
+
+def test_extract_urls_soundcloud_still_extracts_track_named_tracks():
+    assert extract_urls("https://soundcloud.com/artist/song") == [
+        "https://soundcloud.com/artist/song"
+    ]
+
+
+def test_temp_stem_youtube():
+    assert downloader.temp_stem("https://youtu.be/abcdefghijk") == "yt-abcdefghijk"
+
+
+def test_temp_stem_soundcloud():
+    assert (
+        downloader.temp_stem("https://soundcloud.com/user-1/my-song")
+        == "sc-user-1-my-song"
+    )
+
+
+def test_temp_stem_unknown_url_is_hashed():
+    assert downloader.temp_stem("not a url") == downloader.temp_stem("not a url")
+    assert downloader.temp_stem("not a url").startswith("tmp-")
+
+
+def test_download_uses_stem_in_outtmpl(monkeypatch, app_settings):
+    captured = {}
+
+    def fake_ydl(opts):
+        captured["opts"] = opts
+        return FakeYDL()
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", fake_ydl)
+
+    download("https://youtu.be/abcdefghijk", "yt-abcdefghijk")
+
+    assert captured["opts"]["outtmpl"] == str(
+        app_settings.temp_folder.joinpath("yt-abcdefghijk.%(ext)s")
+    )
 
 
 def test_get_author_prefers_artist():

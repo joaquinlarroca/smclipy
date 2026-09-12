@@ -1,6 +1,7 @@
 import argparse
 import sys
 from contextlib import suppress
+from pathlib import Path
 
 from smclipy import __version__
 from smclipy.config import CONFIG_PATH, Settings, _load_raw_config, init, settings
@@ -10,6 +11,7 @@ from smclipy.downloader import (
     extract_urls,
     get_album,
     get_author,
+    temp_stem,
 )
 from smclipy.helpers import (
     get_list_from_split_str,
@@ -24,13 +26,13 @@ from smclipy.images import (
 )
 from smclipy.metadata import (
     COVER_EXTENSIONS,
+    SaveResult,
     change_cover,
     get_all_names,
     get_image_from_file,
-    save_all_authors,
     save_all_covers,
-    save_all_songs_info,
     save_song_temp_to_main,
+    scan_library,
 )
 from smclipy.storage import append_unique_lines, read_lines, write_lines
 from smclipy.ui import (
@@ -43,75 +45,82 @@ from smclipy.ui import (
 )
 
 
-def collect_urls() -> list[str]:
-    print("Enter '' as url to finish inputting url's")
+def collect_urls(s: Settings) -> list[str]:
+    print("Enter '' as url to finish inputting urls")
     urls_list: list[str] = []
     while True:
         try:
             url = input("Enter your URL: ")
         except (KeyboardInterrupt, EOFError):
-            print("\nExiting...")
-            sys.exit(0)
+            print("\nInterrupted while collecting URLs...")
+            if urls_list:
+                write_lines(s.pending_ids_file, urls_list)
+                write_lines(s.processed_ids_file, [])
+                print(
+                    f"Saved partial queue of {len(urls_list)} url/s for a later resume."
+                )
+            raise SystemExit(130) from None
         if url == "":
             break
         extracted_urls = extract_urls(url)
         if not extracted_urls:
             print(f"Warning: no recognizable video URLs found in '{url}'")
         else:
-            urls_list.extend(extracted_urls)
+            urls_list.extend(url for url in extracted_urls if url not in urls_list)
     return urls_list
 
 
-def process_video(url: str, authors_list: list[str]) -> bool:
+def process_video(url: str, authors_list: list[str]) -> SaveResult:
     s = settings()
-    temp_mp3 = s.temp_folder.joinpath("temp.mp3")
-    temp_png = s.temp_folder.joinpath("temp.png")
+    stem = temp_stem(url)
+    temp_mp3 = s.temp_folder.joinpath(f"{stem}.mp3")
 
     _cleanup_temp_files(s)
 
-    info_dictionary = download(url)
-    has_cover = get_image_from_file(temp_mp3, s.temp_folder, "temp.png")
-
-    if has_cover:
-        print("\n\n")
-        display_image(temp_png)
-
-        if is_image_1_to_1(temp_png):
-            print("Already 1:1")
-        elif prompt_crop(default="False"):
-            crop_image_1_to_1(temp_png)
+    info_dictionary = download(url, stem)
+    cover_path = get_image_from_file(temp_mp3, s.temp_folder, stem)
 
     print("\n\n")
-    title = prompt_title(default=str(info_dictionary.get("title", "")))
+    show_video_info(info_dictionary)
+
+    if cover_path:
+        print("\n\n")
+        display_image(cover_path)
+
+        if is_image_1_to_1(cover_path):
+            print("Already 1:1")
+        elif prompt_crop(default=False):
+            crop_image_1_to_1(cover_path)
+
+    print("\n\n")
+    default_title = str(info_dictionary.get("title", "")).strip()
+    title = prompt_title(default=default_title)
     while not title.strip():
         print("Title cannot be empty.")
-        title = prompt_title(default="")
+        title = prompt_title(default=default_title)
     title = title.strip()
 
     print("\n\n")
     album = prompt_album(default=get_album(info_dictionary))
-
-    print("\n\n")
-    show_video_info(info_dictionary)
 
     yt_artists = get_author(info_dictionary)
     authors_default = "\\".join(resolve_known_authors(yt_artists, authors_list))
     authors = prompt_authors(authors_list, default=authors_default)
     while not get_list_from_split_str(authors, "\\"):
         print("At least one artist is required.")
-        authors = prompt_authors(authors_list, default="")
+        authors = prompt_authors(authors_list, default=authors_default)
 
     current_authors_list = get_list_from_split_str(authors, "\\")
     for item in get_unique_items(current_authors_list, authors_list):
         authors_list.append(item)
 
-    if save_song_temp_to_main(temp_mp3, temp_png, title, authors, album):
+    result = save_song_temp_to_main(temp_mp3, cover_path, title, authors, album)
+    if result is SaveResult.SAVED:
         append_unique_lines(s.authors_file, current_authors_list)
         append_unique_lines(
             s.songs_info, [f"{title} - {', '.join(current_authors_list)}"]
         )
-        return True
-    return False
+    return result
 
 
 def filter_processed_ids(pending_ids: list[str], processed_ids: list[str]) -> list[str]:
@@ -119,49 +128,51 @@ def filter_processed_ids(pending_ids: list[str], processed_ids: list[str]) -> li
     return [video_id for video_id in pending_ids if video_id not in processed_set]
 
 
-def _collect_new_queue(s: Settings) -> tuple[list[str], list[str]]:
-    pending_ids = collect_urls()
+def _collect_new_queue(s: Settings) -> list[str]:
+    pending_ids = collect_urls(s)
     write_lines(s.pending_ids_file, pending_ids)
     write_lines(s.processed_ids_file, [])
-    return pending_ids, []
+    return pending_ids
 
 
 def _cleanup_temp_files(s: Settings) -> None:
     temp_folder = s.temp_folder
     if not temp_folder.is_dir():
         return
-    for temp_file in temp_folder.glob("temp.*"):
-        with suppress(OSError):
-            temp_file.unlink()
+    for temp_file in temp_folder.glob("*"):
+        name = temp_file.name
+        if name.startswith(("temp.", "yt-", "sc-", "tmp-")):
+            with suppress(OSError):
+                temp_file.unlink()
 
 
-def cmd_download(args: argparse.Namespace) -> None:
+def cmd_download(_args: argparse.Namespace) -> None:
     s = init()
 
     print("Scanning music files...")
-    save_all_authors()
-    save_all_songs_info()
+    scan_library()
 
     print("Fetching all authors names...")
     authors_list: list[str] = get_all_names()
 
     pending_ids = read_lines(s.pending_ids_file)
-    processed_ids = read_lines(s.processed_ids_file)
-    remaining_ids = filter_processed_ids(pending_ids, processed_ids)
+    remaining_ids = filter_processed_ids(pending_ids, read_lines(s.processed_ids_file))
 
     if remaining_ids and prompt_resume():
-        pending_ids, processed_ids = remaining_ids, []
+        pending_ids = remaining_ids
         write_lines(s.pending_ids_file, pending_ids)
         write_lines(s.processed_ids_file, [])
     else:
-        pending_ids, processed_ids = _collect_new_queue(s)
+        pending_ids = _collect_new_queue(s)
 
     print(f"Preparing to download {len(pending_ids)} vid/s")
     skipped_ids: list[str] = []
     try:
-        for video_id in pending_ids:
+        total = len(pending_ids)
+        for index, video_id in enumerate(pending_ids, start=1):
+            print(f"\n[{index}/{total}] {video_id}")
             try:
-                saved = process_video(video_id, authors_list)
+                result = process_video(video_id, authors_list)
             except VideoDownloadError as exc:
                 print(f"Skipping '{video_id}': {exc}")
                 skipped_ids.append(video_id)
@@ -173,12 +184,11 @@ def cmd_download(args: argparse.Namespace) -> None:
                 print(f"Skipping '{video_id}': unexpected error: {exc!r}")
                 skipped_ids.append(video_id)
                 continue
-            if not saved:
+            if result is SaveResult.FAILED:
                 skipped_ids.append(video_id)
                 continue
             try:
                 append_unique_lines(s.processed_ids_file, [video_id])
-                processed_ids.append(video_id)
             except OSError as exc:
                 print(f"Warning: could not record '{video_id}' as processed: {exc!r}")
                 skipped_ids.append(video_id)
@@ -196,7 +206,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         )
 
 
-def cmd_crop(args: argparse.Namespace) -> None:
+def cmd_crop(_args: argparse.Namespace) -> None:
     s = init()
 
     print("Scanning music files...")
@@ -207,41 +217,52 @@ def cmd_crop(args: argparse.Namespace) -> None:
 
     print("Scanning images files...")
     cover_patterns = tuple(f"*{ext}" for ext in COVER_EXTENSIONS)
-    cover_files = [
-        file
-        for pattern in cover_patterns
-        for file in s.covers_folder.glob(pattern)
-        if file.is_file()
-        and file.stem.strip() not in false_positives
-        and is_image_pillarbox(file)
-    ]
+    cover_files: list[Path] = []
+    for pattern in cover_patterns:
+        for file in s.covers_folder.glob(pattern):
+            if not file.is_file() or file.stem.strip() in false_positives:
+                continue
+            try:
+                if is_image_pillarbox(file):
+                    cover_files.append(file)
+            except Exception as exc:
+                print(f"Warning: could not analyze '{file.name}', skipping: {exc!r}")
 
     if not cover_files:
         print("No images to crop...")
     else:
         for cover in cover_files:
             filename = cover.stem
-            display_image(cover)
-            if prompt_crop(default="True"):
-                crop_image_1_to_1(cover)
-                mp3_file = s.music_folder.joinpath(f"{filename}.mp3")
-                if mp3_file.is_file():
-                    change_cover(cover, mp3_file)
+            try:
+                display_image(cover)
+                if prompt_crop(default=True):
+                    crop_image_1_to_1(cover)
+                    mp3_file = s.music_folder.joinpath(f"{filename}.mp3")
+                    if mp3_file.is_file():
+                        change_cover(cover, mp3_file)
+                    else:
+                        print(f"{filename}: MP3 not found, skipping cover re-embed")
                 else:
-                    print(f"{filename}: MP3 not found, skipping cover re-embed")
-            else:
-                false_positives.append(filename)
+                    false_positives.append(filename)
+                    append_unique_lines(s.false_positives_file, [filename])
+            except Exception as exc:
+                print(f"Warning: could not process '{filename}': {exc!r}")
             print("\n\n")
-    append_unique_lines(s.false_positives_file, false_positives)
 
 
 def cmd_directories(args: argparse.Namespace) -> None:
     s = Settings(_load_raw_config())
-    print(f"Config dir:  {CONFIG_PATH.parent.resolve()}")
-    print(f"Music:       {s.music_folder.resolve()}")
-    print(f"Library:     {s.script_folder.resolve()}")
-    print(f"Temp:        {s.temp_folder.resolve()}")
-    print(f"Covers:      {s.covers_folder.resolve()}")
+    fields = [
+        ("Config dir:", str(CONFIG_PATH.parent.resolve())),
+        ("Music:", str(s.music_folder.resolve())),
+        ("Library:", str(s.script_folder.resolve())),
+        ("Temp:", str(s.temp_folder.resolve())),
+        ("Covers:", str(s.covers_folder.resolve())),
+        ("Authors:", str(s.authors_file.resolve())),
+        ("Songs info:", str(s.songs_info.resolve())),
+    ]
+    for label, value in fields:
+        print(f"{label:<13}{value}")
 
 
 def main(argv: list[str] | None = None) -> None:

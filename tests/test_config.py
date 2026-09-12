@@ -72,3 +72,25 @@ def test_settings_uses_valid_description_max_lines(tmp_path):
         }
     )
     assert s.description_max_lines == 3
+
+
+def test_settings_clamps_negative_description_max_lines(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "description_max_lines": -3,
+        }
+    )
+    assert s.description_max_lines == 0
+
+
+def test_settings_rejects_bool_description_max_lines(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "description_max_lines": True,
+        }
+    )
+    assert s.description_max_lines == 5

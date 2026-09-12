@@ -1,10 +1,11 @@
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 from smclipy.helpers import sanitize_filename
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "name": "smclipy",
     "path_to_music_folder": "./Music",
     "description_max_lines": 5,
@@ -22,8 +23,7 @@ CONFIG_PATH = Path(
 class Settings:
     """Resolved, per-run configuration."""
 
-    def __init__(self, raw: dict) -> None:
-        self.raw = raw
+    def __init__(self, raw: dict[str, Any]) -> None:
         self.music_folder = Path(str(raw.get("path_to_music_folder", ".")))
         self.script_folder = self.music_folder.joinpath(
             sanitize_filename(str(raw.get("name", "smclipy")))
@@ -33,14 +33,19 @@ class Settings:
         self.processed_ids_file = self.temp_folder.joinpath("processed_ids.txt")
         self.authors_file = self.script_folder.joinpath("authors.txt")
         self.songs_info = self.script_folder.joinpath("songs_info.txt")
+        self.scan_state_file = self.script_folder.joinpath("scan_state.txt")
         self.false_positives_file = self.script_folder.joinpath(
             "cropping_tool_false_positives.txt"
         )
         self.covers_folder = self.script_folder.joinpath("covers")
+        raw_value = raw.get("description_max_lines", 5)
+        if isinstance(raw_value, bool):
+            raw_value = 5
         try:
-            self.description_max_lines = int(raw.get("description_max_lines", 5))
+            parsed = int(raw_value)
         except (TypeError, ValueError):
-            self.description_max_lines = 5
+            parsed = 5
+        self.description_max_lines = max(0, parsed)
 
 
 # Global settings singleton. This is a CLI: a single settings object lives for
@@ -49,7 +54,7 @@ class Settings:
 _settings: Settings | None = None
 
 
-def _load_raw_config() -> dict:
+def _load_raw_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=4), encoding="utf-8")
