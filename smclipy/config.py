@@ -9,7 +9,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "name": "smclipy",
     "path_to_music_folder": "./Music",
     "description_max_lines": 5,
+    "write_album_if_same_as_title": False,
+    "tag_fields": [
+        "title",
+        "artists",
+        "album",
+        "date",
+        "album_artist",
+        "track_number",
+        "cover",
+    ],
 }
+
+COVER_FIELD = "cover"
+TAG_FIELDS = frozenset(
+    {"title", "artists", "album", "date", "album_artist", "track_number", COVER_FIELD}
+)
 CONFIG_PATH = Path(
     os.environ.get(
         "SMCLIPY_CONFIG",
@@ -24,14 +39,31 @@ class Settings:
     """Resolved, per-run configuration."""
 
     def __init__(self, raw: dict[str, Any]) -> None:
-        self.music_folder = Path(str(raw.get("path_to_music_folder", ".")))
-        self.script_folder = self.music_folder.joinpath(
-            sanitize_filename(str(raw.get("name", "smclipy")))
-        )
+        raw_path = raw.get("path_to_music_folder", ".")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raw_path = "."
+            print(
+                "Warning: 'path_to_music_folder' must be a non-empty string "
+                "path, defaulting to '.'"
+            )
+        self.music_folder = Path(raw_path)
+        raw_name = raw.get("name", "smclipy")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raw_name = "smclipy"
+            print("Warning: 'name' must be a non-empty string, using 'smclipy'")
+        script_name = sanitize_filename(raw_name)
+        if not script_name:
+            script_name = "smclipy"
+            print(
+                "Warning: 'name' only contains characters that are invalid in "
+                "filenames, using 'smclipy'"
+            )
+        self.script_folder = self.music_folder.joinpath(script_name)
         self.temp_folder = self.script_folder.joinpath(".temp")
         self.pending_ids_file = self.temp_folder.joinpath("pending_ids.txt")
         self.processed_ids_file = self.temp_folder.joinpath("processed_ids.txt")
         self.authors_file = self.script_folder.joinpath("authors.txt")
+        self.tagged_files_file = self.script_folder.joinpath("tagged_files.txt")
         self.songs_info = self.script_folder.joinpath("songs_info.txt")
         self.scan_state_file = self.script_folder.joinpath("scan_state.txt")
         self.false_positives_file = self.script_folder.joinpath(
@@ -46,6 +78,16 @@ class Settings:
         except (TypeError, ValueError):
             parsed = 5
         self.description_max_lines = max(0, parsed)
+        raw_flag = raw.get("write_album_if_same_as_title", False)
+        self.write_album_if_same_as_title = (
+            raw_flag if isinstance(raw_flag, bool) else False
+        )
+        raw_fields = raw.get("tag_fields", list(DEFAULT_CONFIG.get("tag_fields", [])))
+        if isinstance(raw_fields, list):
+            fields = [str(field) for field in raw_fields if isinstance(field, str)]
+        else:
+            fields = []
+        self.tag_fields = [field for field in fields if field in TAG_FIELDS]
 
 
 # Global settings singleton. This is a CLI: a single settings object lives for
@@ -54,8 +96,10 @@ class Settings:
 _settings: Settings | None = None
 
 
-def _load_raw_config() -> dict[str, Any]:
+def _load_raw_config(create_if_missing: bool = True) -> dict[str, Any]:
     if not CONFIG_PATH.exists():
+        if not create_if_missing:
+            return dict(DEFAULT_CONFIG)
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=4), encoding="utf-8")
         print(
@@ -76,13 +120,24 @@ def _load_raw_config() -> dict[str, Any]:
         )
         print("Fix or delete the config file, then run smclipy again.")
         raise SystemExit(1)
-    return raw
+    merged = {**DEFAULT_CONFIG, **raw}
+    if merged != raw:
+        CONFIG_PATH.write_text(json.dumps(merged, indent=4), encoding="utf-8")
+    return merged
 
 
 def setup_folders() -> None:
     s = settings()
-    for folder in (s.script_folder, s.covers_folder, s.temp_folder):
-        folder.mkdir(parents=True, exist_ok=True)
+    try:
+        for folder in (s.script_folder, s.covers_folder, s.temp_folder):
+            folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(
+            f"Error: could not create the smclipy folder structure at "
+            f"'{s.script_folder}': {exc}"
+        )
+        print("Check that 'path_to_music_folder' points to a writable directory.")
+        raise SystemExit(1) from exc
 
 
 def init() -> Settings:

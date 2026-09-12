@@ -1,5 +1,7 @@
 {
     "name": "smclipy",
     "path_to_music_folder": "./Music",
-    "description_max_lines": 5
+    "description_max_lines": 5,
+    "write_album_if_same_as_title": false,
+    "tag_fields": ["title", "artists", "album", "date", "album_artist", "track_number", "cover"]
 }

@@ -65,6 +65,15 @@ def test_extract_urls_youtube_mobile():
     ]
 
 
+def test_extract_urls_youtube_accepts_deep_subdomains():
+    assert extract_urls("https://m.mobile.youtube.com/watch?v=abcdefghijk") == [
+        "https://www.youtube.com/watch?v=abcdefghijk"
+    ]
+    assert extract_urls("https://mobile.youtube.com/embed/abcdefghijk") == [
+        "https://www.youtube.com/watch?v=abcdefghijk"
+    ]
+
+
 def test_extract_urls_ignores_bare_v_fragment():
     assert extract_urls("check out v=abcdefghijk in this text") == []
 
@@ -138,6 +147,35 @@ def test_extract_urls_soundcloud_still_extracts_track_named_tracks():
     assert extract_urls("https://soundcloud.com/artist/song") == [
         "https://soundcloud.com/artist/song"
     ]
+
+
+def test_extract_urls_soundcloud_accepts_track_named_you_or_people():
+    assert extract_urls("https://soundcloud.com/artist/you") == [
+        "https://soundcloud.com/artist/you"
+    ]
+    assert extract_urls("https://soundcloud.com/artist/people") == [
+        "https://soundcloud.com/artist/people"
+    ]
+
+
+def test_extract_urls_youtube_rejects_unrelated_domains():
+    assert extract_urls("https://notyoutube.com/watch?v=abcdefghijk") == []
+    assert extract_urls("https://www.ifyoutube.com/shorts/abcdefghijk") == []
+    assert extract_urls("check out youtube.com.weird/watch?v=abcdefghijk") == []
+
+
+def test_extract_urls_youtube_rejects_host_nested_in_path():
+    assert extract_urls("https://evil.com/youtube.com/watch?v=abcdefghijk") == []
+    assert extract_urls("https://evil.com/youtu.be/abcdefghijk") == []
+
+
+def test_extract_urls_soundcloud_rejects_host_nested_in_path():
+    assert extract_urls("https://evil.com/soundcloud.com/Artist/Track") == []
+    assert extract_urls("https://evil.com.attacker.example/soundcloud.com/A/B") == []
+
+
+def test_extract_urls_scopes_soundcloud_also_blocks_profile_segments():
+    assert extract_urls("https://soundcloud.com/you/something") == []
 
 
 def test_temp_stem_youtube():

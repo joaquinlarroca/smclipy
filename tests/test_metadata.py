@@ -12,8 +12,11 @@ from smclipy.metadata import (
     _open_audio,
     _set_cover,
     _tag_file,
+    apply_tag_update,
     change_cover,
     get_image_from_file,
+    has_cover,
+    read_song_tags,
     save_all_covers,
     save_image,
     save_song_temp_to_main,
@@ -24,11 +27,13 @@ from smclipy.storage import read_lines
 MINIMAL_MP3 = (bytes.fromhex("FFFB9064") + bytes(413)) * 2
 
 
-def write_tagged_mp3(path, title="Foo", artist="Artist") -> None:
+def write_tagged_mp3(path, title="Foo", artist="Artist", album=None) -> None:
     path.write_bytes(MINIMAL_MP3)
     audio = EasyID3()
     audio["title"] = [title]
     audio["artist"] = [artist]
+    if album is not None:
+        audio["album"] = [album]
     audio.save(path)
 
 
@@ -153,6 +158,19 @@ def test_scan_library_rescans_when_library_changed(app_settings):
     scan_library()
 
     assert sorted(read_lines(app_settings.authors_file)) == ["Artist A", "Artist B"]
+
+
+def test_scan_library_skips_case_variant_author_duplicates(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "one.mp3", title="Song", artist="PINK FLOYD")
+    scan_library()
+    assert read_lines(app_settings.authors_file) == ["PINK FLOYD"]
+
+    write_tagged_mp3(music / "two.mp3", title="Other", artist="Pink Floyd")
+    scan_library()
+
+    assert read_lines(app_settings.authors_file) == ["PINK FLOYD"]
 
 
 def test_save_all_covers_skips_untagged_and_saves_tagged(app_settings):
@@ -293,6 +311,31 @@ def test_tag_file_writes_tags_and_cover(tmp_path):
     assert ID3(mp3_file).getall("APIC")
 
 
+def test_tag_file_clears_stale_frames(tmp_path):
+    mp3_file = tmp_path / "song.mp3"
+    mp3_file.write_bytes(MINIMAL_MP3)
+    audio = EasyID3()
+    audio["title"] = ["Old"]
+    audio["artist"] = ["Old Artist"]
+    audio["album"] = ["Old Album"]
+    audio["date"] = ["1999"]
+    audio["genre"] = ["Rock"]
+    audio["albumartist"] = ["Old Album Artist"]
+    audio["tracknumber"] = ["7"]
+    audio.save(mp3_file)
+
+    assert _tag_file(mp3_file, "New", ["Artist"], "Album", None) is True
+
+    tags = ID3(mp3_file)
+    assert str(tags["TIT2"]) == "New"
+    assert str(tags["TPE1"]) == "Artist"
+    assert str(tags["TALB"]) == "Album"
+    assert "TDRC" not in tags
+    assert "TCON" not in tags
+    assert "TPE2" not in tags
+    assert "TRCK" not in tags
+
+
 def test_change_cover_replaces_existing_apic(tmp_path):
     mp3_file = tmp_path / "song.mp3"
     mp3_file.write_bytes(MINIMAL_MP3)
@@ -383,6 +426,23 @@ def test_save_song_temp_to_main_tags_then_moves(app_settings, tmp_path):
     assert ID3(target).getall("APIC")
 
 
+def test_save_song_temp_to_main_splits_comma_artists(app_settings, tmp_path):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    source = tmp_path / "temp.mp3"
+    source.write_bytes(MINIMAL_MP3)
+    image = tmp_path / "cover.png"
+    image.write_bytes(make_png_bytes())
+
+    result = save_song_temp_to_main(source, image, "Song", "Author 1, Author 2", "Al")
+
+    assert result is SaveResult.SAVED
+    assert not source.exists()
+    target = app_settings.music_folder / "Author 1-Song.mp3"
+    assert target.is_file()
+    tags = EasyID3(target)
+    assert tags["artist"] == ["Author 1", "Author 2"]
+
+
 def test_save_song_temp_to_main_warns_on_collision(
     app_settings, tmp_path, capsys, monkeypatch
 ):
@@ -470,3 +530,83 @@ def test_mime_to_ext_mapping():
     assert _mime_to_ext("image/webp") == ".webp"
     assert _mime_to_ext("image/gif") == ".gif"
     assert _mime_to_ext("application/octet-stream") == ".png"
+
+
+def test_read_song_tags_returns_profile(app_settings, tmp_path):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    tagged = app_settings.music_folder / "A-Song.mp3"
+    write_tagged_mp3(tagged, title="My Song", artist="Artist", album="My Album")
+
+    profile = read_song_tags(tagged)
+
+    assert profile["title"] == "My Song"
+    assert profile["artists"] == "Artist"
+    assert profile["album"] == "My Album"
+    assert profile["date"] == ""
+    assert profile["genre"] == ""
+    assert profile["album_artist"] == ""
+    assert profile["track_number"] == ""
+
+
+def test_read_song_tags_missing_file_warns(app_settings, tmp_path, capsys):
+    profile = read_song_tags(tmp_path / "missing.mp3")
+    assert profile == {}
+    assert "could not read" in capsys.readouterr().out
+
+
+def test_has_cover_true_and_false(app_settings, tmp_path):
+    tagged = tmp_path / "tagged.mp3"
+    write_tagged_mp3(tagged, title="Song", artist="Artist")
+    assert has_cover(tagged) is False
+
+    img = ID3(tagged)
+    img.add(
+        APIC(encoding=3, mime="image/png", type=3, desc="Cover", data=make_png_bytes())
+    )
+    img.save()
+    assert has_cover(tagged) is True
+
+
+def test_apply_tag_update_partial(app_settings, tmp_path):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    target = app_settings.music_folder / "A-Song.mp3"
+    write_tagged_mp3(target, title="Old", artist="Artist", album="Album")
+
+    ok = apply_tag_update(
+        target,
+        title="New",
+        date="1990",
+        genre="Rock",
+        album_artist="Band",
+        track_number="3/12",
+    )
+
+    assert ok is True
+    id3 = ID3(target)
+    assert str(id3["TIT2"]) == "New"
+    assert str(id3["TALB"]) == "Album"
+    assert str(id3["TDRC"]) == "1990"
+    assert str(id3["TCON"]) == "Rock"
+    assert str(id3["TPE2"]) == "Band"
+    assert str(id3["TRCK"]) == "3/12"
+
+
+def test_apply_tag_update_none_fields_leave_existing(app_settings, tmp_path):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    target = app_settings.music_folder / "A-Song.mp3"
+    write_tagged_mp3(target, title="Old", artist="Artist", album="Album")
+
+    ok = apply_tag_update(target, title="New")
+
+    assert ok is True
+    id3 = ID3(target)
+    assert str(id3["TIT2"]) == "New"
+    assert str(id3["TPE1"]) == "Artist"
+    assert str(id3["TALB"]) == "Album"
+
+
+def test_apply_tag_update_garbage_returns_false(app_settings, tmp_path, capsys):
+    bad = app_settings.music_folder / "bad.mp3"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_bytes(b"not an mp3 at all")
+    assert apply_tag_update(bad, title="Song") is False

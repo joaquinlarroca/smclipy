@@ -6,12 +6,8 @@ def sanitize_filename(filename: str) -> str:
     return clean_name.strip(" .")
 
 
-def get_list_from_split_str(string: str, pattern: str) -> list[str]:
-    return [a.strip() for a in re.split(re.escape(pattern) + "+", string) if a.strip()]
-
-
-def get_unique_items(source_items: list[str], target_list: list[str]) -> list[str]:
-    return [item for item in source_items if item not in target_list]
+def split_authors(string: str) -> list[str]:
+    return [a.strip() for a in re.split(r"[\\\\,]+", string) if a.strip()]
 
 
 def normalize_author(name: str) -> str:
@@ -33,3 +29,20 @@ def resolve_known_authors(artists: list[str], known_authors: list[str]) -> list[
         seen.add(normalized)
         resolved.append(known_by_normalized.get(normalized, artist))
     return resolved
+
+
+def distinct_authors(authors: list[str], known_authors: list[str]) -> list[str]:
+    """Return `authors` entries not already in `known_authors`, ignoring
+    case and whitespace so a differently-spelled duplicate isn't kept."""
+    known_by_normalized = {
+        normalize_author(author) for author in known_authors if normalize_author(author)
+    }
+    distinct: list[str] = []
+    seen: set[str] = set()
+    for author in authors:
+        normalized = normalize_author(author)
+        if not normalized or normalized in known_by_normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        distinct.append(author)
+    return distinct

@@ -45,6 +45,7 @@ def test_process_video_deletes_stale_temp_files(monkeypatch, app_settings):
     (temp / "temp.png").write_bytes(b"old-png")
     (temp / "yt-abcdefghijk.mp3").write_bytes(b"old-stem-mp3")
     (temp / "yt-abcdefghijk.webp").write_bytes(b"old-stem-thumb")
+    (temp / "tag-cover-rec-1.jpg").write_bytes(b"old-tag-cover")
 
     get_image_from_file_calls = []
 
@@ -68,6 +69,7 @@ def test_process_video_deletes_stale_temp_files(monkeypatch, app_settings):
     assert not (temp / "temp.png").exists()
     assert not (temp / "yt-abcdefghijk.mp3").exists()
     assert not (temp / "yt-abcdefghijk.webp").exists()
+    assert not (temp / "tag-cover-rec-1.jpg").exists()
     assert get_image_from_file_calls == [("sc-artist-track.mp3", "sc-artist-track")]
     assert read_lines(app_settings.authors_file) == ["Artist"]
     assert read_lines(app_settings.songs_info) == ["Song - Artist"]
@@ -158,6 +160,34 @@ def test_process_video_prefills_multiple_artists_with_backslash(
     process_video("https://soundcloud.com/artist/track", [])
 
     assert captured["default"] == "Artist One\\Artist Two"
+
+
+def test_process_video_splits_comma_separated_autofill(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    captured = {}
+
+    def fake_prompt_authors(authors_list, default=""):
+        captured["default"] = default
+        return default
+
+    monkeypatch.setattr(
+        cli,
+        "download",
+        lambda url, stem="temp": {"uploader": "author1, author2"},
+    )
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "prompt_crop", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "prompt_title", lambda *a, **k: "Song")
+    monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "prompt_authors", fake_prompt_authors)
+    monkeypatch.setattr(cli, "save_song_temp_to_main", lambda *a, **k: SaveResult.SAVED)
+
+    process_video("https://soundcloud.com/artist/track", [])
+
+    assert captured["default"] == "author1, author2"
+    assert read_lines(app_settings.authors_file) == ["author1", "author2"]
 
 
 def test_process_video_prefills_album(monkeypatch, app_settings):
@@ -320,6 +350,22 @@ def test_cmd_directories_prints_all_paths(monkeypatch, tmp_path, capsys):
     assert f"Songs info:  {(music / 'smclipy' / 'songs_info.txt').resolve()}" in out
 
 
+def test_cmd_directories_works_without_config(monkeypatch, tmp_path, capsys):
+    import smclipy.cli as cli
+    import smclipy.config as config
+
+    config_file = tmp_path / "config" / "config.json"
+    monkeypatch.setattr(config, "CONFIG_PATH", config_file)
+    monkeypatch.setattr(cli, "CONFIG_PATH", config_file)
+
+    cli.main(["-d"])
+
+    out = capsys.readouterr().out
+    assert "no config file" in out
+    assert not config_file.exists()
+    assert "Music:" in out
+
+
 def test_main_exits_when_stdin_not_a_tty_for_download(monkeypatch, capsys):
     import smclipy.cli as cli
 
@@ -329,6 +375,31 @@ def test_main_exits_when_stdin_not_a_tty_for_download(monkeypatch, capsys):
     assert exc.value.code == 1
     captured = capsys.readouterr()
     assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_exits_when_stdin_not_a_tty_for_tag(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["tag"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_dispatch_dispatches_tag(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+
+    def fake_cmd_tag(_args):
+        calls.append(_args)
+
+    monkeypatch.setattr(cli, "cmd_tag", fake_cmd_tag)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    cli.main(["tag"])
+    assert len(calls) == 1
 
 
 def test_main_help_works_without_tty(monkeypatch, capsys):
@@ -572,6 +643,55 @@ def test_cmd_download_repends_unsaved_videos(monkeypatch, app_settings):
 
     assert read_lines(app_settings.processed_ids_file) == []
     assert read_lines(app_settings.pending_ids_file) == ["vid-a"]
+
+
+def _raises_keyboard_interrupt(vid, authors):
+    raise KeyboardInterrupt
+
+
+def test_cmd_download_interrupt_exits_130(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    monkeypatch.setattr(cli, "scan_library", lambda: None)
+    monkeypatch.setattr(cli, "get_all_names", lambda: [])
+    monkeypatch.setattr(cli, "prompt_resume", lambda: False)
+    monkeypatch.setattr(cli, "collect_urls", lambda s: ["vid-a", "vid-b"])
+    monkeypatch.setattr(cli, "process_video", _raises_keyboard_interrupt)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_download(argparse.Namespace())
+    assert exc.value.code == 130
+    assert "Interrupted" in capsys.readouterr().out
+
+
+def test_cmd_download_interrupt_persists_skipped(monkeypatch, app_settings):
+    import smclipy.cli as cli
+    from smclipy.downloader import VideoDownloadError
+
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    monkeypatch.setattr(cli, "scan_library", lambda: None)
+    monkeypatch.setattr(cli, "get_all_names", lambda: [])
+    monkeypatch.setattr(cli, "prompt_resume", lambda: False)
+    monkeypatch.setattr(cli, "collect_urls", lambda s: ["vid-a", "vid-b"])
+
+    calls: list[str] = []
+
+    def fake_process(vid, authors):
+        calls.append(vid)
+        if vid == "vid-a":
+            raise VideoDownloadError("vid-a", 500)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "process_video", fake_process)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_download(argparse.Namespace())
+    assert exc.value.code == 130
+    pending = read_lines(app_settings.pending_ids_file)
+    assert "vid-a" in pending
+    assert "Interrupted" not in pending
+    assert read_lines(app_settings.processed_ids_file) == []
 
 
 def test_cmd_crop_reembeds_jpg_cover(monkeypatch, app_settings):

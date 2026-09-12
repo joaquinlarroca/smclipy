@@ -1,9 +1,9 @@
 from smclipy.helpers import (
-    get_list_from_split_str,
-    get_unique_items,
+    distinct_authors,
     normalize_author,
     resolve_known_authors,
     sanitize_filename,
+    split_authors,
 )
 
 
@@ -15,22 +15,17 @@ def test_sanitize_filename_strips_dots_and_spaces():
     assert sanitize_filename("  song.  ") == "song"
 
 
-def test_get_list_from_split_str():
-    assert get_list_from_split_str("A\\B\\C", "\\") == ["A", "B", "C"]
-    assert get_list_from_split_str("A\\\\B", "\\") == ["A", "B"]
-    assert get_list_from_split_str("A\\", "\\") == ["A"]
+def test_split_authors_splits_backslash_and_comma():
+    assert split_authors("A\\B,C") == ["A", "B", "C"]
+    assert split_authors("A\\\\B,,C") == ["A", "B", "C"]
+    assert split_authors("A,B\\C") == ["A", "B", "C"]
 
 
-def test_get_list_from_split_str_ignores_empty():
-    assert get_list_from_split_str("\\A\\", "\\") == ["A"]
-
-
-def test_get_unique_items():
-    assert get_unique_items(["A", "B", "C"], ["A", "C"]) == ["B"]
-
-
-def test_get_unique_items_keeps_order():
-    assert get_unique_items(["C", "A"], ["A"]) == ["C"]
+def test_split_authors_strips_whitespace_and_drops_empty():
+    assert split_authors(" A ,  B\\ ") == ["A", "B"]
+    assert split_authors("A,") == ["A"]
+    assert split_authors(",") == []
+    assert split_authors("") == []
 
 
 def test_normalize_author_ignores_case_and_spaces():
@@ -55,3 +50,21 @@ def test_resolve_known_authors_mixed_and_dedupes():
 def test_resolve_known_authors_empty_inputs():
     assert resolve_known_authors([], ["author1"]) == []
     assert resolve_known_authors(["A"], []) == ["A"]
+
+
+def test_distinct_authors_keeps_new_ones():
+    assert distinct_authors(["Guest", "Artist"], ["Artist"]) == ["Guest"]
+
+
+def test_distinct_authors_ignores_case_and_spaces():
+    assert distinct_authors(["artist", " Artist "], ["Artist"]) == []
+
+
+def test_distinct_authors_keeps_first_spelling():
+    assert distinct_authors(["The Beatles", "the beatles"], ["Other"]) == [
+        "The Beatles"
+    ]
+
+
+def test_distinct_authors_drops_empty():
+    assert distinct_authors(["A", "   ", ""], ["B"]) == ["A"]

@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +16,14 @@ def test_load_raw_config_missing_creates_default(tmp_path, monkeypatch):
     assert exc.value.code == 0
     assert cfg.is_file()
     assert json.loads(cfg.read_text(encoding="utf-8")) == DEFAULT_CONFIG
+
+
+def test_load_raw_config_missing_no_create_returns_defaults(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr("smclipy.config.CONFIG_PATH", cfg)
+
+    assert _load_raw_config(create_if_missing=False) == DEFAULT_CONFIG
+    assert not cfg.exists()
 
 
 def test_load_raw_config_invalid_json_exits_cleanly(tmp_path, monkeypatch, capsys):
@@ -37,6 +46,40 @@ def test_load_raw_config_valid_json(tmp_path, monkeypatch):
     monkeypatch.setattr("smclipy.config.CONFIG_PATH", cfg)
 
     assert _load_raw_config() == DEFAULT_CONFIG
+
+
+def test_load_raw_config_backfills_missing_fields(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        json.dumps({"name": "smclipy", "path_to_music_folder": "./Music"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("smclipy.config.CONFIG_PATH", cfg)
+
+    raw = _load_raw_config()
+
+    assert raw == DEFAULT_CONFIG
+    assert json.loads(cfg.read_text(encoding="utf-8")) == DEFAULT_CONFIG
+
+
+def test_load_raw_config_backfill_keeps_custom_values(tmp_path, monkeypatch):
+    custom = {
+        "name": "custom",
+        "path_to_music_folder": "./Custom",
+        "description_max_lines": 2,
+        "tag_fields": ["title"],
+    }
+    cfg = tmp_path / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps(custom), encoding="utf-8")
+    monkeypatch.setattr("smclipy.config.CONFIG_PATH", cfg)
+
+    expected = {**DEFAULT_CONFIG, **custom}
+    raw = _load_raw_config()
+
+    assert raw == expected
+    assert json.loads(cfg.read_text(encoding="utf-8")) == expected
 
 
 def test_load_raw_config_rejects_non_object_json(tmp_path, monkeypatch, capsys):
@@ -94,3 +137,79 @@ def test_settings_rejects_bool_description_max_lines(tmp_path):
         }
     )
     assert s.description_max_lines == 5
+
+
+def test_settings_default_tag_fields(tmp_path):
+    s = Settings({"name": "smclipy", "path_to_music_folder": str(tmp_path)})
+    assert s.tag_fields == DEFAULT_CONFIG["tag_fields"]
+
+
+def test_settings_filters_invalid_tag_fields(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "tag_fields": ["title", "bogus", "cover", 5],
+        }
+    )
+    assert s.tag_fields == ["title", "cover"]
+
+
+def test_settings_rejects_non_list_tag_fields(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "tag_fields": "title",
+        }
+    )
+    assert s.tag_fields == []
+
+
+def test_settings_default_write_album_if_same_as_title(tmp_path):
+    s = Settings({"name": "smclipy", "path_to_music_folder": str(tmp_path)})
+    assert s.write_album_if_same_as_title is False
+
+
+def test_settings_honors_write_album_if_same_as_title(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "write_album_if_same_as_title": True,
+        }
+    )
+    assert s.write_album_if_same_as_title is True
+
+
+def test_settings_rejects_non_bool_write_album_if_same_as_title(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "write_album_if_same_as_title": "true",
+        }
+    )
+    assert s.write_album_if_same_as_title is False
+
+
+def test_settings_coerces_non_string_music_folder(capsys):
+    s = Settings({"name": "smclipy", "path_to_music_folder": None})
+    assert s.music_folder == Path(".")
+    assert "path_to_music_folder" in capsys.readouterr().out
+
+
+def test_settings_coerces_blank_music_folder(tmp_path, capsys):
+    s = Settings({"name": "smclipy", "path_to_music_folder": "   "})
+    assert s.music_folder == Path(".")
+    assert "path_to_music_folder" in capsys.readouterr().out
+
+
+def test_settings_falls_back_on_invalid_name(tmp_path):
+    s = Settings({"name": "///", "path_to_music_folder": str(tmp_path)})
+    assert s.script_folder == tmp_path / "smclipy"
+
+
+def test_settings_falls_back_on_non_string_name(tmp_path):
+    s = Settings({"name": 5, "path_to_music_folder": str(tmp_path)})
+    assert s.script_folder == tmp_path / "smclipy"

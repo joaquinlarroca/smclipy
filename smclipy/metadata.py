@@ -3,12 +3,12 @@ from collections.abc import Iterator
 from enum import Enum, auto
 from pathlib import Path
 
-from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1
+from mutagen.id3 import APIC, ID3, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TRCK
 from mutagen.mp3 import MP3, error
 from PIL import Image as PILImage
 
 from smclipy.config import Settings, settings
-from smclipy.helpers import get_list_from_split_str, sanitize_filename
+from smclipy.helpers import distinct_authors, sanitize_filename, split_authors
 from smclipy.storage import append_unique_lines, read_lines
 from smclipy.ui import prompt_overwrite
 
@@ -31,6 +31,33 @@ def _title_from_id3(id3: ID3) -> str:
 def _artists_from_id3(id3: ID3) -> list[str]:
     artists = [str(text) for frame in id3.getall("TPE1") for text in frame.text]
     return list(dict.fromkeys(artist.strip() for artist in artists if artist.strip()))
+
+
+def _single_text_from_id3(id3: ID3, frame_id: str) -> str:
+    for frame in id3.getall(frame_id):
+        if frame.text:
+            return str(frame.text[0]).strip()
+    return ""
+
+
+def _album_from_id3(id3: ID3) -> str:
+    return _single_text_from_id3(id3, "TALB")
+
+
+def _date_from_id3(id3: ID3) -> str:
+    return _single_text_from_id3(id3, "TDRC")
+
+
+def _genre_from_id3(id3: ID3) -> str:
+    return _single_text_from_id3(id3, "TCON")
+
+
+def _album_artist_from_id3(id3: ID3) -> str:
+    return _single_text_from_id3(id3, "TPE2")
+
+
+def _track_number_from_id3(id3: ID3) -> str:
+    return _single_text_from_id3(id3, "TRCK")
 
 
 def _iter_tagged_mp3s() -> Iterator[tuple[ID3, str, list[str]]]:
@@ -61,14 +88,18 @@ def scan_library() -> None:
     fingerprint = _library_fingerprint(s)
     try:
         previous = s.scan_state_file.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         previous = None
     if previous == fingerprint:
         return
+    known_authors = read_lines(s.authors_file)
     for _id3, title, artists in _iter_tagged_mp3s():
         if not artists:
             continue
-        append_unique_lines(s.authors_file, artists)
+        new_authors = distinct_authors(artists, known_authors)
+        if new_authors:
+            append_unique_lines(s.authors_file, new_authors)
+            known_authors.extend(new_authors)
         append_unique_lines(s.songs_info, [f"{title} - {', '.join(artists)}"])
     s.scan_state_file.parent.mkdir(parents=True, exist_ok=True)
     s.scan_state_file.write_text(fingerprint, encoding="utf-8")
@@ -111,7 +142,7 @@ def _open_audio(file: Path) -> MP3 | None:
 def save_song_temp_to_main(
     file: Path, image: Path | None, title: str, authors: str, album: str
 ) -> SaveResult:
-    authors_list = get_list_from_split_str(authors, "\\")
+    authors_list = split_authors(authors)
     if not authors_list:
         print("Warning: no artists provided, skipping save")
         return SaveResult.FAILED
@@ -137,11 +168,89 @@ def _tag_file(
     if audio is None:
         print(f"Warning: could not read '{target.name}', skipping save")
         return False
-    assert audio.tags is not None
-    audio.tags.add(TIT2(encoding=3, text=title))
-    audio.tags.add(TPE1(encoding=3, text=authors))
-    audio.tags.add(TALB(encoding=3, text=album))
+    tags = audio.tags
+    if tags is None:
+        raise RuntimeError(f"'{target.name}' has no ID3 tag stream")
+    for key in list(tags.keys()):
+        parent_id = key[:4]
+        if parent_id in ("TIT2", "TPE1", "TALB", "APIC"):
+            continue
+        tags.delall(parent_id)
+    tags.add(TIT2(encoding=3, text=title))
+    tags.add(TPE1(encoding=3, text=authors))
+    tags.add(TALB(encoding=3, text=album))
     _set_cover(audio, image)
+    audio.save()
+    return True
+
+
+def read_song_profile(file: Path) -> tuple[dict[str, str], bool]:
+    """Read an MP3's tag profile and whether it carries embedded cover art."""
+    try:
+        id3 = ID3(file)
+    except Exception as exc:
+        print(f"Warning: could not read '{file.name}', skipping: {exc}")
+        return {}, False
+    return {
+        "title": _title_from_id3(id3),
+        "artists": ", ".join(_artists_from_id3(id3)),
+        "album": _album_from_id3(id3),
+        "date": _date_from_id3(id3),
+        "genre": _genre_from_id3(id3),
+        "album_artist": _album_artist_from_id3(id3),
+        "track_number": _track_number_from_id3(id3),
+    }, any(key.startswith("APIC") for key in id3)
+
+
+def read_song_tags(file: Path) -> dict[str, str]:
+    """Read the full tag profile of an MP3 into a field -> value mapping."""
+    return read_song_profile(file)[0]
+
+
+def has_cover(file: Path) -> bool:
+    try:
+        id3 = ID3(file)
+    except Exception:
+        return False
+    return any(key.startswith("APIC") for key in id3)
+
+
+def apply_tag_update(
+    file: Path,
+    *,
+    title: str | None = None,
+    artists: list[str] | None = None,
+    album: str | None = None,
+    date: str | None = None,
+    genre: str | None = None,
+    album_artist: str | None = None,
+    track_number: str | None = None,
+    image: Path | None = None,
+) -> bool:
+    """Apply a partial tag update, only overwriting fields that are not None."""
+    audio = _open_audio(file)
+    if audio is None:
+        print(f"Warning: could not read '{file.name}', skipping update")
+        return False
+    tags = audio.tags
+    if tags is None:
+        raise RuntimeError(f"'{file.name}' has no ID3 tag stream")
+    if title is not None:
+        tags.add(TIT2(encoding=3, text=title))
+    if artists is not None:
+        tags.add(TPE1(encoding=3, text=artists))
+    if album is not None:
+        tags.add(TALB(encoding=3, text=album))
+    if date is not None:
+        tags.add(TDRC(encoding=3, text=date))
+    if genre is not None:
+        tags.add(TCON(encoding=3, text=genre))
+    if album_artist is not None:
+        tags.add(TPE2(encoding=3, text=album_artist))
+    if track_number is not None:
+        tags.add(TRCK(encoding=3, text=track_number))
+    if image is not None:
+        _set_cover(audio, image)
     audio.save()
     return True
 
@@ -154,11 +263,13 @@ def _get_image_mime(image: Path) -> str:
 def _set_cover(audio: MP3, image: Path | None) -> None:
     if audio.tags is None:
         audio.add_tags()
-    assert audio.tags is not None
     if image is None or not image.is_file():
         return
-    audio.tags.delall("APIC")
-    audio.tags.add(
+    tags = audio.tags
+    if tags is None:
+        raise RuntimeError("MP3 has no ID3 tag stream to embed cover into")
+    tags.delall("APIC")
+    tags.add(
         APIC(
             encoding=3,
             mime=_get_image_mime(image),

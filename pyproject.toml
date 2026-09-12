@@ -1,12 +1,13 @@
 [project]
 name = "smclipy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Simple music CLI to download, tag, and organize music from YouTube and SoundCloud"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "climage>=0.2.2",
     "mutagen>=1.47.0",
+    "musicbrainzngs>=0.7.1",
     "pillow>=12.2.0",
     "prompt-toolkit>=3.0.52",
     "yt-dlp[default]>=2026.3.17",
@@ -54,7 +55,7 @@ module = ["smclipy", "smclipy.*"]
 disallow_untyped_calls = false
 
 [[tool.mypy.overrides]]
-module = ["yt_dlp.*", "climage.*", "mutagen.*"]
+module = ["yt_dlp.*", "climage.*", "mutagen.*", "musicbrainzngs.*"]
 ignore_missing_imports = true
 no_implicit_reexport = false
 

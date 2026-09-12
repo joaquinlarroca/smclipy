@@ -6,6 +6,7 @@ from pathlib import Path
 from smclipy import __version__
 from smclipy.config import CONFIG_PATH, Settings, _load_raw_config, init, settings
 from smclipy.downloader import (
+    TEMP_STEM_PREFIXES,
     VideoDownloadError,
     download,
     extract_urls,
@@ -14,9 +15,9 @@ from smclipy.downloader import (
     temp_stem,
 )
 from smclipy.helpers import (
-    get_list_from_split_str,
-    get_unique_items,
+    distinct_authors,
     resolve_known_authors,
+    split_authors,
 )
 from smclipy.images import (
     crop_image_1_to_1,
@@ -35,6 +36,7 @@ from smclipy.metadata import (
     scan_library,
 )
 from smclipy.storage import append_unique_lines, read_lines, write_lines
+from smclipy.tag import TAG_COVER_PREFIX, cmd_tag
 from smclipy.ui import (
     prompt_album,
     prompt_authors,
@@ -45,6 +47,11 @@ from smclipy.ui import (
 )
 
 
+def _save_queue_state(s: Settings, pending_ids: list[str]) -> None:
+    write_lines(s.pending_ids_file, pending_ids)
+    write_lines(s.processed_ids_file, [])
+
+
 def collect_urls(s: Settings) -> list[str]:
     print("Enter '' as url to finish inputting urls")
     urls_list: list[str] = []
@@ -53,9 +60,8 @@ def collect_urls(s: Settings) -> list[str]:
             url = input("Enter your URL: ")
         except (KeyboardInterrupt, EOFError):
             print("\nInterrupted while collecting URLs...")
+            _save_queue_state(s, urls_list)
             if urls_list:
-                write_lines(s.pending_ids_file, urls_list)
-                write_lines(s.processed_ids_file, [])
                 print(
                     f"Saved partial queue of {len(urls_list)} url/s for a later resume."
                 )
@@ -80,9 +86,6 @@ def process_video(url: str, authors_list: list[str]) -> SaveResult:
     info_dictionary = download(url, stem)
     cover_path = get_image_from_file(temp_mp3, s.temp_folder, stem)
 
-    print("\n\n")
-    show_video_info(info_dictionary)
-
     if cover_path:
         print("\n\n")
         display_image(cover_path)
@@ -93,30 +96,35 @@ def process_video(url: str, authors_list: list[str]) -> SaveResult:
             crop_image_1_to_1(cover_path)
 
     print("\n\n")
-    default_title = str(info_dictionary.get("title", "")).strip()
+
+    show_video_info(info_dictionary)
+
+    print("\n")
+
+    title_value = info_dictionary.get("title")
+    default_title = title_value.strip() if isinstance(title_value, str) else ""
     title = prompt_title(default=default_title)
     while not title.strip():
         print("Title cannot be empty.")
         title = prompt_title(default=default_title)
     title = title.strip()
 
-    print("\n\n")
     album = prompt_album(default=get_album(info_dictionary))
 
     yt_artists = get_author(info_dictionary)
     authors_default = "\\".join(resolve_known_authors(yt_artists, authors_list))
     authors = prompt_authors(authors_list, default=authors_default)
-    while not get_list_from_split_str(authors, "\\"):
+    while not split_authors(authors):
         print("At least one artist is required.")
         authors = prompt_authors(authors_list, default=authors_default)
 
-    current_authors_list = get_list_from_split_str(authors, "\\")
-    for item in get_unique_items(current_authors_list, authors_list):
-        authors_list.append(item)
+    current_authors_list = split_authors(authors)
+    new_authors = distinct_authors(current_authors_list, authors_list)
+    authors_list.extend(new_authors)
 
     result = save_song_temp_to_main(temp_mp3, cover_path, title, authors, album)
     if result is SaveResult.SAVED:
-        append_unique_lines(s.authors_file, current_authors_list)
+        append_unique_lines(s.authors_file, new_authors)
         append_unique_lines(
             s.songs_info, [f"{title} - {', '.join(current_authors_list)}"]
         )
@@ -130,9 +138,11 @@ def filter_processed_ids(pending_ids: list[str], processed_ids: list[str]) -> li
 
 def _collect_new_queue(s: Settings) -> list[str]:
     pending_ids = collect_urls(s)
-    write_lines(s.pending_ids_file, pending_ids)
-    write_lines(s.processed_ids_file, [])
+    _save_queue_state(s, pending_ids)
     return pending_ids
+
+
+_TEMP_FILE_PREFIXES = ("temp.", *TEMP_STEM_PREFIXES, TAG_COVER_PREFIX)
 
 
 def _cleanup_temp_files(s: Settings) -> None:
@@ -141,7 +151,7 @@ def _cleanup_temp_files(s: Settings) -> None:
         return
     for temp_file in temp_folder.glob("*"):
         name = temp_file.name
-        if name.startswith(("temp.", "yt-", "sc-", "tmp-")):
+        if name.startswith(_TEMP_FILE_PREFIXES):
             with suppress(OSError):
                 temp_file.unlink()
 
@@ -160,13 +170,13 @@ def cmd_download(_args: argparse.Namespace) -> None:
 
     if remaining_ids and prompt_resume():
         pending_ids = remaining_ids
-        write_lines(s.pending_ids_file, pending_ids)
-        write_lines(s.processed_ids_file, [])
+        _save_queue_state(s, pending_ids)
     else:
         pending_ids = _collect_new_queue(s)
 
     print(f"Preparing to download {len(pending_ids)} vid/s")
     skipped_ids: list[str] = []
+    interrupted = False
     try:
         total = len(pending_ids)
         for index, video_id in enumerate(pending_ids, start=1):
@@ -179,6 +189,7 @@ def cmd_download(_args: argparse.Namespace) -> None:
                 continue
             except KeyboardInterrupt:
                 print("\nInterrupted, exiting...")
+                interrupted = True
                 break
             except Exception as exc:
                 print(f"Skipping '{video_id}': unexpected error: {exc!r}")
@@ -201,9 +212,13 @@ def cmd_download(_args: argparse.Namespace) -> None:
         except OSError as exc:
             print(f"Warning: could not persist skipped videos for retry: {exc!r}")
         print(
-            f"Finished with {len(skipped_ids)} skipped vid/s "
+            f"{'Interrupted' if interrupted else 'Finished'} with "
+            f"{len(skipped_ids)} skipped vid/s "
             f"(still pending for a retry): {skipped_ids}"
         )
+
+    if interrupted:
+        raise SystemExit(130) from None
 
 
 def cmd_crop(_args: argparse.Namespace) -> None:
@@ -251,7 +266,12 @@ def cmd_crop(_args: argparse.Namespace) -> None:
 
 
 def cmd_directories(args: argparse.Namespace) -> None:
-    s = Settings(_load_raw_config())
+    config_exists = CONFIG_PATH.exists()
+    s = Settings(_load_raw_config(create_if_missing=False))
+    if not config_exists:
+        print(f"Using default configuration (no config file at {CONFIG_PATH}).")
+        print("Run `smclipy download` to generate one.")
+        print()
     fields = [
         ("Config dir:", str(CONFIG_PATH.parent.resolve())),
         ("Music:", str(s.music_folder.resolve())),
@@ -265,6 +285,9 @@ def cmd_directories(args: argparse.Namespace) -> None:
         print(f"{label:<13}{value}")
 
 
+_TTY_REQUIRED_COMMANDS = frozenset({"download", "crop", "tag"})
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="smclipy",
@@ -272,6 +295,7 @@ def main(argv: list[str] | None = None) -> None:
         epilog=(
             "examples:\n"
             "  smclipy download   Batch download songs and tag them interactively\n"
+            "  smclipy tag        Retag library songs using MusicBrainz metadata\n"
             "  smclipy crop       Crop pillarboxed cover images and re-embed them\n"
             "  smclipy -d         Print the directories smclipy uses\n"
             "  smclipy -v         Print the version and exit\n"
@@ -305,6 +329,16 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
 
+    subparsers.add_parser(
+        "tag",
+        help="Retag library songs using MusicBrainz metadata.",
+        description=(
+            "List every song in the library, fetch matching metadata from "
+            "MusicBrainz, and interactively review and apply title, artist, album, "
+            "release date, track number, album artist, and cover art changes."
+        ),
+    )
+
     parser.add_argument(
         "-d",
         "--directories",
@@ -321,7 +355,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command is None:
         parser.error("the following arguments are required: command")
 
-    if args.command in ("download", "crop") and not sys.stdin.isatty():
+    if args.command in _TTY_REQUIRED_COMMANDS and not sys.stdin.isatty():
         print(
             "smclipy requires an interactive terminal. "
             "Piped or non-TTY input is not supported.",
@@ -333,3 +367,5 @@ def main(argv: list[str] | None = None) -> None:
         cmd_download(args)
     elif args.command == "crop":
         cmd_crop(args)
+    elif args.command == "tag":
+        cmd_tag(args)

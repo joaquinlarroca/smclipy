@@ -8,6 +8,11 @@ import yt_dlp.utils
 from smclipy.config import settings
 from smclipy.helpers import sanitize_filename
 
+YT_STEM_PREFIX = "yt-"
+SC_STEM_PREFIX = "sc-"
+TMP_STEM_PREFIX = "tmp-"
+TEMP_STEM_PREFIXES = (YT_STEM_PREFIX, SC_STEM_PREFIX, TMP_STEM_PREFIX)
+
 
 class VideoDownloadError(Exception):
     """Raised when yt-dlp fails with a client-side HTTP error (e.g. 403)."""
@@ -18,34 +23,67 @@ class VideoDownloadError(Exception):
         self.status_code = status_code
 
 
+def _is_host_at_boundary(text: str, start: int) -> bool:
+    """Whether `text[start:]` begins at a real host position.
+
+    A host must start at the beginning of the text, after whitespace, or right
+    after a ``://`` scheme. This rejects lookalike hosts nested inside another
+    URL, e.g. ``https://evil.com/soundcloud.com/artist/track``.
+    """
+    if start == 0:
+        return True
+    prefix = text[:start]
+    return prefix[-1].isspace() or prefix.endswith("://")
+
+
 _YOUTUBE_VIDEO_ID_RE = re.compile(
-    r"(?:"
-    r"(?:https?://)?(?:www\.|m\.|music\.)?youtube\.com/"
+    r"(?:https?://)?(?:[\w-]+\.)*youtube\.com/"
     r"(?:watch\?(?:.*&)?v=|shorts/|embed/|live/)"
-    r"|(?:https?://)?youtu\.be/"
-    r")([a-zA-Z0-9_-]{11})(?![\w-])"
+    r"([a-zA-Z0-9_-]{11})(?![\w-])"
+)
+_YOUTUBE_SHORT_URL_RE = re.compile(
+    r"(?:https?://)?youtu\.be/([a-zA-Z0-9_-]{11})(?![\w-])"
 )
 
 
+def _iter_youtube_ids(text: str) -> list[str]:
+    video_ids: list[str] = []
+    for url_re in (_YOUTUBE_VIDEO_ID_RE, _YOUTUBE_SHORT_URL_RE):
+        for match in url_re.finditer(text):
+            if _is_host_at_boundary(text, match.start()):
+                video_ids.append(match.group(1))
+    return video_ids
+
+
 def _extract_youtube_urls(text: str) -> list[str]:
-    video_ids = _YOUTUBE_VIDEO_ID_RE.findall(text)
-    return [f"https://www.youtube.com/watch?v={video_id}" for video_id in video_ids]
+    return [
+        f"https://www.youtube.com/watch?v={video_id}"
+        for video_id in _iter_youtube_ids(text)
+    ]
 
 
-_FORBIDDEN_SOUNDCLOUD_SEGMENTS = (
+_RESERVED_USER_SEGMENTS = (
     "search|discover|you|upload|settings|messages|notifications|people"
+    "|sets|tracks|likes|albums|playlists|followers|following|comments|stream"
+)
+_RESERVED_TRACK_SEGMENTS = (
+    "search|discover|upload|settings|messages|notifications"
     "|sets|tracks|likes|albums|playlists|followers|following|comments|stream"
 )
 
 _SOUNDCLOUD_URL_RE = re.compile(
-    rf"(?:https?://)?(?:\w+\.)?soundcloud\.com/"
-    rf"(?!{_FORBIDDEN_SOUNDCLOUD_SEGMENTS})([\w.-]+)/"
-    rf"(?!{_FORBIDDEN_SOUNDCLOUD_SEGMENTS})([\w-]+)(?:[/?#].*)?"
+    rf"(?:https?://)?(?:(?:www|m|mobile)\.)?soundcloud\.com/"
+    rf"(?!{_RESERVED_USER_SEGMENTS})([\w.-]+)/"
+    rf"(?!{_RESERVED_TRACK_SEGMENTS})([\w-]+)(?:[/?#].*)?"
 )
 
 
 def _extract_soundcloud_urls(text: str) -> list[tuple[str, str]]:
-    return cast(list[tuple[str, str]], _SOUNDCLOUD_URL_RE.findall(text))
+    return [
+        (match.group(1), match.group(2))
+        for match in _SOUNDCLOUD_URL_RE.finditer(text)
+        if _is_host_at_boundary(text, match.start())
+    ]
 
 
 def extract_urls(text: str) -> list[str]:
@@ -58,15 +96,15 @@ def extract_urls(text: str) -> list[str]:
 
 
 def temp_stem(url: str) -> str:
-    video_ids = _YOUTUBE_VIDEO_ID_RE.findall(url)
+    video_ids = _iter_youtube_ids(url)
     if video_ids:
-        return f"yt-{video_ids[0]}"
+        return f"{YT_STEM_PREFIX}{video_ids[0]}"
     soundcloud_urls = _extract_soundcloud_urls(url)
     if soundcloud_urls:
         user, track = soundcloud_urls[0]
-        return sanitize_filename(f"sc-{user}-{track}")
+        return sanitize_filename(f"{SC_STEM_PREFIX}{user}-{track}")
     digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
-    return f"tmp-{digest}"
+    return f"{TMP_STEM_PREFIX}{digest}"
 
 
 def get_author(info: dict[str, Any]) -> list[str]:
