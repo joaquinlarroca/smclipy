@@ -6,7 +6,11 @@ _seen_cache: dict[Path, set[str]] = {}
 
 def read_lines(path: Path) -> list[str]:
     try:
-        return [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+        return [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
     except FileNotFoundError:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()

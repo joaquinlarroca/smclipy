@@ -13,6 +13,12 @@ def test_read_lines_returns_stripped_lines(tmp_path):
     assert read_lines(path) == ["A", "B", "C"]
 
 
+def test_read_lines_drops_blank_lines(tmp_path):
+    path = tmp_path / "data.txt"
+    path.write_text("A\n\n  \nB\n", encoding="utf-8")
+    assert read_lines(path) == ["A", "B"]
+
+
 def test_append_unique_lines_appends_missing(tmp_path):
     path = tmp_path / "data.txt"
     append_unique_lines(path, ["A", "B"])
