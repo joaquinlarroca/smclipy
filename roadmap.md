@@ -10,7 +10,6 @@ The development of `smclipy` is divided into three key phases, focusing on code 
 
 - **Multi-Format Support:** Expand beyond MP3 to support even more formats, including **FLAC**, **M4A**, and **Opus**.
 - **Enhanced Multi-Value Tagging:** Standardize how multi-artist and multi-genre tags are embedded across different formats and support more tags (e.g., ensuring proper native delimiters so they read flawlessly in advanced offline media players).
-- **Library Maintenance:** Introduce an interactive edit/re-tag mode to update metadata or swap cover art for files already in your library without re-downloading.
 
 ## Directory Organization & UI/UX
 
