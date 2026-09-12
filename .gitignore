@@ -20,3 +20,6 @@ htmlcov/
 # smclipy
 Music/
 config.json
+
+# Local tooling state
+.cortexkit/
