@@ -2,7 +2,7 @@ import re
 
 
 def sanitize_filename(filename: str) -> str:
-    clean_name = re.sub(r'[\\/*?:"<>|]', "", filename)
+    clean_name: str = re.sub(r'[\\/*?:"<>|]', "", filename)
     return clean_name.strip(" .")
 
 
@@ -15,7 +15,7 @@ def normalize_author(name: str) -> str:
 
 
 def resolve_known_authors(artists: list[str], known_authors: list[str]) -> list[str]:
-    known_by_normalized = {
+    known_by_normalized: dict[str, str] = {
         normalize_author(known): known
         for known in known_authors
         if normalize_author(known)
@@ -23,7 +23,7 @@ def resolve_known_authors(artists: list[str], known_authors: list[str]) -> list[
     resolved: list[str] = []
     seen: set[str] = set()
     for artist in artists:
-        normalized = normalize_author(artist)
+        normalized: str = normalize_author(artist)
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
@@ -34,13 +34,13 @@ def resolve_known_authors(artists: list[str], known_authors: list[str]) -> list[
 def distinct_authors(authors: list[str], known_authors: list[str]) -> list[str]:
     """Return `authors` entries not already in `known_authors`, ignoring
     case and whitespace so a differently-spelled duplicate isn't kept."""
-    known_by_normalized = {
+    known_by_normalized: set[str] = {
         normalize_author(author) for author in known_authors if normalize_author(author)
     }
     distinct: list[str] = []
     seen: set[str] = set()
     for author in authors:
-        normalized = normalize_author(author)
+        normalized: str = normalize_author(author)
         if not normalized or normalized in known_by_normalized or normalized in seen:
             continue
         seen.add(normalized)

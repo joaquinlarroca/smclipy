@@ -1,12 +1,15 @@
 import io
+import os
 
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import APIC, ID3
 from mutagen.mp3 import MP3
 from PIL import Image
 
+import smclipy.db as db
 from smclipy.metadata import (
     SaveResult,
+    ScanSummary,
     _get_image_mime,
     _mime_to_ext,
     _open_audio,
@@ -16,13 +19,14 @@ from smclipy.metadata import (
     change_cover,
     get_image_from_file,
     has_cover,
-    read_song_tags,
+    read_song_profile,
+    read_song_uuid,
     save_all_covers,
     save_image,
     save_song_temp_to_main,
     scan_library,
+    write_song_uuid,
 )
-from smclipy.storage import read_lines
 
 MINIMAL_MP3 = (bytes.fromhex("FFFB9064") + bytes(413)) * 2
 
@@ -99,19 +103,18 @@ def test_get_image_from_file_warns_on_corrupt_file(tmp_path, capsys):
     assert "could not read" in capsys.readouterr().out
 
 
-def test_scan_library_adds_authors_and_songs(app_settings):
+def test_scan_library_tracks_songs_and_authors(app_settings):
     music = app_settings.music_folder
     music.mkdir(parents=True, exist_ok=True)
     write_tagged_mp3(music / "one.mp3", title="Song", artist="Artist A")
     write_tagged_mp3(music / "two.mp3", title="Other", artist="Artist A")
     write_tagged_mp3(music / "three.mp3", title="Third", artist="Artist B")
     scan_library()
-    assert sorted(read_lines(app_settings.authors_file)) == ["Artist A", "Artist B"]
-    assert sorted(read_lines(app_settings.songs_info)) == [
-        "Other - Artist A",
-        "Song - Artist A",
-        "Third - Artist B",
-    ]
+    assert db.get_authors() == ["Artist A", "Artist B"]
+    songs = db.list_songs()
+    assert len(songs) == 3
+    assert {row["title"] for row in songs} == {"Song", "Other", "Third"}
+    assert {row["artists"] for row in songs} == {"Artist A", "Artist B"}
 
 
 def test_scan_library_skips_untagged_and_corrupt(app_settings):
@@ -121,43 +124,20 @@ def test_scan_library_skips_untagged_and_corrupt(app_settings):
     (music / "untagged.mp3").write_bytes(MINIMAL_MP3)
     (music / "garbage.mp3").write_bytes(b"not an mp3 at all")
     scan_library()
-    assert read_lines(app_settings.authors_file) == ["Artist A"]
-    assert read_lines(app_settings.songs_info) == ["Song - Artist A"]
+    assert db.get_authors() == ["Artist A"]
+    assert len(db.list_songs()) == 1
 
 
-def test_scan_library_skips_when_library_unchanged(app_settings, monkeypatch):
-    import smclipy.metadata as metadata
-
+def test_scan_library_is_idempotent(app_settings):
     music = app_settings.music_folder
     music.mkdir(parents=True, exist_ok=True)
     write_tagged_mp3(music / "one.mp3", title="Song", artist="Artist A")
 
-    calls: list[int] = []
-    real = metadata._iter_tagged_mp3s
-
-    def counting():
-        calls.append(1)
-        return real()
-
-    monkeypatch.setattr(metadata, "_iter_tagged_mp3s", counting)
-
     scan_library()
     scan_library()
 
-    assert len(calls) == 1
-    assert read_lines(app_settings.authors_file) == ["Artist A"]
-
-
-def test_scan_library_rescans_when_library_changed(app_settings):
-    music = app_settings.music_folder
-    music.mkdir(parents=True, exist_ok=True)
-    write_tagged_mp3(music / "one.mp3", title="Song", artist="Artist A")
-    scan_library()
-
-    write_tagged_mp3(music / "two.mp3", title="Other", artist="Artist B")
-    scan_library()
-
-    assert sorted(read_lines(app_settings.authors_file)) == ["Artist A", "Artist B"]
+    assert len(db.list_songs()) == 1
+    assert db.get_authors() == ["Artist A"]
 
 
 def test_scan_library_skips_case_variant_author_duplicates(app_settings):
@@ -165,12 +145,158 @@ def test_scan_library_skips_case_variant_author_duplicates(app_settings):
     music.mkdir(parents=True, exist_ok=True)
     write_tagged_mp3(music / "one.mp3", title="Song", artist="PINK FLOYD")
     scan_library()
-    assert read_lines(app_settings.authors_file) == ["PINK FLOYD"]
+    assert db.get_authors() == ["PINK FLOYD"]
 
     write_tagged_mp3(music / "two.mp3", title="Other", artist="Pink Floyd")
     scan_library()
 
-    assert read_lines(app_settings.authors_file) == ["PINK FLOYD"]
+    assert db.get_authors() == ["PINK FLOYD"]
+    assert len(db.list_songs()) == 2
+
+
+def test_scan_library_assigns_uuid_to_untracked_files(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    file = music / "untracked.mp3"
+    write_tagged_mp3(file, title="Song", artist="Artist A")
+
+    assert read_song_uuid(file) is None
+    scan_library()
+    assert read_song_uuid(file) is not None
+
+    scan_library()
+    assert len(db.list_songs()) == 1
+
+
+def test_scan_library_tracks_rename(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    file = music / "A-Song.mp3"
+    write_tagged_mp3(file, title="Song", artist="Artist A")
+    scan_library()
+
+    song_uuid = read_song_uuid(file)
+    assert song_uuid is not None
+
+    os.rename(file, music / "B-Song.mp3")
+    scan_library()
+
+    row = db.get_song_by_uuid(song_uuid)
+    assert row is not None
+    assert row["current_path"] == "B-Song.mp3"
+    assert {e["event"] for e in db.get_events(song_uuid)} == {"appeared", "renamed"}
+
+
+def test_scan_library_marks_missing_songs(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    file = music / "A-Song.mp3"
+    write_tagged_mp3(file, title="Song", artist="Artist A")
+    scan_library()
+
+    song_uuid = read_song_uuid(file)
+    assert song_uuid is not None
+
+    file.unlink()
+    scan_library()
+
+    row = db.get_song_by_uuid(song_uuid)
+    assert row is not None
+    assert row["current_path"] is None
+    assert {e["event"] for e in db.get_events(song_uuid)} == {"appeared", "missing"}
+
+
+def test_scan_library_backfills_row_uuid_into_writable_file(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    file = music / "Legacy-Song.mp3"
+    write_tagged_mp3(file, title="Song", artist="Artist A")
+
+    db.insert_song(current_path="Legacy-Song.mp3", title="Song", artists="Artist A")
+    legacy_uuid = db.get_song_by_path("Legacy-Song.mp3")[0]["uuid"]
+
+    scan_library()
+
+    assert read_song_uuid(file) == legacy_uuid
+    assert len(db.list_songs()) == 1
+
+
+def test_scan_library_new_file_at_renamed_path_gets_new_uuid(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    original = music / "A-Song.mp3"
+    write_tagged_mp3(original, title="Song", artist="Artist A")
+    scan_library()
+
+    song_uuid = read_song_uuid(original)
+    assert song_uuid is not None
+
+    os.rename(original, music / "B-Song.mp3")
+    replacement = music / "A-Song.mp3"
+    write_tagged_mp3(replacement, title="Different", artist="Artist B")
+    scan_library()
+
+    row = db.get_song_by_uuid(song_uuid)
+    assert row is not None
+    assert row["current_path"] == "B-Song.mp3"
+    assert read_song_uuid(replacement) != song_uuid
+    assert len(db.list_songs()) == 2
+
+
+def test_scan_library_reports_counts(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    first = music / "A-Song.mp3"
+    write_tagged_mp3(first, title="Song", artist="Artist A")
+    second = music / "Other-Song.mp3"
+    write_tagged_mp3(second, title="Other", artist="Artist B")
+    write_tagged_mp3(music / "Changed-Tag.mp3", title="Old", artist="Artist A")
+
+    summary = scan_library()
+    assert summary == ScanSummary(added=3, renamed=0, missing=0, changed=0)
+
+    os.rename(first, music / "Renamed.mp3")
+    changed_tags = EasyID3(str(music / "Changed-Tag.mp3"))
+    changed_tags["title"] = ["New"]
+    changed_tags.save()
+    summary = scan_library()
+    assert summary == ScanSummary(added=0, renamed=1, missing=0, changed=1)
+
+    (music / "Renamed.mp3").unlink()
+    summary = scan_library()
+    assert summary == ScanSummary(added=0, renamed=0, missing=1, changed=0)
+
+    summary = scan_library()
+    assert summary == ScanSummary(added=0, renamed=0, missing=0, changed=0)
+
+
+def test_scan_library_syncs_full_profile_tags(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    file = music / "A-Song.mp3"
+    write_tagged_mp3(file, title="Song", artist="Artist A", album="Album")
+    scan_library()
+    song_uuid = read_song_uuid(file)
+    assert song_uuid is not None
+    assert db.get_song_by_uuid(song_uuid)["album"] == "Album"
+    assert db.get_song_by_uuid(song_uuid)["date"] in (None, "")
+
+    retagged = EasyID3(str(file))
+    retagged["album"] = ["New Album"]
+    retagged["date"] = ["2001"]
+    retagged.save()
+
+    summary = scan_library()
+    assert summary == ScanSummary(added=0, renamed=0, missing=0, changed=1)
+
+    row = db.get_song_by_uuid(song_uuid)
+    assert row is not None
+    assert row["album"] == "New Album"
+    assert row["date"] == "2001"
+    assert row["title"] == "Song"
+
+    summary = scan_library()
+    assert summary == ScanSummary(added=0, renamed=0, missing=0, changed=0)
 
 
 def test_save_all_covers_skips_untagged_and_saves_tagged(app_settings):
@@ -296,7 +422,7 @@ def test_save_all_covers_preserves_dots_in_filename(app_settings):
     assert (app_settings.covers_folder / "Artist A-Song.One.png").is_file()
 
 
-def test_tag_file_writes_tags_and_cover(tmp_path):
+def test_tag_file_writes_tags_cover_and_tracking_uuid(tmp_path):
     mp3_file = tmp_path / "song.mp3"
     mp3_file.write_bytes(MINIMAL_MP3)
     image = tmp_path / "cover.png"
@@ -309,6 +435,22 @@ def test_tag_file_writes_tags_and_cover(tmp_path):
     assert tags["artist"] == ["Artist A", "Artist B"]
     assert tags["album"] == ["Album"]
     assert ID3(mp3_file).getall("APIC")
+    assert read_song_uuid(mp3_file) is not None
+
+
+def test_tag_file_preserves_existing_tracking_uuid(tmp_path):
+    mp3_file = tmp_path / "song.mp3"
+    mp3_file.write_bytes(MINIMAL_MP3)
+    audio = EasyID3()
+    audio["title"] = ["Song"]
+    audio["artist"] = ["Artist"]
+    audio.save(mp3_file)
+
+    song_uuid = write_song_uuid(mp3_file)
+    assert song_uuid is not None
+
+    assert _tag_file(mp3_file, "New", ["Artist"], "Album", None) is True
+    assert read_song_uuid(mp3_file) == song_uuid
 
 
 def test_tag_file_clears_stale_frames(tmp_path):
@@ -413,17 +555,20 @@ def test_save_song_temp_to_main_tags_then_moves(app_settings, tmp_path):
     image = tmp_path / "cover.png"
     image.write_bytes(make_png_bytes())
 
-    result = save_song_temp_to_main(source, image, "Song", "Artist A", "Great Album")
+    result, target = save_song_temp_to_main(
+        source, image, "Song", "Artist A", "Great Album"
+    )
 
     assert result is SaveResult.SAVED
+    assert target == app_settings.music_folder / "Artist A-Song.mp3"
     assert not source.exists()
-    target = app_settings.music_folder / "Artist A-Song.mp3"
     assert target.is_file()
     tags = EasyID3(target)
     assert tags["title"] == ["Song"]
     assert tags["artist"] == ["Artist A"]
     assert tags["album"] == ["Great Album"]
     assert ID3(target).getall("APIC")
+    assert read_song_uuid(target) is not None
 
 
 def test_save_song_temp_to_main_splits_comma_artists(app_settings, tmp_path):
@@ -433,7 +578,9 @@ def test_save_song_temp_to_main_splits_comma_artists(app_settings, tmp_path):
     image = tmp_path / "cover.png"
     image.write_bytes(make_png_bytes())
 
-    result = save_song_temp_to_main(source, image, "Song", "Author 1, Author 2", "Al")
+    result, _ = save_song_temp_to_main(
+        source, image, "Song", "Author 1, Author 2", "Al"
+    )
 
     assert result is SaveResult.SAVED
     assert not source.exists()
@@ -476,7 +623,7 @@ def test_save_song_temp_to_main_declined_overwrite_is_skipped(
 
     monkeypatch.setattr("smclipy.metadata.prompt_overwrite", lambda: False)
 
-    result = save_song_temp_to_main(source, image, "Song", "Artist A", "Album")
+    result, _ = save_song_temp_to_main(source, image, "Song", "Artist A", "Album")
 
     assert result is SaveResult.SKIPPED
     assert target.read_bytes() == b"original"
@@ -490,7 +637,7 @@ def test_save_song_temp_to_main_empty_authors_skips(app_settings, tmp_path, caps
     image = tmp_path / "cover.png"
     image.write_bytes(make_png_bytes())
 
-    result = save_song_temp_to_main(source, image, "Song", "   ", "Album")
+    result, _ = save_song_temp_to_main(source, image, "Song", "   ", "Album")
 
     assert result is SaveResult.FAILED
     assert source.exists()
@@ -502,7 +649,9 @@ def test_save_song_temp_to_main_missing_file_skips(app_settings, tmp_path, capsy
     image = tmp_path / "cover.png"
     image.write_bytes(make_png_bytes())
 
-    result = save_song_temp_to_main(tmp_path / "missing.mp3", image, "Song", "A", "Al")
+    result, _ = save_song_temp_to_main(
+        tmp_path / "missing.mp3", image, "Song", "A", "Al"
+    )
 
     assert result is SaveResult.FAILED
     assert not (app_settings.music_folder / "A-Song.mp3").exists()
@@ -532,12 +681,12 @@ def test_mime_to_ext_mapping():
     assert _mime_to_ext("application/octet-stream") == ".png"
 
 
-def test_read_song_tags_returns_profile(app_settings, tmp_path):
+def test_read_song_profile_returns_tags(app_settings, tmp_path):
     app_settings.music_folder.mkdir(parents=True, exist_ok=True)
     tagged = app_settings.music_folder / "A-Song.mp3"
     write_tagged_mp3(tagged, title="My Song", artist="Artist", album="My Album")
 
-    profile = read_song_tags(tagged)
+    profile, has_cover_flag = read_song_profile(tagged)
 
     assert profile["title"] == "My Song"
     assert profile["artists"] == "Artist"
@@ -546,11 +695,13 @@ def test_read_song_tags_returns_profile(app_settings, tmp_path):
     assert profile["genre"] == ""
     assert profile["album_artist"] == ""
     assert profile["track_number"] == ""
+    assert has_cover_flag is False
 
 
-def test_read_song_tags_missing_file_warns(app_settings, tmp_path, capsys):
-    profile = read_song_tags(tmp_path / "missing.mp3")
+def test_read_song_profile_missing_file_warns(app_settings, tmp_path, capsys):
+    profile, has_cover_flag = read_song_profile(tmp_path / "missing.mp3")
     assert profile == {}
+    assert has_cover_flag is False
     assert "could not read" in capsys.readouterr().out
 
 

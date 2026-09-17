@@ -3,37 +3,23 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from mutagen.easyid3 import EasyID3
 from PIL import Image
 
-from smclipy.cli import cmd_crop, filter_processed_ids, process_video
-from smclipy.metadata import SaveResult
-from smclipy.storage import read_lines
+import smclipy.db as db
+from smclipy.cli import cmd_crop, process_video
+from smclipy.metadata import SaveResult, write_song_uuid
 
-
-def test_filter_processed_ids_keeps_unprocessed():
-    assert filter_processed_ids(["A", "B", "C"], ["A"]) == ["B", "C"]
-
-
-def test_filter_processed_ids_empty_processed():
-    assert filter_processed_ids(["A", "B"], []) == ["A", "B"]
-
-
-def test_filter_processed_ids_all_processed():
-    assert filter_processed_ids(["A", "B"], ["B", "A"]) == []
-
-
-def test_filter_processed_ids_preserves_order():
-    assert filter_processed_ids(["C", "A", "B"], ["A"]) == ["C", "B"]
+MINIMAL_MP3 = (bytes.fromhex("FFFB9064") + bytes(413)) * 2
 
 
 def test_collect_new_queue_resets_state(monkeypatch, app_settings):
     import smclipy.cli as cli
 
-    monkeypatch.setattr(cli, "collect_urls", lambda s: ["A", "B"])
-    pending_ids = cli._collect_new_queue(app_settings)
+    monkeypatch.setattr(cli, "collect_urls", lambda: ["A", "B"])
+    pending_ids = cli._collect_new_queue()
     assert pending_ids == ["A", "B"]
-    assert read_lines(app_settings.pending_ids_file) == ["A", "B"]
-    assert read_lines(app_settings.processed_ids_file) == []
+    assert db.get_pending_urls() == ["A", "B"]
 
 
 def test_process_video_deletes_stale_temp_files(monkeypatch, app_settings):
@@ -61,7 +47,14 @@ def test_process_video_deletes_stale_temp_files(monkeypatch, app_settings):
     monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
     monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
     monkeypatch.setattr(cli, "prompt_authors", lambda *a, **k: "Artist")
-    monkeypatch.setattr(cli, "save_song_temp_to_main", lambda *a, **k: SaveResult.SAVED)
+    monkeypatch.setattr(
+        cli,
+        "save_song_temp_to_main",
+        lambda *a, **k: (
+            SaveResult.SAVED,
+            app_settings.music_folder / "Artist-Song.mp3",
+        ),
+    )
 
     process_video("https://soundcloud.com/artist/track", [])
 
@@ -71,8 +64,7 @@ def test_process_video_deletes_stale_temp_files(monkeypatch, app_settings):
     assert not (temp / "yt-abcdefghijk.webp").exists()
     assert not (temp / "tag-cover-rec-1.jpg").exists()
     assert get_image_from_file_calls == [("sc-artist-track.mp3", "sc-artist-track")]
-    assert read_lines(app_settings.authors_file) == ["Artist"]
-    assert read_lines(app_settings.songs_info) == ["Song - Artist"]
+    assert db.get_authors() == ["Artist"]
 
 
 def test_process_video_skips_crop_prompt_when_already_1_to_1(
@@ -97,7 +89,14 @@ def test_process_video_skips_crop_prompt_when_already_1_to_1(
     monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
     monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
     monkeypatch.setattr(cli, "prompt_authors", lambda *a, **k: "Artist")
-    monkeypatch.setattr(cli, "save_song_temp_to_main", lambda *a, **k: SaveResult.SAVED)
+    monkeypatch.setattr(
+        cli,
+        "save_song_temp_to_main",
+        lambda *a, **k: (
+            SaveResult.SAVED,
+            app_settings.music_folder / "Artist-Song.mp3",
+        ),
+    )
 
     process_video("https://soundcloud.com/artist/track", [])
 
@@ -108,8 +107,7 @@ def test_process_video_skips_crop_prompt_when_already_1_to_1(
 def test_process_video_prefills_corrected_authors(monkeypatch, app_settings):
     import smclipy.cli as cli
 
-    app_settings.authors_file.parent.mkdir(parents=True, exist_ok=True)
-    app_settings.authors_file.write_text("author1\n", encoding="utf-8")
+    db.add_authors(["author1"])
 
     captured = {}
 
@@ -126,7 +124,14 @@ def test_process_video_prefills_corrected_authors(monkeypatch, app_settings):
     monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
     monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
     monkeypatch.setattr(cli, "prompt_authors", fake_prompt_authors)
-    monkeypatch.setattr(cli, "save_song_temp_to_main", lambda *a, **k: SaveResult.SAVED)
+    monkeypatch.setattr(
+        cli,
+        "save_song_temp_to_main",
+        lambda *a, **k: (
+            SaveResult.SAVED,
+            app_settings.music_folder / "Artist-Song.mp3",
+        ),
+    )
 
     process_video("https://soundcloud.com/artist/track", ["author1"])
 
@@ -155,7 +160,14 @@ def test_process_video_prefills_multiple_artists_with_backslash(
     monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
     monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
     monkeypatch.setattr(cli, "prompt_authors", fake_prompt_authors)
-    monkeypatch.setattr(cli, "save_song_temp_to_main", lambda *a, **k: SaveResult.SAVED)
+    monkeypatch.setattr(
+        cli,
+        "save_song_temp_to_main",
+        lambda *a, **k: (
+            SaveResult.SAVED,
+            app_settings.music_folder / "Artist-Song.mp3",
+        ),
+    )
 
     process_video("https://soundcloud.com/artist/track", [])
 
@@ -182,12 +194,19 @@ def test_process_video_splits_comma_separated_autofill(monkeypatch, app_settings
     monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
     monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
     monkeypatch.setattr(cli, "prompt_authors", fake_prompt_authors)
-    monkeypatch.setattr(cli, "save_song_temp_to_main", lambda *a, **k: SaveResult.SAVED)
+    monkeypatch.setattr(
+        cli,
+        "save_song_temp_to_main",
+        lambda *a, **k: (
+            SaveResult.SAVED,
+            app_settings.music_folder / "Artist-Song.mp3",
+        ),
+    )
 
     process_video("https://soundcloud.com/artist/track", [])
 
     assert captured["default"] == "author1, author2"
-    assert read_lines(app_settings.authors_file) == ["author1", "author2"]
+    assert db.get_authors() == ["author1", "author2"]
 
 
 def test_process_video_prefills_album(monkeypatch, app_settings):
@@ -208,7 +227,14 @@ def test_process_video_prefills_album(monkeypatch, app_settings):
     monkeypatch.setattr(cli, "prompt_album", fake_prompt_album)
     monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
     monkeypatch.setattr(cli, "prompt_authors", lambda *a, **k: "Artist")
-    monkeypatch.setattr(cli, "save_song_temp_to_main", lambda *a, **k: SaveResult.SAVED)
+    monkeypatch.setattr(
+        cli,
+        "save_song_temp_to_main",
+        lambda *a, **k: (
+            SaveResult.SAVED,
+            app_settings.music_folder / "Artist-Song.mp3",
+        ),
+    )
 
     process_video("https://soundcloud.com/artist/track", [])
 
@@ -222,7 +248,7 @@ def test_process_video_passes_album_to_save(monkeypatch, app_settings):
 
     def fake_save(temp_mp3, temp_png, title, authors, album):
         captured["album"] = album
-        return SaveResult.SAVED
+        return (SaveResult.SAVED, None)
 
     monkeypatch.setattr(
         cli, "download", lambda url, stem="temp": {"album": "Great Album"}
@@ -251,13 +277,12 @@ def test_process_video_skips_records_when_save_cancelled(monkeypatch, app_settin
     monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
     monkeypatch.setattr(cli, "prompt_authors", lambda *a, **k: "Artist")
     monkeypatch.setattr(
-        cli, "save_song_temp_to_main", lambda *a, **k: SaveResult.FAILED
+        cli, "save_song_temp_to_main", lambda *a, **k: (SaveResult.FAILED, None)
     )
 
     process_video("https://soundcloud.com/artist/track", [])
 
-    assert read_lines(app_settings.authors_file) == []
-    assert read_lines(app_settings.songs_info) == []
+    assert db.get_authors() == []
 
 
 def make_pillarbox_png(path) -> None:
@@ -322,6 +347,35 @@ def test_cmd_crop_reembeds_dotted_title_cover(monkeypatch, app_settings):
     change_cover.assert_called_once()
 
 
+def test_cmd_crop_reembeds_into_renamed_mp3(monkeypatch, app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    original = music / "Artist-Song.mp3"
+    original.write_bytes(MINIMAL_MP3)
+    song_uuid = write_song_uuid(original, "11111111-1111-1111-1111-111111111111")
+    assert song_uuid is not None
+    db.insert_song(
+        song_uuid=song_uuid,
+        current_path="Artist-Song.mp3",
+        title="Song",
+        artists="Artist",
+    )
+    db.set_song_path(song_uuid, "Renamed.mp3")
+    original.rename(music / "Renamed.mp3")
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+
+    cmd_crop(argparse.Namespace())
+
+    change_cover.assert_called_once()
+    assert change_cover.call_args.args[1] == music / "Renamed.mp3"
+
+
 def test_cmd_directories_prints_all_paths(monkeypatch, tmp_path, capsys):
     import json
 
@@ -346,8 +400,7 @@ def test_cmd_directories_prints_all_paths(monkeypatch, tmp_path, capsys):
     assert f"Library:     {(music / 'smclipy').resolve()}" in out
     assert f"Temp:        {(music / 'smclipy' / '.temp').resolve()}" in out
     assert f"Covers:      {(music / 'smclipy' / 'covers').resolve()}" in out
-    assert f"Authors:     {(music / 'smclipy' / 'authors.txt').resolve()}" in out
-    assert f"Songs info:  {(music / 'smclipy' / 'songs_info.txt').resolve()}" in out
+    assert f"Database:    {(music / 'smclipy' / 'smclipy.db').resolve()}" in out
 
 
 def test_cmd_directories_works_without_config(monkeypatch, tmp_path, capsys):
@@ -402,6 +455,94 @@ def test_main_dispatch_dispatches_tag(monkeypatch, app_settings):
     assert len(calls) == 1
 
 
+def test_main_dispatch_dispatches_tag_auto(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+
+    def fake_cmd_tag(_args):
+        calls.append(_args)
+
+    monkeypatch.setattr(cli, "cmd_tag", fake_cmd_tag)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    cli.main(["tag", "--auto"])
+    assert len(calls) == 1
+    assert calls[0].auto is True
+    assert calls[0].semi is False
+
+
+def test_main_dispatch_dispatches_tag_semi(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+
+    def fake_cmd_tag(_args):
+        calls.append(_args)
+
+    monkeypatch.setattr(cli, "cmd_tag", fake_cmd_tag)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    cli.main(["tag", "-s"])
+    assert len(calls) == 1
+    assert calls[0].auto is False
+    assert calls[0].semi is True
+
+
+def test_main_rejects_tag_auto_and_semi_together(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["tag", "--auto", "--semi"])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert "not allowed with argument" in captured.err
+
+
+def test_main_dispatch_dispatches_update(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+
+    def fake_cmd_update(_args):
+        calls.append(_args)
+
+    monkeypatch.setattr(cli, "cmd_update", fake_cmd_update)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    cli.main(["update"])
+    assert len(calls) == 1
+
+
+def test_main_update_works_without_tty(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr(cli, "cmd_update", lambda _args: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    cli.main(["update"])
+    assert "interactive terminal" not in capsys.readouterr().out
+
+
+def test_cmd_update_reports_scan_summary(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(MINIMAL_MP3)
+    audio = EasyID3()
+    audio["title"] = ["Song"]
+    audio["artist"] = ["Artist"]
+    audio.save(music / "Artist-Song.mp3")
+
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    cli.cmd_update(argparse.Namespace())
+
+    out = capsys.readouterr().out
+    assert "Scanning music files..." in out
+    assert "Updated: 1 added" in out
+
+    cli.cmd_update(argparse.Namespace())
+    assert "Already up to date." in capsys.readouterr().out
+
+
 def test_main_help_works_without_tty(monkeypatch, capsys):
     import smclipy.cli as cli
 
@@ -431,7 +572,7 @@ def test_collect_urls_exits_cleanly_on_eof(monkeypatch, capsys, app_settings):
         lambda _prompt: (_ for _ in ()).throw(EOFError()),
     )
     with pytest.raises(SystemExit) as exc:
-        cli.collect_urls(app_settings)
+        cli.collect_urls()
     assert exc.value.code == 130
     assert "Interrupted" in capsys.readouterr().out
 
@@ -441,7 +582,7 @@ def test_collect_urls_warns_on_unrecognized_input(monkeypatch, capsys, app_setti
 
     inputs = iter(["not a url at all", ""])
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
-    urls = cli.collect_urls(app_settings)
+    urls = cli.collect_urls()
     assert urls == []
     assert "no recognizable video URLs" in capsys.readouterr().out
 
@@ -453,7 +594,7 @@ def test_collect_urls_still_extracts_valid_urls(monkeypatch, capsys, app_setting
         ["garbage https://youtu.be/abcdefghijk", "https://soundcloud.com/a/b", ""]
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
-    urls = cli.collect_urls(app_settings)
+    urls = cli.collect_urls()
     assert urls == [
         "https://www.youtube.com/watch?v=abcdefghijk",
         "https://soundcloud.com/a/b",
@@ -471,11 +612,9 @@ def test_collect_urls_persists_partial_queue_on_interrupt(
         lambda _prompt: inputs.pop(0) if inputs else (_ for _ in ()).throw(EOFError()),
     )
     with pytest.raises(SystemExit) as exc:
-        cli.collect_urls(app_settings)
+        cli.collect_urls()
     assert exc.value.code == 130
-    assert read_lines(app_settings.pending_ids_file) == [
-        "https://www.youtube.com/watch?v=abcdefghijk"
-    ]
+    assert db.get_pending_urls() == ["https://www.youtube.com/watch?v=abcdefghijk"]
     assert "partial queue" in capsys.readouterr().out
 
 
@@ -492,7 +631,7 @@ def test_collect_urls_dedupes_repeated_urls(monkeypatch, app_settings):
         ]
     )
     monkeypatch.setattr("builtins.input", lambda _prompt: next(inputs))
-    assert cli.collect_urls(app_settings) == [
+    assert cli.collect_urls() == [
         "https://www.youtube.com/watch?v=abcdefghijk",
         "https://soundcloud.com/a/b",
     ]
@@ -514,7 +653,14 @@ def test_process_video_reprompts_on_empty_title(monkeypatch, app_settings):
     monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
     monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
     monkeypatch.setattr(cli, "prompt_authors", lambda *a, **k: "Artist")
-    monkeypatch.setattr(cli, "save_song_temp_to_main", lambda *a, **k: SaveResult.SAVED)
+    monkeypatch.setattr(
+        cli,
+        "save_song_temp_to_main",
+        lambda *a, **k: (
+            SaveResult.SAVED,
+            app_settings.music_folder / "Artist-Song.mp3",
+        ),
+    )
 
     process_video("https://soundcloud.com/artist/track", [])
     assert len(calls) == 2
@@ -539,9 +685,9 @@ def test_process_video_reprompts_on_empty_authors(monkeypatch, app_settings):
         title: str,
         authors: str,
         album: str,
-    ) -> SaveResult:
+    ) -> tuple[SaveResult, Path | None]:
         captured["authors"] = authors
-        return SaveResult.SAVED
+        return (SaveResult.SAVED, None)
 
     monkeypatch.setattr(
         cli, "download", lambda url, stem="temp": {"title": "Song", "channel": "Artist"}
@@ -566,9 +712,8 @@ def test_cmd_download_skips_unexpected_errors(monkeypatch, app_settings, capsys)
 
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
-    monkeypatch.setattr(cli, "get_all_names", lambda: [])
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda s: ["vid-a", "vid-b"])
+    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a", "vid-b"])
     monkeypatch.setattr(
         cli,
         "process_video",
@@ -581,7 +726,7 @@ def test_cmd_download_skips_unexpected_errors(monkeypatch, app_settings, capsys)
     assert "unexpected error" in out
     assert "vid-a" in out
     assert "vid-b" in out
-    assert read_lines(app_settings.processed_ids_file) == []
+    assert db.get_pending_urls() == ["vid-a", "vid-b"]
 
 
 def test_cmd_download_cleans_temp_files_on_finish(monkeypatch, app_settings):
@@ -594,9 +739,8 @@ def test_cmd_download_cleans_temp_files_on_finish(monkeypatch, app_settings):
 
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
-    monkeypatch.setattr(cli, "get_all_names", lambda: [])
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda s: [])
+    monkeypatch.setattr(cli, "collect_urls", lambda: [])
 
     cli.cmd_download(argparse.Namespace())
 
@@ -612,21 +756,19 @@ def test_cmd_download_survives_processed_recording_error(
 
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
-    monkeypatch.setattr(cli, "get_all_names", lambda: [])
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda s: ["vid-a"])
+    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a"])
     monkeypatch.setattr(cli, "process_video", lambda vid, authors: SaveResult.SAVED)
 
-    def raisy(path, lines):
+    def raisy(url, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(cli, "append_unique_lines", raisy)
+    monkeypatch.setattr(cli.db, "mark_processed", raisy)
 
     cli.cmd_download(argparse.Namespace())
 
     out = capsys.readouterr().out
     assert "could not record" in out
-    assert "could not persist" in out
 
 
 def test_cmd_download_repends_unsaved_videos(monkeypatch, app_settings):
@@ -634,15 +776,13 @@ def test_cmd_download_repends_unsaved_videos(monkeypatch, app_settings):
 
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
-    monkeypatch.setattr(cli, "get_all_names", lambda: [])
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda s: ["vid-a"])
+    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a"])
     monkeypatch.setattr(cli, "process_video", lambda vid, authors: SaveResult.FAILED)
 
     cli.cmd_download(argparse.Namespace())
 
-    assert read_lines(app_settings.processed_ids_file) == []
-    assert read_lines(app_settings.pending_ids_file) == ["vid-a"]
+    assert db.get_pending_urls() == ["vid-a"]
 
 
 def _raises_keyboard_interrupt(vid, authors):
@@ -654,9 +794,8 @@ def test_cmd_download_interrupt_exits_130(monkeypatch, app_settings, capsys):
 
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
-    monkeypatch.setattr(cli, "get_all_names", lambda: [])
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda s: ["vid-a", "vid-b"])
+    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a", "vid-b"])
     monkeypatch.setattr(cli, "process_video", _raises_keyboard_interrupt)
 
     with pytest.raises(SystemExit) as exc:
@@ -671,9 +810,8 @@ def test_cmd_download_interrupt_persists_skipped(monkeypatch, app_settings):
 
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
-    monkeypatch.setattr(cli, "get_all_names", lambda: [])
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda s: ["vid-a", "vid-b"])
+    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a", "vid-b"])
 
     calls: list[str] = []
 
@@ -688,10 +826,7 @@ def test_cmd_download_interrupt_persists_skipped(monkeypatch, app_settings):
     with pytest.raises(SystemExit) as exc:
         cli.cmd_download(argparse.Namespace())
     assert exc.value.code == 130
-    pending = read_lines(app_settings.pending_ids_file)
-    assert "vid-a" in pending
-    assert "Interrupted" not in pending
-    assert read_lines(app_settings.processed_ids_file) == []
+    assert sorted(db.get_pending_urls()) == ["vid-a", "vid-b"]
 
 
 def test_cmd_crop_reembeds_jpg_cover(monkeypatch, app_settings):
@@ -754,3 +889,123 @@ def make_pillarbox_webp(path) -> None:
         for y in range(100):
             img.putpixel((x, y), (255, 0, 0))
     img.save(path, "WEBP")
+
+
+def test_process_video_records_song_source(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    app_settings.temp_folder.mkdir(parents=True, exist_ok=True)
+    target = app_settings.music_folder / "Artist-Song.mp3"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(MINIMAL_MP3)
+    write_song_uuid(target)
+
+    monkeypatch.setattr(cli, "download", lambda url, stem="temp": {"title": "Song"})
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "prompt_crop", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "prompt_title", lambda *a, **k: "Song")
+    monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "prompt_authors", lambda *a, **k: "Artist")
+    monkeypatch.setattr(
+        cli,
+        "save_song_temp_to_main",
+        lambda *a, **k: (SaveResult.SAVED, target),
+    )
+
+    process_video("https://soundcloud.com/artist/track", [])
+
+    songs = db.list_songs()
+    assert len(songs) == 1
+    row = songs[0]
+    assert row["source_url"] == "https://soundcloud.com/artist/track"
+    assert row["current_path"] == "Artist-Song.mp3"
+    assert row["title"] == "Song"
+    assert row["artists"] == "Artist"
+    assert any(e["event"] == "downloaded" for e in db.get_events(row["uuid"]))
+    assert db.get_authors() == ["Artist"]
+
+
+def test_cmd_crop_records_cropped_status(monkeypatch, app_settings):
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+
+    cmd_crop(argparse.Namespace())
+
+    assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] == "cropped"
+    change_cover.assert_called_once()
+
+
+def test_cmd_crop_scans_library_before_recording_status(monkeypatch, app_settings):
+    from mutagen.easyid3 import EasyID3
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    mp3 = music / "Artist-Song.mp3"
+    mp3.write_bytes(MINIMAL_MP3)
+    audio = EasyID3()
+    audio["title"] = ["Song"]
+    audio["artist"] = ["Artist"]
+    audio.save(mp3)
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+
+    cmd_crop(argparse.Namespace())
+
+    assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] == "cropped"
+    change_cover.assert_called_once()
+
+
+def test_cmd_crop_records_false_positive(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    monkeypatch.setattr(cli, "display_image", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "prompt_crop", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "crop_image_1_to_1", lambda *a, **k: None)
+
+    change_cover = Mock()
+    monkeypatch.setattr(cli, "change_cover", change_cover)
+
+    cmd_crop(argparse.Namespace())
+
+    assert db.get_false_positives() == {"Artist-Song"}
+    assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] == "false_positive"
+    change_cover.assert_not_called()
+
+    cmd_crop(argparse.Namespace())
+    change_cover.assert_not_called()
+    assert "No images to crop" in capsys.readouterr().out
+
+
+def test_cmd_crop_records_not_pillarbox(monkeypatch, app_settings):
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (100, 100), "red").save(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    cmd_crop(argparse.Namespace())
+
+    assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] == "not_pillarbox"

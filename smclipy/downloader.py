@@ -6,6 +6,7 @@ import yt_dlp as yt_dlp
 import yt_dlp.utils
 
 from smclipy.config import settings
+from smclipy.formats import FORMAT_TO_NATIVE_CODEC
 from smclipy.helpers import sanitize_filename
 
 YT_STEM_PREFIX = "yt-"
@@ -32,16 +33,16 @@ def _is_host_at_boundary(text: str, start: int) -> bool:
     """
     if start == 0:
         return True
-    prefix = text[:start]
+    prefix: str = text[:start]
     return prefix[-1].isspace() or prefix.endswith("://")
 
 
-_YOUTUBE_VIDEO_ID_RE = re.compile(
+_YOUTUBE_VIDEO_ID_RE: re.Pattern[str] = re.compile(
     r"(?:https?://)?(?:[\w-]+\.)*youtube\.com/"
     r"(?:watch\?(?:.*&)?v=|shorts/|embed/|live/)"
     r"([a-zA-Z0-9_-]{11})(?![\w-])"
 )
-_YOUTUBE_SHORT_URL_RE = re.compile(
+_YOUTUBE_SHORT_URL_RE: re.Pattern[str] = re.compile(
     r"(?:https?://)?youtu\.be/([a-zA-Z0-9_-]{11})(?![\w-])"
 )
 
@@ -71,7 +72,7 @@ _RESERVED_TRACK_SEGMENTS = (
     "|sets|tracks|likes|albums|playlists|followers|following|comments|stream"
 )
 
-_SOUNDCLOUD_URL_RE = re.compile(
+_SOUNDCLOUD_URL_RE: re.Pattern[str] = re.compile(
     rf"(?:https?://)?(?:(?:www|m|mobile)\.)?soundcloud\.com/"
     rf"(?!{_RESERVED_USER_SEGMENTS})([\w.-]+)/"
     rf"(?!{_RESERVED_TRACK_SEGMENTS})([\w-]+)(?:[/?#].*)?"
@@ -87,8 +88,8 @@ def _extract_soundcloud_urls(text: str) -> list[tuple[str, str]]:
 
 
 def extract_urls(text: str) -> list[str]:
-    youtube_urls = _extract_youtube_urls(text)
-    soundcloud_urls = [
+    youtube_urls: list[str] = _extract_youtube_urls(text)
+    soundcloud_urls: list[str] = [
         f"https://soundcloud.com/{user}/{track}"
         for user, track in _extract_soundcloud_urls(text)
     ]
@@ -96,14 +97,14 @@ def extract_urls(text: str) -> list[str]:
 
 
 def temp_stem(url: str) -> str:
-    video_ids = _iter_youtube_ids(url)
+    video_ids: list[str] = _iter_youtube_ids(url)
     if video_ids:
         return f"{YT_STEM_PREFIX}{video_ids[0]}"
-    soundcloud_urls = _extract_soundcloud_urls(url)
+    soundcloud_urls: list[tuple[str, str]] = _extract_soundcloud_urls(url)
     if soundcloud_urls:
         user, track = soundcloud_urls[0]
         return sanitize_filename(f"{SC_STEM_PREFIX}{user}-{track}")
-    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+    digest: str = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
     return f"{TMP_STEM_PREFIX}{digest}"
 
 
@@ -145,16 +146,20 @@ def _contains_keyboard_interrupt(exc: BaseException) -> bool:
 
 
 def _yt_dlp_opts(stem: str) -> dict[str, Any]:
+    s = settings()
+    codec: str = FORMAT_TO_NATIVE_CODEC.get(s.audio_format, "mp3")
+    extract_audio_opts: dict[str, Any] = {
+        "key": "FFmpegExtractAudio",
+        "preferredcodec": codec,
+    }
+    if s.audio_format == "mp3":
+        extract_audio_opts["preferredquality"] = "320"
     return {
         "format": "bestaudio/best",
         "writethumbnail": True,
-        "outtmpl": str(settings().temp_folder.joinpath(f"{stem}.%(ext)s")),
+        "outtmpl": str(s.temp_folder.joinpath(f"{stem}.%(ext)s")),
         "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "320",
-            },
+            extract_audio_opts,
             {
                 "key": "EmbedThumbnail",
             },

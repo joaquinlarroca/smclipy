@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from smclipy.formats import SUPPORTED_FORMATS
 from smclipy.helpers import sanitize_filename
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -10,6 +11,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "path_to_music_folder": "./Music",
     "description_max_lines": 5,
     "write_album_if_same_as_title": False,
+    "audio_format": "mp3",
     "tag_fields": [
         "title",
         "artists",
@@ -22,7 +24,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 COVER_FIELD = "cover"
-TAG_FIELDS = frozenset(
+TAG_FIELDS: frozenset[str] = frozenset(
     {"title", "artists", "album", "date", "album_artist", "track_number", COVER_FIELD}
 )
 CONFIG_PATH = Path(
@@ -51,25 +53,26 @@ class Settings:
         if not isinstance(raw_name, str) or not raw_name.strip():
             raw_name = "smclipy"
             print("Warning: 'name' must be a non-empty string, using 'smclipy'")
-        script_name = sanitize_filename(raw_name)
+        script_name: str = sanitize_filename(raw_name)
         if not script_name:
             script_name = "smclipy"
             print(
                 "Warning: 'name' only contains characters that are invalid in "
                 "filenames, using 'smclipy'"
             )
-        self.script_folder = self.music_folder.joinpath(script_name)
-        self.temp_folder = self.script_folder.joinpath(".temp")
-        self.pending_ids_file = self.temp_folder.joinpath("pending_ids.txt")
-        self.processed_ids_file = self.temp_folder.joinpath("processed_ids.txt")
-        self.authors_file = self.script_folder.joinpath("authors.txt")
-        self.tagged_files_file = self.script_folder.joinpath("tagged_files.txt")
-        self.songs_info = self.script_folder.joinpath("songs_info.txt")
-        self.scan_state_file = self.script_folder.joinpath("scan_state.txt")
-        self.false_positives_file = self.script_folder.joinpath(
+        self.script_folder: Path = self.music_folder.joinpath(script_name)
+        self.temp_folder: Path = self.script_folder.joinpath(".temp")
+        # Legacy text-file tracking paths, referenced only by the one-time
+        # migration into the SQLite database (smclipy/db.py).
+        self.pending_ids_file: Path = self.temp_folder.joinpath("pending_ids.txt")
+        self.processed_ids_file: Path = self.temp_folder.joinpath("processed_ids.txt")
+        self.authors_file: Path = self.script_folder.joinpath("authors.txt")
+        self.tagged_files_file: Path = self.script_folder.joinpath("tagged_files.txt")
+        self.false_positives_file: Path = self.script_folder.joinpath(
             "cropping_tool_false_positives.txt"
         )
-        self.covers_folder = self.script_folder.joinpath("covers")
+        self.db_path: Path = self.script_folder.joinpath("smclipy.db")
+        self.covers_folder: Path = self.script_folder.joinpath("covers")
         raw_value = raw.get("description_max_lines", 5)
         if isinstance(raw_value, bool):
             raw_value = 5
@@ -77,17 +80,27 @@ class Settings:
             parsed = int(raw_value)
         except (TypeError, ValueError):
             parsed = 5
-        self.description_max_lines = max(0, parsed)
+        self.description_max_lines: int = max(0, parsed)
         raw_flag = raw.get("write_album_if_same_as_title", False)
-        self.write_album_if_same_as_title = (
+        self.write_album_if_same_as_title: bool = (
             raw_flag if isinstance(raw_flag, bool) else False
         )
         raw_fields = raw.get("tag_fields", list(DEFAULT_CONFIG.get("tag_fields", [])))
         if isinstance(raw_fields, list):
-            fields = [str(field) for field in raw_fields if isinstance(field, str)]
+            fields: list[str] = [
+                field for field in raw_fields if isinstance(field, str)
+            ]
         else:
             fields = []
-        self.tag_fields = [field for field in fields if field in TAG_FIELDS]
+        self.tag_fields: list[str] = [field for field in fields if field in TAG_FIELDS]
+        raw_format = raw.get("audio_format", "mp3")
+        if not isinstance(raw_format, str) or raw_format not in SUPPORTED_FORMATS:
+            print(
+                f"Warning: 'audio_format' must be one of "
+                f"{', '.join(SUPPORTED_FORMATS)}, using 'mp3'"
+            )
+            raw_format = "mp3"
+        self.audio_format: str = raw_format
 
 
 # Global settings singleton. This is a CLI: a single settings object lives for
@@ -127,7 +140,7 @@ def _load_raw_config(create_if_missing: bool = True) -> dict[str, Any]:
 
 
 def setup_folders() -> None:
-    s = settings()
+    s: Settings = settings()
     try:
         for folder in (s.script_folder, s.covers_folder, s.temp_folder):
             folder.mkdir(parents=True, exist_ok=True)

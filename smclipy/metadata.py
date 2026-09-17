@@ -1,15 +1,22 @@
 import os
+import uuid
 from collections.abc import Iterator
 from enum import Enum, auto
 from pathlib import Path
+from typing import Any, NamedTuple
 
-from mutagen.id3 import APIC, ID3, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TRCK
-from mutagen.mp3 import MP3, error
-from PIL import Image as PILImage
+from mutagen.id3 import APIC
 
+import smclipy.db as db
 from smclipy.config import Settings, settings
-from smclipy.helpers import distinct_authors, sanitize_filename, split_authors
-from smclipy.storage import append_unique_lines, read_lines
+from smclipy.formats import (
+    Track,
+    audio_ext,
+    format_of,
+    image_mime,
+    open_for_tagging,
+)
+from smclipy.helpers import normalize_author, sanitize_filename, split_authors
 from smclipy.ui import prompt_overwrite
 
 
@@ -21,198 +28,287 @@ class SaveResult(Enum):
     FAILED = auto()
 
 
-def _title_from_id3(id3: ID3) -> str:
-    for frame in id3.getall("TIT2"):
-        if frame.text:
-            return str(frame.text[0])
-    return "Unknown"
+class ScanSummary(NamedTuple):
+    """What a library scan changed in the tracking database."""
+
+    added: int = 0
+    renamed: int = 0
+    missing: int = 0
+    changed: int = 0
 
 
-def _artists_from_id3(id3: ID3) -> list[str]:
-    artists = [str(text) for frame in id3.getall("TPE1") for text in frame.text]
-    return list(dict.fromkeys(artist.strip() for artist in artists if artist.strip()))
-
-
-def _single_text_from_id3(id3: ID3, frame_id: str) -> str:
-    for frame in id3.getall(frame_id):
-        if frame.text:
-            return str(frame.text[0]).strip()
-    return ""
-
-
-def _album_from_id3(id3: ID3) -> str:
-    return _single_text_from_id3(id3, "TALB")
-
-
-def _date_from_id3(id3: ID3) -> str:
-    return _single_text_from_id3(id3, "TDRC")
-
-
-def _genre_from_id3(id3: ID3) -> str:
-    return _single_text_from_id3(id3, "TCON")
-
-
-def _album_artist_from_id3(id3: ID3) -> str:
-    return _single_text_from_id3(id3, "TPE2")
-
-
-def _track_number_from_id3(id3: ID3) -> str:
-    return _single_text_from_id3(id3, "TRCK")
-
-
-def _iter_tagged_mp3s() -> Iterator[tuple[ID3, str, list[str]]]:
-    for file in settings().music_folder.glob("*.mp3"):
-        if not file.is_file():
-            continue
-        try:
-            id3 = ID3(file)
-        except Exception as exc:
-            print(f"Warning: could not read '{file.name}', skipping: {exc}")
-            continue
-        yield id3, _title_from_id3(id3), _artists_from_id3(id3)
-
-
-def _library_fingerprint(s: Settings) -> str:
-    files = []
-    for file in s.music_folder.glob("*.mp3"):
-        try:
-            stat = file.stat()
-        except OSError:
-            continue
-        files.append(f"{file.name}\0{stat.st_mtime_ns}\0{stat.st_size}")
-    return repr(sorted(files))
-
-
-def scan_library() -> None:
-    s = settings()
-    fingerprint = _library_fingerprint(s)
-    try:
-        previous = s.scan_state_file.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError):
-        previous = None
-    if previous == fingerprint:
+def iter_audio_files() -> Iterator[Path]:
+    """Every supported audio file in the music folder, sorted by name."""
+    folder: Path = settings().music_folder
+    if not folder.is_dir():
         return
-    known_authors = read_lines(s.authors_file)
-    for _id3, title, artists in _iter_tagged_mp3s():
-        if not artists:
+    for file in sorted(folder.iterdir()):
+        if file.is_file() and format_of(file) is not None:
+            yield file
+
+
+def read_song_uuid(file: Path) -> str | None:
+    """Read the smclipy tracking UUID from an audio file's tags."""
+    track: Track | None = Track.open(file)
+    if track is None:
+        return None
+    return track.read_uuid()
+
+
+def write_song_uuid(file: Path, song_uuid: str | None = None) -> str | None:
+    """Write a tracking UUID into the file's tags and return it."""
+    if song_uuid is None:
+        song_uuid = str(uuid.uuid4())
+    track: Track | None = Track.open(file)
+    if track is None:
+        return None
+    try:
+        track.write_uuid(song_uuid)
+        track.save()
+    except Exception as exc:
+        print(f"Warning: could not write tracking id to '{file.name}': {exc}")
+        return None
+    return song_uuid
+
+
+def _iter_tagged_files() -> Iterator[tuple[Track, str, list[str]]]:
+    for file in iter_audio_files():
+        track: Track | None = Track.open(file)
+        if track is None:
             continue
-        new_authors = distinct_authors(artists, known_authors)
-        if new_authors:
-            append_unique_lines(s.authors_file, new_authors)
-            known_authors.extend(new_authors)
-        append_unique_lines(s.songs_info, [f"{title} - {', '.join(artists)}"])
-    s.scan_state_file.parent.mkdir(parents=True, exist_ok=True)
-    s.scan_state_file.write_text(fingerprint, encoding="utf-8")
+        profile, _ = track.read_profile()
+        yield track, profile["title"], track.read_artists()
+
+
+def _matches_tags(title: str, artists: list[str], row: Any) -> bool:
+    """Whether a brand-new file at a tracked path plausibly is the tracked song.
+
+    Prevents handing a tracked UUID to a different song dropped onto an old
+    path after a rename: only backfill when title and artists agree with the
+    recorded row (file artists may be a subset of the recorded ones).
+    """
+    if row["title"] and title.casefold().strip() != row["title"].casefold().strip():
+        return False
+    if row["artists"]:
+        known_set = {normalize_author(a) for a in split_authors(row["artists"])}
+        file_set = {normalize_author(a) for a in artists}
+        known_set.discard("")
+        file_set.discard("")
+        if file_set and not file_set <= known_set:
+            return False
+    return True
+
+
+def scan_library() -> ScanSummary:
+    """Reconcile the database with the music folder.
+
+    Every audio file is keyed by its tracking UUID: new files get a UUID
+    written and a row inserted, renamed files keep their row (a
+    ``renamed`` event is logged), and files that vanished are marked
+    missing.
+    """
+    s: Settings = settings()
+    seen: set[str] = set()
+    authors_seen: set[str] = set()
+    added = renamed = missing = changed = 0
+    with db.transaction() as conn:
+        known: dict[str, Any] = {}
+        by_path: dict[str, str] = {}
+        for row in db.list_songs(conn):
+            known[row["uuid"]] = row
+            if row["current_path"]:
+                by_path.setdefault(row["current_path"], row["uuid"])
+            elif row["first_seen_path"]:
+                # A missing song (no current_path) returning to its original
+                # location reclaims its old UUID; an owned path never hands
+                # its UUID to a different file placed there later.
+                by_path.setdefault(row["first_seen_path"], row["uuid"])
+        for file in iter_audio_files():
+            rel: str = file.relative_to(s.music_folder).as_posix()
+            seen.add(rel)
+            track: Track | None = open_for_tagging(file)
+            if track is None:
+                continue
+            profile: dict[str, str]
+            has_cover: bool
+            profile, has_cover = track.read_profile()
+            title: str = profile["title"]
+            artists_list: list[str] = track.read_artists()
+            artists_str: str = ", ".join(artists_list)
+            authors_seen.update(artists_list)
+            song_uuid: str | None = track.read_uuid()
+            if song_uuid is None:
+                candidate: str | None = by_path.get(rel)
+                if candidate is not None and not _matches_tags(
+                    title, artists_list, known[candidate]
+                ):
+                    candidate = None
+                song_uuid = write_song_uuid(file, candidate)
+                if song_uuid is None:
+                    continue
+            existing: Any = known.get(song_uuid)
+            if existing is None:
+                db.insert_song(
+                    conn=conn,
+                    song_uuid=song_uuid,
+                    current_path=rel,
+                    title=title,
+                    artists=artists_str,
+                    album=profile["album"],
+                    date=profile["date"],
+                    genre=profile["genre"],
+                    album_artist=profile["album_artist"],
+                    track_number=profile["track_number"],
+                    has_cover=has_cover,
+                )
+                db.log_event(song_uuid, "appeared", {"path": rel}, conn=conn)
+                added += 1
+                continue
+            current: str | None = existing["current_path"]
+            if current is not None and current != rel:
+                db.set_song_path(song_uuid, rel, conn=conn)
+                db.log_event(
+                    song_uuid,
+                    "renamed",
+                    {"old_path": current, "new_path": rel},
+                    conn=conn,
+                )
+                db.update_song_metadata(
+                    song_uuid,
+                    title=title,
+                    artists=artists_str,
+                    album=profile["album"],
+                    date=profile["date"],
+                    genre=profile["genre"],
+                    album_artist=profile["album_artist"],
+                    track_number=profile["track_number"],
+                    has_cover=has_cover,
+                    conn=conn,
+                )
+                renamed += 1
+            else:
+                db.touch_song(song_uuid, conn=conn)
+                if (
+                    existing["title"] != title
+                    or (existing["artists"] or "") != artists_str
+                    or (existing["album"] or "") != (profile["album"] or "")
+                    or (existing["date"] or "") != (profile["date"] or "")
+                    or (existing["genre"] or "") != (profile["genre"] or "")
+                    or (existing["album_artist"] or "")
+                    != (profile["album_artist"] or "")
+                    or (existing["track_number"] or "")
+                    != (profile["track_number"] or "")
+                    or bool(existing["has_cover"]) != has_cover
+                ):
+                    db.update_song_metadata(
+                        song_uuid,
+                        title=title,
+                        artists=artists_str,
+                        album=profile["album"],
+                        date=profile["date"],
+                        genre=profile["genre"],
+                        album_artist=profile["album_artist"],
+                        track_number=profile["track_number"],
+                        has_cover=has_cover,
+                        conn=conn,
+                    )
+                    changed += 1
+        for row in db.list_songs(conn):
+            current = row["current_path"]
+            if current is not None and current not in seen:
+                db.mark_song_missing(row["uuid"], conn=conn)
+                db.log_event(row["uuid"], "missing", {"path": current}, conn=conn)
+                missing += 1
+        db.add_authors(sorted(authors_seen), conn=conn)
+    return ScanSummary(added, renamed, missing, changed)
 
 
 def save_all_covers() -> None:
-    s = settings()
-    for id3, title, artists in _iter_tagged_mp3s():
-        if not artists or not any(key.startswith("APIC") for key in id3):
+    s: Settings = settings()
+    for track, title, artists in _iter_tagged_files():
+        if not artists or not track.has_cover():
             continue
-        save_image(sanitize_filename(f"{artists[0]}-{title}"), id3, s.covers_folder)
+        save_image(sanitize_filename(f"{artists[0]}-{title}"), track, s.covers_folder)
 
 
 def get_image_from_file(file: Path, save_to_path: Path, save_as: str) -> Path | None:
     if not file.is_file():
         return None
-    try:
-        file_id3: ID3 = ID3(file)
-    except Exception as exc:
-        print(f"Warning: could not read '{file.name}', skipping cover: {exc}")
+    track: Track | None = Track.open(file)
+    if track is None:
+        print(f"Warning: could not read '{file.name}', skipping cover")
         return None
-    return save_image(sanitize_filename(save_as), file_id3, save_to_path)
+    return save_image(sanitize_filename(save_as), track, save_to_path)
 
 
-def _open_audio(file: Path) -> MP3 | None:
-    if not file.is_file():
-        return None
-    try:
-        audio: MP3 = MP3(file, ID3=ID3)
-    except (error, OSError):
-        try:
-            audio = MP3(file)
-        except (error, OSError):
-            return None
-    if audio.tags is None:
-        audio.add_tags()
-    return audio
+def _open_audio(file: Path) -> Track | None:
+    return Track.open(file)
 
 
 def save_song_temp_to_main(
     file: Path, image: Path | None, title: str, authors: str, album: str
-) -> SaveResult:
-    authors_list = split_authors(authors)
+) -> tuple[SaveResult, Path | None]:
+    authors_list: list[str] = split_authors(authors)
     if not authors_list:
         print("Warning: no artists provided, skipping save")
-        return SaveResult.FAILED
-    target_name = sanitize_filename(f"{authors_list[0]}-{title}.mp3")
+        return SaveResult.FAILED, None
+    extension: str = audio_ext(format_of(file) or settings().audio_format)
+    target_name: str = sanitize_filename(f"{authors_list[0]}-{title}{extension}")
     if not target_name:
         print("Warning: artist/title produced an invalid filename, skipping save")
-        return SaveResult.FAILED
-    target = settings().music_folder.joinpath(target_name)
+        return SaveResult.FAILED, None
+    target: Path = settings().music_folder.joinpath(target_name)
     if target.is_file():
         print(f"Warning: '{target.name}' already exists")
         if not prompt_overwrite():
-            return SaveResult.SKIPPED
+            return SaveResult.SKIPPED, None
     if not _tag_file(file, title, authors_list, album, image):
-        return SaveResult.FAILED
+        return SaveResult.FAILED, None
     os.replace(str(file), str(target))
-    return SaveResult.SAVED
+    return SaveResult.SAVED, target
 
 
 def _tag_file(
     target: Path, title: str, authors: list[str], album: str, image: Path | None
 ) -> bool:
-    audio = _open_audio(target)
-    if audio is None:
+    track: Track | None = _open_audio(target)
+    if track is None:
         print(f"Warning: could not read '{target.name}', skipping save")
         return False
-    tags = audio.tags
-    if tags is None:
-        raise RuntimeError(f"'{target.name}' has no ID3 tag stream")
-    for key in list(tags.keys()):
-        parent_id = key[:4]
-        if parent_id in ("TIT2", "TPE1", "TALB", "APIC"):
-            continue
-        tags.delall(parent_id)
-    tags.add(TIT2(encoding=3, text=title))
-    tags.add(TPE1(encoding=3, text=authors))
-    tags.add(TALB(encoding=3, text=album))
-    _set_cover(audio, image)
-    audio.save()
+    track.strip_unknown_tags()
+    track.set_field("title", title)
+    track.set_artists(authors)
+    track.set_field("album", album)
+    if track.read_uuid() is None:
+        track.write_uuid(str(uuid.uuid4()))
+    track.set_cover(image)
+    try:
+        track.save()
+    except Exception as exc:
+        print(f"Warning: could not save '{target.name}': {exc}")
+        return False
     return True
 
 
 def read_song_profile(file: Path) -> tuple[dict[str, str], bool]:
-    """Read an MP3's tag profile and whether it carries embedded cover art."""
-    try:
-        id3 = ID3(file)
-    except Exception as exc:
-        print(f"Warning: could not read '{file.name}', skipping: {exc}")
+    """Read an audio file's tag profile and whether it has embedded cover art."""
+    track: Track | None = Track.open(file)
+    if track is None:
+        print(f"Warning: could not read '{file.name}', skipping tag read")
         return {}, False
-    return {
-        "title": _title_from_id3(id3),
-        "artists": ", ".join(_artists_from_id3(id3)),
-        "album": _album_from_id3(id3),
-        "date": _date_from_id3(id3),
-        "genre": _genre_from_id3(id3),
-        "album_artist": _album_artist_from_id3(id3),
-        "track_number": _track_number_from_id3(id3),
-    }, any(key.startswith("APIC") for key in id3)
+    return track.read_profile()
 
 
 def read_song_tags(file: Path) -> dict[str, str]:
-    """Read the full tag profile of an MP3 into a field -> value mapping."""
+    """Read the full tag profile of an audio file into a field -> value mapping."""
     return read_song_profile(file)[0]
 
 
 def has_cover(file: Path) -> bool:
-    try:
-        id3 = ID3(file)
-    except Exception:
+    track: Track | None = Track.open(file)
+    if track is None:
         return False
-    return any(key.startswith("APIC") for key in id3)
+    return track.has_cover()
 
 
 def apply_tag_update(
@@ -228,39 +324,42 @@ def apply_tag_update(
     image: Path | None = None,
 ) -> bool:
     """Apply a partial tag update, only overwriting fields that are not None."""
-    audio = _open_audio(file)
-    if audio is None:
+    track: Track | None = _open_audio(file)
+    if track is None:
         print(f"Warning: could not read '{file.name}', skipping update")
         return False
-    tags = audio.tags
-    if tags is None:
-        raise RuntimeError(f"'{file.name}' has no ID3 tag stream")
     if title is not None:
-        tags.add(TIT2(encoding=3, text=title))
+        track.set_field("title", title)
     if artists is not None:
-        tags.add(TPE1(encoding=3, text=artists))
+        track.set_artists(artists)
     if album is not None:
-        tags.add(TALB(encoding=3, text=album))
+        track.set_field("album", album)
     if date is not None:
-        tags.add(TDRC(encoding=3, text=date))
+        track.set_field("date", date)
     if genre is not None:
-        tags.add(TCON(encoding=3, text=genre))
+        track.set_field("genre", genre)
     if album_artist is not None:
-        tags.add(TPE2(encoding=3, text=album_artist))
+        track.set_field("album_artist", album_artist)
     if track_number is not None:
-        tags.add(TRCK(encoding=3, text=track_number))
+        track.set_field("track_number", track_number)
     if image is not None:
-        _set_cover(audio, image)
-    audio.save()
+        track.set_cover(image)
+    try:
+        track.save()
+    except Exception as exc:
+        print(f"Warning: could not save '{file.name}': {exc}")
+        return False
     return True
 
 
 def _get_image_mime(image: Path) -> str:
-    with PILImage.open(image) as img:
-        return PILImage.MIME.get(img.format or "", "application/octet-stream")
+    return image_mime(image)
 
 
-def _set_cover(audio: MP3, image: Path | None) -> None:
+def _set_cover(audio: Any, image: Path | None) -> None:
+    if isinstance(audio, Track):
+        audio.set_cover(image)
+        return
     if audio.tags is None:
         audio.add_tags()
     if image is None or not image.is_file():
@@ -281,17 +380,20 @@ def _set_cover(audio: MP3, image: Path | None) -> None:
 
 
 def change_cover(image: Path, file: Path) -> None:
-    audio = _open_audio(file)
-    if audio is None:
+    track: Track | None = _open_audio(file)
+    if track is None:
         print(f"Warning: could not read '{file.name}', skipping cover re-embed")
         return
-    _set_cover(audio, image)
-    audio.save()
+    track.set_cover(image)
+    try:
+        track.save()
+    except Exception as exc:
+        print(f"Warning: could not save '{file.name}': {exc}")
 
 
 COVER_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
-_MIME_TO_EXT = {
+_MIME_TO_EXT: dict[str, str] = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
     "image/webp": ".webp",
@@ -304,33 +406,40 @@ def _mime_to_ext(mime: str) -> str:
 
 
 def get_all_names() -> list[str]:
-    return read_lines(settings().authors_file)
+    return db.get_authors()
 
 
 def _without_cover_extension(name: str) -> str:
-    lowered = name.casefold()
+    lowered: str = name.casefold()
     for extension in COVER_EXTENSIONS:
         if lowered.endswith(extension):
             return name[: -len(extension)]
     return name
 
 
-def save_image(name: str, song_file: ID3, path: Path) -> Path | None:
-    stem = _without_cover_extension(name)
-    apic_key = next((key for key in song_file if key.startswith("APIC")), None)
-    if not apic_key:
-        print(f"Couldn't find '{stem}' cover")
-        return None
-    artwork = song_file[apic_key]
-    ext = _mime_to_ext(artwork.mime)
-    known_mime = artwork.mime in _MIME_TO_EXT
+def save_image(name: str, song_file: Any, path: Path) -> Path | None:
+    stem: str = _without_cover_extension(name)
+    if isinstance(song_file, Track):
+        cover: tuple[str, bytes] | None = song_file.read_cover()
+        if cover is None:
+            print(f"Couldn't find '{stem}' cover")
+            return None
+        mime: str = cover[0]
+        data: bytes = cover[1]
+    else:
+        apic_key = next((key for key in song_file if key.startswith("APIC")), None)
+        if not apic_key:
+            print(f"Couldn't find '{stem}' cover")
+            return None
+        artwork = song_file[apic_key]
+        mime = artwork.mime
+        data = artwork.data
+    ext: str = _mime_to_ext(mime)
+    known_mime: bool = mime in _MIME_TO_EXT
     if not known_mime:
-        print(
-            f"Warning: unrecognized cover mime '{artwork.mime}' for '{stem}', "
-            "assuming PNG"
-        )
-    target = path.joinpath(f"{stem}{ext}")
-    existing = next(
+        print(f"Warning: unrecognized cover mime '{mime}' for '{stem}', assuming PNG")
+    target: Path = path.joinpath(f"{stem}{ext}")
+    existing: Path | None = next(
         (
             path.joinpath(f"{stem}{extension}")
             for extension in COVER_EXTENSIONS
@@ -340,19 +449,19 @@ def save_image(name: str, song_file: ID3, path: Path) -> Path | None:
     )
     if existing is not None:
         if existing == target:
-            if existing.read_bytes() == artwork.data:
+            if existing.read_bytes() == data:
                 return target
-            target.write_bytes(artwork.data)
+            target.write_bytes(data)
             print(f"Updated '{target.name}'")
             return target
         if not known_mime:
-            existing.write_bytes(artwork.data)
+            existing.write_bytes(data)
             print(f"Updated '{existing.name}'")
             return existing
-        target.write_bytes(artwork.data)
+        target.write_bytes(data)
         existing.unlink()
         print(f"Fixed '{existing.name}' -> '{target.name}'")
         return target
     print(f"Saving '{target.name}'")
-    target.write_bytes(artwork.data)
+    target.write_bytes(data)
     return target

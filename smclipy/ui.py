@@ -24,51 +24,49 @@ def show_video_info(info_dictionary: dict[str, Any]) -> None:
     print("---------- TITLE ----------")
     print(info_dictionary.get("title", "No title"))
     print("---------- ARTIST/S ----------")
-    authors = get_author(info_dictionary)
+    authors: list[str] = get_author(info_dictionary)
     if authors:
         print(", ".join(authors))
     else:
         print("No artists")
     print("---------- DESCRIPTION ----------")
     description = str(info_dictionary.get("description", "No description"))
-    description_lines = description.splitlines()[: settings().description_max_lines]
+    description_lines: list[str] = description.splitlines()[
+        : settings().description_max_lines
+    ]
     print("\n".join(description_lines))
     print("")
 
 
-def prompt_crop(default: bool = False) -> bool:
+def _choice_yes_no(
+    message: str, *, default: bool, yes: str = "Yes", no: str = "No"
+) -> bool:
     return (
         choice(
-            message="Crop cover to 1:1?",
-            options=[("Yes", "Yes"), ("No", "No")],
-            default="Yes" if default else "No",
+            message=message,
+            options=[(yes, yes), (no, no)],
+            default=yes if default else no,
         )
-        == "Yes"
+        == yes
     )
 
 
+def prompt_crop(default: bool = False) -> bool:
+    return _choice_yes_no("Crop cover to 1:1?", default=default)
+
+
 def prompt_resume() -> bool:
-    return (
-        choice(
-            message="Found an interrupted download. Resume from where it stopped?",
-            options=[("Yes", "Yes"), ("No", "No")],
-            default="Yes",
-        )
-        == "Yes"
+    return _choice_yes_no(
+        "Found an interrupted download. Resume from where it stopped?", default=True
     )
 
 
 def prompt_overwrite() -> bool:
-    return (
-        choice(
-            message="File already exists. Overwrite it?",
-            options=[
-                ("No (keep existing)", "No (keep existing)"),
-                ("Yes (overwrite)", "Yes (overwrite)"),
-            ],
-            default="No (keep existing)",
-        )
-        == "Yes (overwrite)"
+    return _choice_yes_no(
+        "File already exists. Overwrite it?",
+        default=False,
+        yes="Yes (overwrite)",
+        no="No (keep existing)",
     )
 
 
@@ -93,7 +91,7 @@ def prompt_authors(authors_list: list[str], default: str = "") -> str:
 
 def _expand_song_token(token: str) -> list[int]:
     """Expand ``"7"`` or ``"2-5"`` into a list of 1-based song numbers."""
-    bounds = [part.strip() for part in token.split("-")]
+    bounds: list[str] = [part.strip() for part in token.split("-")]
     if len(bounds) == 1:
         return [int(bounds[0])]
     if len(bounds) != 2 or not bounds[0] or not bounds[1]:
@@ -113,7 +111,7 @@ def prompt_song_selection(count: int) -> list[int]:
     """
     while True:
         try:
-            answer = prompt(
+            answer: str = prompt(
                 "Song numbers/ranges (e.g. 1,3,5 or 2-10), 'all' for every song, "
                 "or 'q' to cancel: "
             )
@@ -126,9 +124,11 @@ def prompt_song_selection(count: int) -> list[int]:
             return []
         if answer.casefold() == "all":
             return list(range(count))
-        parts = [part.strip() for part in answer.split(",") if part.strip()]
+        parts: list[str] = [part.strip() for part in answer.split(",") if part.strip()]
         try:
-            numbers = [number for part in parts for number in _expand_song_token(part)]
+            numbers: list[int] = [
+                number for part in parts for number in _expand_song_token(part)
+            ]
         except ValueError:
             print("Invalid selection. Use numbers or ranges (e.g. 1,3,5 or 2-10).")
             continue
@@ -140,15 +140,15 @@ def prompt_song_selection(count: int) -> list[int]:
 
 def prompt_match_selection(matches: list["MusicBrainzMatch"]) -> int | None:
     """Let the user pick a candidate match, or None to skip the song."""
-    options = [("Skip this song", "Skip this song")]
+    options: list[tuple[str, str]] = [("Skip this song", "Skip this song")]
     for index, match in enumerate(matches, start=1):
-        label = ", ".join(match.artists) + f" - {match.title}"
+        label: str = ", ".join(match.artists) + f" - {match.title}"
         if match.album:
             label += f" | {match.album}"
         if match.date:
             label += f" ({match.date})"
         options.append((str(index), label))
-    selection = choice(
+    selection: str = choice(
         message="Pick a matching recording:",
         options=options,
         default="Skip this song",
@@ -162,7 +162,7 @@ def prompt_match_selection(matches: list["MusicBrainzMatch"]) -> int | None:
     return index - 1
 
 
-_DARK_DIALOG_STYLE = Style.from_dict(
+_DARK_DIALOG_STYLE: Style = Style.from_dict(
     {
         "dialog": "bg:#1e1e1e #d4d4d4",
         "dialog.body": "bg:#1e1e1e #d4d4d4",
@@ -183,7 +183,7 @@ _DARK_DIALOG_STYLE = Style.from_dict(
     }
 )
 
-_TAG_FIELD_ORDER = [
+_TAG_FIELD_ORDER: list[str] = [
     "title",
     "artists",
     "album",
@@ -191,7 +191,7 @@ _TAG_FIELD_ORDER = [
     "album_artist",
     "track_number",
 ]
-_TAG_FIELD_LABELS = {
+_TAG_FIELD_LABELS: dict[str, str] = {
     "title": "Title",
     "artists": "Artist(s)",
     "album": "Album",
@@ -212,24 +212,13 @@ def collect_tag_changes(
     ]
 
 
-def display_tag_diff(current: dict[str, str], intended: dict[str, str]) -> None:
-    """Print the fields that would change between two tag profiles."""
-    changes = collect_tag_changes(current, intended)
-    if not changes:
-        print("No tag changes to apply.")
-        return
-    width = max(len(_TAG_FIELD_LABELS.get(field, field)) for field, _, _ in changes)
-    print("Changes to apply:")
-    for field, before, after in changes:
-        label = _TAG_FIELD_LABELS.get(field, field)
-        print(f"  {label:<{width}}  {before or '(empty)'} -> {after}")
-
-
 def _tag_checkbox_dialog(
     values: list[tuple[str, str]], default_values: list[str], style: Style
 ) -> Application[list[str]]:
     """Checkbox dialog where Enter applies and Space toggles the focused row."""
-    cb_list = CheckboxList(values=values, default_values=default_values)
+    cb_list: CheckboxList[str] = CheckboxList(
+        values=values, default_values=default_values
+    )
 
     def apply_now() -> None:
         get_app().exit(result=cb_list.current_values)
@@ -246,7 +235,8 @@ def _tag_checkbox_dialog(
         body=HSplit(
             [
                 Label(
-                    text="Space toggles a field, Enter applies:",
+                    text="Space toggles a field, Enter applies (uncheck all to skip "
+                    "this song):",
                     dont_extend_height=True,
                 ),
                 cb_list,
@@ -255,7 +245,6 @@ def _tag_checkbox_dialog(
         ),
         buttons=[
             Button(text="Apply", handler=apply_now),
-            Button(text="Skip this song", handler=get_app().exit),
         ],
         with_background=True,
     )
@@ -275,10 +264,10 @@ def prompt_tag_changes(
     """Let the user tick which fields to apply.
 
     Every offered change is checked by default. Pressing Enter applies the
-    checked fields immediately, Space toggles the focused row, and
-    ``None`` is returned when the user cancels.
+    checked fields immediately, Space toggles the focused row, and unchecking
+    every field and pressing Apply skips the song (an empty selection).
     """
-    values = [
+    values: list[tuple[str, str]] = [
         (
             field,
             f"{_TAG_FIELD_LABELS.get(field, field)}: {before or '(empty)'} -> {after}",
@@ -289,7 +278,7 @@ def prompt_tag_changes(
         values.append(("cover", "Cover image"))
     if not values:
         return []
-    selected = _tag_checkbox_dialog(
+    selected: list[str] = _tag_checkbox_dialog(
         values=values,
         default_values=[field for field, _ in values],
         style=_DARK_DIALOG_STYLE,

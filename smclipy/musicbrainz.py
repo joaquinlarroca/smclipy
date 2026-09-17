@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import musicbrainzngs
 from PIL import Image as PILImage
@@ -19,7 +19,7 @@ _SEARCH_LIMIT = 5
 _MIN_REQUEST_INTERVAL = 1.0
 _last_request_at = 0.0
 
-_SNIFFED_EXT_BY_FORMAT = {
+_SNIFFED_EXT_BY_FORMAT: dict[str, str] = {
     "JPEG": ".jpg",
     "PNG": ".png",
     "WEBP": ".webp",
@@ -29,8 +29,8 @@ _SNIFFED_EXT_BY_FORMAT = {
 
 def _throttle() -> None:
     global _last_request_at
-    elapsed = time.monotonic() - _last_request_at
-    remaining = _MIN_REQUEST_INTERVAL - elapsed
+    elapsed: float = time.monotonic() - _last_request_at
+    remaining: float = _MIN_REQUEST_INTERVAL - elapsed
     if remaining > 0:
         time.sleep(remaining)
     _last_request_at = time.monotonic()
@@ -63,7 +63,9 @@ def _artist_credit(recording: dict[str, Any]) -> list[str]:
         if not isinstance(credit, dict):
             continue
         artist = credit.get("artist")
-        name = str(artist.get("name", "")).strip() if isinstance(artist, dict) else ""
+        name: str = (
+            str(artist.get("name", "")).strip() if isinstance(artist, dict) else ""
+        )
         if not name:
             name = str(credit.get("name", "")).strip()
         if name and name not in artists:
@@ -92,10 +94,10 @@ def _has_official_release(recording: dict[str, Any]) -> bool:
 
 def _best_track_number(release: dict[str, Any], recording_title: str) -> str:
     fallback = ""
-    expected = recording_title.casefold().strip()
+    expected: str = recording_title.casefold().strip()
     for medium in release.get("medium-list", []):
         for track in medium.get("track-list", []):
-            number = str(track.get("number", "")).strip()
+            number: str = str(track.get("number", "")).strip()
             if not number:
                 continue
             if str(track.get("title", "")).strip().casefold() == expected:
@@ -110,19 +112,19 @@ def _release_details(
 ) -> tuple[str, str, str, str, str | None]:
     if release is None:
         return "", "", "", "", None
-    album = str(release.get("title", "")).strip()
-    date = str(release.get("date", "")).strip()
-    album_artist = str(release.get("artist-credit-phrase", "")).strip()
+    album: str = str(release.get("title", "")).strip()
+    date: str = str(release.get("date", "")).strip()
+    album_artist: str = str(release.get("artist-credit-phrase", "")).strip()
     release_group = release.get("release-group", {})
-    release_group_id = str(release_group.get("id") or "") or None
-    track_number = _best_track_number(release, recording_title)
+    release_group_id: str | None = str(release_group.get("id") or "") or None
+    track_number: str = _best_track_number(release, recording_title)
     return album, date, album_artist, track_number, release_group_id
 
 
 def _match_from_recording(recording: dict[str, Any]) -> MusicBrainzMatch:
-    title = str(recording.get("title", "")).strip()
-    artists = _artist_credit(recording)
-    release = _first_official_release(recording)
+    title: str = str(recording.get("title", "")).strip()
+    artists: list[str] = _artist_credit(recording)
+    release: dict[str, Any] | None = _first_official_release(recording)
     album, date, album_artist, track_number, release_group_id = _release_details(
         release, title
     )
@@ -140,14 +142,14 @@ def _match_from_recording(recording: dict[str, Any]) -> MusicBrainzMatch:
 
 def _rank_recording(recording: dict[str, Any]) -> tuple[int, int, int]:
     """Rank an official studio recording above covers and live tracks."""
-    raw_score = recording.get("ext:score", "") or ""
+    raw_score: Any = recording.get("ext:score", "") or ""
     try:
         score = int(str(raw_score))
     except (TypeError, ValueError):
         score = 0
-    official = 1 if _has_official_release(recording) else 0
-    score_part = score if official else max(0, score - 20)
-    haystack = " ".join(
+    official: Literal[0, 1] = 1 if _has_official_release(recording) else 0
+    score_part: int = score if official else max(0, score - 20)
+    haystack: str = " ".join(
         {
             str(recording.get("title", "")),
             str(recording.get("disambiguation", "")),
@@ -168,16 +170,16 @@ def search_recordings(
 ) -> list[MusicBrainzMatch]:
     """Search MusicBrainz for a recording and return ranked candidates."""
     _configure_agent()
-    cleaned_title = _clean_query_value(title)
+    cleaned_title: str = _clean_query_value(title)
     if not cleaned_title:
         return []
-    query_parts = [f'"{cleaned_title}"']
+    query_parts: list[str] = [f'"{cleaned_title}"']
     for artist in artists:
-        clean = _clean_query_value(artist)
+        clean: str = _clean_query_value(artist)
         if clean:
             query_parts.append(f' AND artist:"{clean}"')
     if album:
-        clean_album = _clean_query_value(album)
+        clean_album: str = _clean_query_value(album)
         if clean_album:
             query_parts.append(f' AND release:"{clean_album}"')
     try:
@@ -196,7 +198,7 @@ def _sniff_cover_extension(data: bytes) -> str | None:
     """Detect the cover's image format, or None if ``data`` isn't an image."""
     try:
         with PILImage.open(BytesIO(data)) as image:
-            format_name = image.format
+            format_name: str | None = image.format
     except Exception:
         return None
     if format_name is None:
@@ -220,14 +222,14 @@ def fetch_cover_art(release_group_id: str, dest: Path) -> Path | None:
         return None
     if not data:
         return None
-    extension = _sniff_cover_extension(data)
+    extension: str | None = _sniff_cover_extension(data)
     if extension is None:
         print(
             f"Warning: cover art for release group {release_group_id} "
             "is not a valid image, skipping."
         )
         return None
-    actual_dest = dest.with_suffix(extension) if extension else dest
+    actual_dest: Path = dest.with_suffix(extension) if extension else dest
     actual_dest.parent.mkdir(parents=True, exist_ok=True)
     actual_dest.write_bytes(data)
     return actual_dest
