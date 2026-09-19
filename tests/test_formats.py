@@ -71,7 +71,7 @@ def test_settings_default_audio_format_is_mp3(app_settings):
 def test_settings_rejects_unknown_audio_format(tmp_path, capsys):
     s = config.Settings({"path_to_music_folder": str(tmp_path), "audio_format": "wav"})
     assert s.audio_format == "mp3"
-    assert "audio_format" in capsys.readouterr().out
+    assert "audio_format" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("audio_format", SUPPORTED_FORMATS)

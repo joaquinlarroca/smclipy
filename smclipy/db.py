@@ -125,11 +125,12 @@ COVER_STATUS_CROPPED = "cropped"
 
 QUEUE_PENDING = "pending"
 QUEUE_PROCESSED = "processed"
+QUEUE_FAILED = "failed"
 
 _LEGACY_MIGRATED_KEY = "legacy_migrated"
 
 # Bumped when the schema changes; _migrate_schema applies incremental upgrades.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def _now() -> str:
@@ -677,28 +678,48 @@ def mark_processed(
 def requeue(urls: list[str], error: str | None = None) -> None:
     """Re-pend URLs in place, incrementing their attempt count.
 
-    Uses UPDATE (not INSERT OR REPLACE) so rowids, timestamps, and any
-    recorded title/artists/album metadata survive requeues.
+    Once a URL's attempts exceed ``max_download_attempts`` it is not re-queued:
+    it is permanently marked ``failed`` so a dead link stops being re-offered
+    on every resume. Uses UPDATE (not INSERT OR REPLACE) so rowids,
+    timestamps, and any recorded title/artists/album metadata survive.
     """
     now: str = _now()
+    max_attempts: int = settings().max_download_attempts
     with transaction() as conn:
         for url in urls:
             existing = conn.execute(
                 "SELECT attempts, created_at FROM queue WHERE url = ?", (url,)
             ).fetchone()
             attempts: int = 1 if existing is None else int(existing["attempts"]) + 1
+            status: str = QUEUE_PENDING if attempts <= max_attempts else QUEUE_FAILED
             if existing is None:
                 conn.execute(
                     "INSERT INTO queue (url, status, attempts, last_error,"
                     " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (url, QUEUE_PENDING, attempts, error, now, now),
+                    (url, status, attempts, error, now, now),
                 )
             else:
                 conn.execute(
                     "UPDATE queue SET status = ?, attempts = ?, last_error = ?,"
                     " updated_at = ? WHERE url = ?",
-                    (QUEUE_PENDING, attempts, error, now, url),
+                    (status, attempts, error, now, url),
                 )
+
+
+def get_failed_urls(conn: sqlite3.Connection | None = None) -> list[str]:
+    """URLs permanently dropped after exceeding the download retry limit."""
+    c, owner = _rw(conn)
+    try:
+        return [
+            row["url"]
+            for row in c.execute(
+                "SELECT url FROM queue WHERE status = ? ORDER BY rowid",
+                (QUEUE_FAILED,),
+            ).fetchall()
+        ]
+    finally:
+        if owner:
+            c.close()
 
 
 def get_authors(conn: sqlite3.Connection | None = None) -> list[str]:

@@ -311,6 +311,59 @@ def test_requeue_preserves_processed_metadata(app_settings):
     assert row == ("Song", "Artist", 1)
 
 
+def test_requeue_marks_url_failed_after_max_attempts(app_settings):
+    import sqlite3
+
+    db.reset_queue(["A"])
+    db.requeue(["A"])
+    db.requeue(["A"])
+    db.requeue(["A"])
+    assert db.get_pending_urls() == ["A"]
+    assert db.get_failed_urls() == []
+
+    db.requeue(["A"], error="HTTP Error 404")
+
+    assert db.get_pending_urls() == []
+    assert db.get_failed_urls() == ["A"]
+    with sqlite3.connect(app_settings.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status, attempts, last_error FROM queue WHERE url = 'A'"
+        ).fetchone()
+    assert row["status"] == db.QUEUE_FAILED
+    assert row["attempts"] == 4
+    assert row["last_error"] == "HTTP Error 404"
+
+
+def test_requeue_honors_custom_max_download_attempts(app_settings):
+    import sqlite3
+
+    app_settings.max_download_attempts = 1
+    db.reset_queue(["A"])
+
+    db.requeue(["A"])
+    assert db.get_pending_urls() == ["A"]
+
+    db.requeue(["A"])
+    assert db.get_pending_urls() == []
+    assert db.get_failed_urls() == ["A"]
+    with sqlite3.connect(app_settings.db_path) as conn:
+        status = conn.execute("SELECT status FROM queue WHERE url = 'A'").fetchone()[0]
+    assert status == db.QUEUE_FAILED
+
+
+def test_reset_queue_recovers_permanently_failed_url(app_settings):
+    app_settings.max_download_attempts = 1
+    db.reset_queue(["A"])
+    db.requeue(["A"])
+    db.requeue(["A"])
+    assert db.get_failed_urls() == ["A"]
+
+    db.reset_queue(["A"])
+    assert db.get_pending_urls() == ["A"]
+    assert db.get_failed_urls() == []
+
+
 def test_playlist_crud(app_settings):
     assert db.create_playlist("Chill")
     assert not db.create_playlist("Chill")

@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -102,6 +103,60 @@ def test_process_video_skips_crop_prompt_when_already_1_to_1(
 
     prompt_crop_called.assert_not_called()
     assert "Already 1:1" in capsys.readouterr().out
+
+
+def test_process_video_no_prompt_uses_defaults(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    captured = {}
+
+    monkeypatch.setattr(
+        cli, "download", lambda url, stem="temp": {"title": "Song Title"}
+    )
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "get_album", lambda info: "Album Name")
+    monkeypatch.setattr(cli, "get_author", lambda info: ["Artist"])
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    for name in ("prompt_title", "prompt_album", "prompt_authors", "prompt_crop"):
+        monkeypatch.setattr(cli, name, Mock(side_effect=AssertionError(name)))
+
+    def fake_save(temp, cover, title, authors, album):
+        captured.update(title=title, authors=authors, album=album)
+        return SaveResult.SAVED, None
+
+    monkeypatch.setattr(cli, "save_song_temp_to_main", fake_save)
+
+    process_video("https://soundcloud.com/artist/track", [], no_prompt=True)
+
+    assert captured == {
+        "title": "Song Title",
+        "authors": "Artist",
+        "album": "Album Name",
+    }
+
+
+def test_process_video_no_prompt_falls_back_to_stem_title(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    captured = {}
+
+    monkeypatch.setattr(cli, "download", lambda url, stem="temp": {})
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "get_album", lambda info: "")
+    monkeypatch.setattr(cli, "get_author", lambda info: ["Artist"])
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    for name in ("prompt_title", "prompt_album", "prompt_authors", "prompt_crop"):
+        monkeypatch.setattr(cli, name, Mock(side_effect=AssertionError(name)))
+
+    def fake_save(temp, cover, title, authors, album):
+        captured["title"] = title
+        return SaveResult.SAVED, None
+
+    monkeypatch.setattr(cli, "save_song_temp_to_main", fake_save)
+
+    process_video("https://soundcloud.com/artist/track", [], no_prompt=True)
+
+    assert captured["title"] == "sc-artist-track"
 
 
 def test_process_video_prefills_corrected_authors(monkeypatch, app_settings):
@@ -535,9 +590,9 @@ def test_cmd_update_reports_scan_summary(monkeypatch, app_settings, capsys):
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     cli.cmd_update(argparse.Namespace())
 
-    out = capsys.readouterr().out
-    assert "Scanning music files..." in out
-    assert "Updated: 1 added" in out
+    out = capsys.readouterr()
+    assert "Scanning music files..." in out.err
+    assert "Updated: 1 added" in out.out
 
     cli.cmd_update(argparse.Namespace())
     assert "Already up to date." in capsys.readouterr().out
@@ -717,7 +772,7 @@ def test_cmd_download_skips_unexpected_errors(monkeypatch, app_settings, capsys)
     monkeypatch.setattr(
         cli,
         "process_video",
-        lambda vid, authors: (_ for _ in ()).throw(RuntimeError("boom")),
+        lambda vid, authors, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
 
     cli.cmd_download(argparse.Namespace())
@@ -758,7 +813,9 @@ def test_cmd_download_survives_processed_recording_error(
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
     monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a"])
-    monkeypatch.setattr(cli, "process_video", lambda vid, authors: SaveResult.SAVED)
+    monkeypatch.setattr(
+        cli, "process_video", lambda vid, authors, **kwargs: SaveResult.SAVED
+    )
 
     def raisy(url, **kwargs):
         raise OSError("disk full")
@@ -778,14 +835,40 @@ def test_cmd_download_repends_unsaved_videos(monkeypatch, app_settings):
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
     monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a"])
-    monkeypatch.setattr(cli, "process_video", lambda vid, authors: SaveResult.FAILED)
+    monkeypatch.setattr(
+        cli, "process_video", lambda vid, authors, **kwargs: SaveResult.FAILED
+    )
 
     cli.cmd_download(argparse.Namespace())
 
     assert db.get_pending_urls() == ["vid-a"]
 
 
-def _raises_keyboard_interrupt(vid, authors):
+def test_cmd_download_notices_permanently_failed_videos(
+    monkeypatch, app_settings, capsys
+):
+    import smclipy.cli as cli
+
+    app_settings.max_download_attempts = 1
+    db.reset_queue(["vid-a"])
+    db.requeue(["vid-a"])
+    db.requeue(["vid-a"])
+    assert db.get_failed_urls() == ["vid-a"]
+
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    monkeypatch.setattr(cli, "scan_library", lambda: None)
+    monkeypatch.setattr(cli, "prompt_resume", lambda: False)
+    monkeypatch.setattr(cli, "collect_urls", lambda: [])
+
+    cli.cmd_download(argparse.Namespace())
+
+    out = capsys.readouterr().out
+    assert "permanently dropped" in out
+    assert "vid-a" in out
+    assert db.get_failed_urls() == ["vid-a"]
+
+
+def _raises_keyboard_interrupt(vid, authors, **kwargs):
     raise KeyboardInterrupt
 
 
@@ -815,7 +898,7 @@ def test_cmd_download_interrupt_persists_skipped(monkeypatch, app_settings):
 
     calls: list[str] = []
 
-    def fake_process(vid, authors):
+    def fake_process(vid, authors, **kwargs):
         calls.append(vid)
         if vid == "vid-a":
             raise VideoDownloadError("vid-a", 500)
@@ -1009,3 +1092,194 @@ def test_cmd_crop_records_not_pillarbox(monkeypatch, app_settings):
     cmd_crop(argparse.Namespace())
 
     assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] == "not_pillarbox"
+
+
+def test_main_dispatches_playlist(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_playlist", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["playlist", "list"])
+    assert len(calls) == 1
+    assert calls[0].playlist_action == "list"
+
+
+def test_main_exits_without_tty_for_playlist_add(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["playlist", "add", "Chill"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_exits_without_tty_for_playlist_remove(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["playlist", "remove", "Chill"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_playlist_list_runs_without_tty(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr(cli, "cmd_playlist", lambda _args: None)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["playlist", "list"])
+    assert "interactive terminal" not in capsys.readouterr().out
+
+
+def test_main_playlist_import_runs_without_tty(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_playlist", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["playlist", "import", "mix.m3u"])
+    assert len(calls) == 1
+    assert calls[0].playlist_action == "import"
+
+
+def test_main_directories_flag_does_not_shadow_command(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_update", lambda args: calls.append(args))
+    cli.main(["-d", "update"])
+    assert len(calls) == 1
+
+
+def test_main_tag_all_auto_runs_without_tty(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_tag", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["tag", "--auto", "--all"])
+    assert len(calls) == 1
+    assert calls[0].all is True
+    assert "interactive terminal" not in capsys.readouterr().out
+
+
+def test_main_tag_all_without_auto_requires_tty(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["tag", "--all"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_download_batch_runs_without_tty(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_download", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["download", "--batch", "urls.txt", "--no-prompt"])
+    assert len(calls) == 1
+    assert calls[0].batch == "urls.txt"
+    assert calls[0].no_prompt is True
+    assert "interactive terminal" not in capsys.readouterr().out
+
+
+def test_main_download_batch_without_no_prompt_requires_tty(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["download", "--batch", "urls.txt"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_cmd_update_json_reports_changes(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(MINIMAL_MP3)
+    audio = EasyID3()
+    audio["title"] = ["Song"]
+    audio["artist"] = ["Artist"]
+    audio.save(music / "Artist-Song.mp3")
+
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    cli.cmd_update(argparse.Namespace(json=True))
+
+    captured = capsys.readouterr()
+    assert "Scanning music files..." in captured.err
+    payload = json.loads(captured.out)
+    assert payload["added"] == 1
+    assert payload["renamed"] == 0
+    assert payload["missing"] == 0
+    assert len(payload["songs"]) == 1
+    song = payload["songs"][0]
+    assert song["status"] == "added"
+    assert song["path"] == "Artist-Song.mp3"
+    assert song["old_path"] is None
+    assert song["uuid"]
+
+
+def test_collect_urls_interrupt_preserves_prior_pending(
+    monkeypatch, app_settings, capsys
+):
+    import smclipy.cli as cli
+
+    db.reset_queue(["old-a", "old-b"])
+    replies = iter(["https://youtu.be/abcdefghijk"])
+
+    def fake_input(_prompt=""):
+        try:
+            return next(replies)
+        except StopIteration:
+            raise KeyboardInterrupt from None
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.collect_urls()
+    assert exc.value.code == 130
+    pending = db.get_pending_urls()
+    assert "old-a" in pending and "old-b" in pending
+    assert "https://www.youtube.com/watch?v=abcdefghijk" in pending
+
+
+def test_collect_batch_reads_and_dedupes_urls(app_settings, tmp_path, capsys):
+    import smclipy.cli as cli
+
+    batch = tmp_path / "urls.txt"
+    batch.write_text(
+        "\n# a comment\nhttps://youtu.be/abcdefghijk\n"
+        "https://www.youtube.com/watch?v=abcdefghijk\n",
+        encoding="utf-8",
+    )
+
+    result = cli._collect_batch(batch)
+
+    assert result == ["https://www.youtube.com/watch?v=abcdefghijk"]
+    assert db.get_pending_urls() == ["https://www.youtube.com/watch?v=abcdefghijk"]
+
+
+def test_collect_batch_missing_file_exits(monkeypatch, app_settings, tmp_path, capsys):
+    import smclipy.cli as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli._collect_batch(tmp_path / "nope.txt")
+    assert exc.value.code == 1
+    assert "could not read batch file" in capsys.readouterr().err

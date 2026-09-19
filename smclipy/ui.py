@@ -181,9 +181,9 @@ def prompt_match_selection(matches: list["MusicBrainzMatch"]) -> int | None:
             label += f" ({match.date})"
         options.append((str(index), label))
     selection: str = choice(
-        message="Pick a matching recording:",
+        message="Pick a matching recording (MusicBrainz):",
         options=options,
-        default="Skip this song",
+        default="1" if matches else "Skip this song",
     )
     if selection == "Skip this song":
         return None

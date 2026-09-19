@@ -140,12 +140,18 @@ def test_prompt_match_selection_shows_metadata_labels(monkeypatch):
         _fake_match(title="Korn", artists=("Korn",), album="Korn", date="1994"),
     ]
     assert ui.prompt_match_selection(matches) is None
-    assert captured["default"] == "Skip this song"
+    assert captured["default"] == "1"
     assert captured["options"] == [
         ("Skip this song", "Skip this song"),
         ("1", "Twenty One Pilots - Choker | Trench (2018)"),
         ("2", "Korn - Korn | Korn (1994)"),
     ]
+
+
+def test_prompt_match_selection_defaults_to_skip_when_no_matches(monkeypatch):
+    captured = _patch_choice(monkeypatch, "Skip this song")
+    assert ui.prompt_match_selection([]) is None
+    assert captured["default"] == "Skip this song"
 
 
 def test_prompt_match_selection_returns_picked_index(monkeypatch):

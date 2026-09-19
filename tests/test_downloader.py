@@ -119,8 +119,21 @@ def test_extract_urls_soundcloud_mixes_platforms_and_dedupes():
         "https://soundcloud.com/artist/track https://youtu.be/abcdefghijk "
         "https://soundcloud.com/artist/track"
     ) == [
-        "https://www.youtube.com/watch?v=abcdefghijk",
         "https://soundcloud.com/artist/track",
+        "https://www.youtube.com/watch?v=abcdefghijk",
+    ]
+
+
+def test_extract_urls_preserves_input_order_across_platforms_and_styles():
+    assert extract_urls(
+        "https://youtu.be/aaaaaaaaaaa https://soundcloud.com/a/one "
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb "
+        "https://soundcloud.com/b/two"
+    ) == [
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        "https://soundcloud.com/a/one",
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+        "https://soundcloud.com/b/two",
     ]
 
 
@@ -176,6 +189,45 @@ def test_extract_urls_soundcloud_rejects_host_nested_in_path():
 
 def test_extract_urls_scopes_soundcloud_also_blocks_profile_segments():
     assert extract_urls("https://soundcloud.com/you/something") == []
+
+
+def test_extract_urls_soundcloud_accepts_usernames_starting_with_reserved_word():
+    assert extract_urls("https://soundcloud.com/young-future/track") == [
+        "https://soundcloud.com/young-future/track"
+    ]
+    assert extract_urls("https://soundcloud.com/sets-lover/mix") == [
+        "https://soundcloud.com/sets-lover/mix"
+    ]
+    assert extract_urls("https://soundcloud.com/user/streams-it") == [
+        "https://soundcloud.com/user/streams-it"
+    ]
+
+
+def test_extract_urls_youtube_wrapped_in_delimiters():
+    assert extract_urls("(https://www.youtube.com/watch?v=abcdefghijk)") == [
+        "https://www.youtube.com/watch?v=abcdefghijk"
+    ]
+    assert extract_urls('["https://youtu.be/abcdefghijk"]') == [
+        "https://www.youtube.com/watch?v=abcdefghijk"
+    ]
+
+
+def test_extract_urls_youtube_after_equals():
+    assert extract_urls("url=https://www.youtube.com/watch?v=abcdefghijk") == [
+        "https://www.youtube.com/watch?v=abcdefghijk"
+    ]
+
+
+def test_extract_urls_soundcloud_wrapped_in_brackets():
+    assert extract_urls("[soundcloud.com/a/b]") == ["https://soundcloud.com/a/b"]
+    assert extract_urls("text (soundcloud.com/artist/track) more") == [
+        "https://soundcloud.com/artist/track"
+    ]
+
+
+def test_extract_urls_youtube_rejects_non_http_schemes():
+    assert extract_urls("shield://youtube.com/watch?v=abcdefghijk") == []
+    assert extract_urls("file://www.youtube.com/watch?v=abcdefghijk") == []
 
 
 def test_temp_stem_youtube():

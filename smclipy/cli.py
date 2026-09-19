@@ -225,6 +225,12 @@ def cmd_download(args: argparse.Namespace) -> None:
     authors_list: list[str] = db.get_authors()
 
     pending_ids: list[str] = db.get_pending_urls()
+    failed_ids: list[str] = db.get_failed_urls()
+    if failed_ids:
+        print(
+            f"Notice: {len(failed_ids)} URL/s reached the maximum number of "
+            f"download attempts and were permanently dropped: {failed_ids}"
+        )
 
     if batch_raw is not None:
         pending_ids = _collect_batch(Path(batch_raw))
@@ -543,6 +549,11 @@ def main(argv: list[str] | None = None) -> None:
             "List every song in the library, fetch matching metadata from "
             "MusicBrainz, and interactively review and apply title, artist, album, "
             "release date, track number, album artist, and cover art changes."
+        ),
+        epilog=(
+            "Metadata is provided by MusicBrainz (core data is CC0, supplementary "
+            "data and docs are CC BY-NC-SA 3.0; https://musicbrainz.org ), and "
+            "cover art is served by the Cover Art Archive (coverartarchive.org)."
         ),
     )
     tag_mode: argparse._MutuallyExclusiveGroup = (

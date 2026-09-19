@@ -13,7 +13,7 @@ def test_load_raw_config_missing_creates_default(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         _load_raw_config()
 
-    assert exc.value.code == 0
+    assert exc.value.code == 1
     assert cfg.is_file()
     assert json.loads(cfg.read_text(encoding="utf-8")) == DEFAULT_CONFIG
 
@@ -36,7 +36,7 @@ def test_load_raw_config_invalid_json_exits_cleanly(tmp_path, monkeypatch, capsy
         _load_raw_config()
 
     assert exc.value.code == 1
-    assert "could not read config" in capsys.readouterr().out
+    assert "could not read config" in capsys.readouterr().err
 
 
 def test_load_raw_config_valid_json(tmp_path, monkeypatch):
@@ -92,7 +92,7 @@ def test_load_raw_config_rejects_non_object_json(tmp_path, monkeypatch, capsys):
         _load_raw_config()
 
     assert exc.value.code == 1
-    assert "must contain a JSON object" in capsys.readouterr().out
+    assert "must contain a JSON object" in capsys.readouterr().err
 
 
 def test_settings_falls_back_on_bad_description_max_lines(tmp_path):
@@ -196,13 +196,13 @@ def test_settings_rejects_non_bool_write_album_if_same_as_title(tmp_path):
 def test_settings_coerces_non_string_music_folder(capsys):
     s = Settings({"name": "smclipy", "path_to_music_folder": None})
     assert s.music_folder == Path(".")
-    assert "path_to_music_folder" in capsys.readouterr().out
+    assert "path_to_music_folder" in capsys.readouterr().err
 
 
 def test_settings_coerces_blank_music_folder(tmp_path, capsys):
     s = Settings({"name": "smclipy", "path_to_music_folder": "   "})
     assert s.music_folder == Path(".")
-    assert "path_to_music_folder" in capsys.readouterr().out
+    assert "path_to_music_folder" in capsys.readouterr().err
 
 
 def test_settings_falls_back_on_invalid_name(tmp_path):
@@ -213,3 +213,21 @@ def test_settings_falls_back_on_invalid_name(tmp_path):
 def test_settings_falls_back_on_non_string_name(tmp_path):
     s = Settings({"name": 5, "path_to_music_folder": str(tmp_path)})
     assert s.script_folder == tmp_path / "smclipy"
+
+
+def test_settings_default_max_download_attempts(tmp_path):
+    s = Settings({"path_to_music_folder": str(tmp_path)})
+    assert s.max_download_attempts == 3
+
+
+def test_settings_parses_max_download_attempts(tmp_path):
+    s = Settings({"path_to_music_folder": str(tmp_path), "max_download_attempts": "5"})
+    assert s.max_download_attempts == 5
+
+
+def test_settings_rejects_bogus_max_download_attempts(tmp_path, capsys):
+    s = Settings(
+        {"path_to_music_folder": str(tmp_path), "max_download_attempts": "often"}
+    )
+    assert s.max_download_attempts == 3
+    assert "max_download_attempts" in capsys.readouterr().err

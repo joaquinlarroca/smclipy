@@ -24,17 +24,26 @@ class VideoDownloadError(Exception):
         self.status_code = status_code
 
 
+_BENIGN_HOST_DELIMITERS = frozenset("([{<'\"" + "`=,;:")
+
+
 def _is_host_at_boundary(text: str, start: int) -> bool:
     """Whether `text[start:]` begins at a real host position.
 
-    A host must start at the beginning of the text, after whitespace, or right
-    after a ``://`` scheme. This rejects lookalike hosts nested inside another
-    URL, e.g. ``https://evil.com/soundcloud.com/artist/track``.
+    A host may start at the beginning of the text, after whitespace, right
+    after an ``http(s)://`` scheme, or after a benign delimiter that commonly
+    wraps links (parentheses, brackets, quotes, ``=``, ``,``, etc.). This
+    rejects lookalike hosts nested inside another URL, e.g.
+    ``https://evil.com/soundcloud.com/artist/track``, and non-HTTP schemes
+    such as ``file://`` or ``shield://``.
     """
     if start == 0:
         return True
     prefix: str = text[:start]
-    return prefix[-1].isspace() or prefix.endswith("://")
+    char: str = prefix[-1]
+    if char in _BENIGN_HOST_DELIMITERS or char.isspace():
+        return True
+    return prefix.endswith(("https://", "http://"))
 
 
 _YOUTUBE_VIDEO_ID_RE: re.Pattern[str] = re.compile(
@@ -56,53 +65,108 @@ def _iter_youtube_ids(text: str) -> list[str]:
     return video_ids
 
 
-def _extract_youtube_urls(text: str) -> list[str]:
-    return [
-        f"https://www.youtube.com/watch?v={video_id}"
-        for video_id in _iter_youtube_ids(text)
-    ]
+def _extract_youtube_urls(text: str) -> list[tuple[int, str]]:
+    """``(start offset, normalized URL)`` pairs, per-regex in text order."""
+    found: list[tuple[int, str]] = []
+    for url_re in (_YOUTUBE_VIDEO_ID_RE, _YOUTUBE_SHORT_URL_RE):
+        for match in url_re.finditer(text):
+            if _is_host_at_boundary(text, match.start()):
+                found.append(
+                    (
+                        match.start(),
+                        f"https://www.youtube.com/watch?v={match.group(1)}",
+                    )
+                )
+    return found
 
 
-_RESERVED_USER_SEGMENTS = (
-    "search|discover|you|upload|settings|messages|notifications|people"
-    "|sets|tracks|likes|albums|playlists|followers|following|comments|stream"
+_RESERVED_USER_SEGMENTS: tuple[str, ...] = (
+    "search",
+    "discover",
+    "you",
+    "upload",
+    "settings",
+    "messages",
+    "notifications",
+    "people",
+    "sets",
+    "tracks",
+    "likes",
+    "albums",
+    "playlists",
+    "followers",
+    "following",
+    "comments",
+    "stream",
 )
-_RESERVED_TRACK_SEGMENTS = (
-    "search|discover|upload|settings|messages|notifications"
-    "|sets|tracks|likes|albums|playlists|followers|following|comments|stream"
+_RESERVED_TRACK_SEGMENTS: tuple[str, ...] = (
+    "search",
+    "discover",
+    "upload",
+    "settings",
+    "messages",
+    "notifications",
+    "sets",
+    "tracks",
+    "likes",
+    "albums",
+    "playlists",
+    "followers",
+    "following",
+    "comments",
+    "stream",
 )
+
+
+def _reserved_segment_lookahead(segments: tuple[str, ...]) -> str:
+    r"""A negative lookahead rejecting any reserved segment at a word boundary.
+
+    The trailing ``(?![\w-])`` makes each alternative only match a *full*
+    segment, so ``young-future``, ``sets-lover``, or ``streams-it`` (which
+    merely start with a reserved word) stay valid usernames.
+    """
+    return "|".join(f"{segment}(?![\\w-])" for segment in segments)
+
 
 _SOUNDCLOUD_URL_RE: re.Pattern[str] = re.compile(
     rf"(?:https?://)?(?:(?:www|m|mobile)\.)?soundcloud\.com/"
-    rf"(?!{_RESERVED_USER_SEGMENTS})([\w.-]+)/"
-    rf"(?!{_RESERVED_TRACK_SEGMENTS})([\w-]+)(?:[/?#].*)?"
+    rf"(?!{_reserved_segment_lookahead(_RESERVED_USER_SEGMENTS)})([\w.-]+)/"
+    rf"(?!{_reserved_segment_lookahead(_RESERVED_TRACK_SEGMENTS)})"
+    rf"([\w-]+)(?:[/?#].*)?"
 )
 
 
-def _extract_soundcloud_urls(text: str) -> list[tuple[str, str]]:
+def _extract_soundcloud_urls(text: str) -> list[tuple[int, str, str]]:
     return [
-        (match.group(1), match.group(2))
+        (
+            match.start(),
+            match.group(1),
+            match.group(2),
+        )
         for match in _SOUNDCLOUD_URL_RE.finditer(text)
         if _is_host_at_boundary(text, match.start())
     ]
 
 
 def extract_urls(text: str) -> list[str]:
-    youtube_urls: list[str] = _extract_youtube_urls(text)
-    soundcloud_urls: list[str] = [
-        f"https://soundcloud.com/{user}/{track}"
-        for user, track in _extract_soundcloud_urls(text)
+    found: list[tuple[int, str]] = [
+        *_extract_youtube_urls(text),
+        *(
+            (start, f"https://soundcloud.com/{user}/{track}")
+            for start, user, track in _extract_soundcloud_urls(text)
+        ),
     ]
-    return list(dict.fromkeys(youtube_urls + soundcloud_urls))
+    found.sort(key=lambda item: item[0])
+    return list(dict.fromkeys(url for _, url in found))
 
 
 def temp_stem(url: str) -> str:
     video_ids: list[str] = _iter_youtube_ids(url)
     if video_ids:
         return f"{YT_STEM_PREFIX}{video_ids[0]}"
-    soundcloud_urls: list[tuple[str, str]] = _extract_soundcloud_urls(url)
+    soundcloud_urls: list[tuple[int, str, str]] = _extract_soundcloud_urls(url)
     if soundcloud_urls:
-        user, track = soundcloud_urls[0]
+        _, user, track = soundcloud_urls[0]
         return sanitize_filename(f"{SC_STEM_PREFIX}{user}-{track}")
     digest: str = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
     return f"{TMP_STEM_PREFIX}{digest}"

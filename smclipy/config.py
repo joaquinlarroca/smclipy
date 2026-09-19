@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "description_max_lines": 5,
     "write_album_if_same_as_title": False,
     "audio_format": "mp3",
+    "max_download_attempts": 3,
     "tag_fields": [
         "title",
         "artists",
@@ -46,19 +48,24 @@ class Settings:
             raw_path = "."
             print(
                 "Warning: 'path_to_music_folder' must be a non-empty string "
-                "path, defaulting to '.'"
+                "path, defaulting to '.'",
+                file=sys.stderr,
             )
         self.music_folder = Path(raw_path)
         raw_name = raw.get("name", "smclipy")
         if not isinstance(raw_name, str) or not raw_name.strip():
             raw_name = "smclipy"
-            print("Warning: 'name' must be a non-empty string, using 'smclipy'")
+            print(
+                "Warning: 'name' must be a non-empty string, using 'smclipy'",
+                file=sys.stderr,
+            )
         script_name: str = sanitize_filename(raw_name)
         if not script_name:
             script_name = "smclipy"
             print(
                 "Warning: 'name' only contains characters that are invalid in "
-                "filenames, using 'smclipy'"
+                "filenames, using 'smclipy'",
+                file=sys.stderr,
             )
         self.script_folder: Path = self.music_folder.joinpath(script_name)
         self.temp_folder: Path = self.script_folder.joinpath(".temp")
@@ -97,10 +104,23 @@ class Settings:
         if not isinstance(raw_format, str) or raw_format not in SUPPORTED_FORMATS:
             print(
                 f"Warning: 'audio_format' must be one of "
-                f"{', '.join(SUPPORTED_FORMATS)}, using 'mp3'"
+                f"{', '.join(SUPPORTED_FORMATS)}, using 'mp3'",
+                file=sys.stderr,
             )
             raw_format = "mp3"
         self.audio_format: str = raw_format
+        raw_attempts = raw.get("max_download_attempts", 3)
+        if isinstance(raw_attempts, bool):
+            raw_attempts = 3
+        try:
+            parsed_attempts = int(raw_attempts)
+        except (TypeError, ValueError):
+            parsed_attempts = 3
+            print(
+                "Warning: 'max_download_attempts' must be a positive integer, using 3",
+                file=sys.stderr,
+            )
+        self.max_download_attempts: int = max(1, parsed_attempts)
 
 
 # Global settings singleton. This is a CLI: a single settings object lives for
@@ -117,21 +137,23 @@ def _load_raw_config(create_if_missing: bool = True) -> dict[str, Any]:
         CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=4), encoding="utf-8")
         print(
             "Looks like its your first time executing the script, "
-            "please modify config.json to your liking! and read the README.md file"
+            "please modify config.json to your liking! and read the README.md file",
+            file=sys.stderr,
         )
-        raise SystemExit(0)
+        raise SystemExit(1)
     try:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-        print(f"Error: could not read config at {CONFIG_PATH}: {exc}")
-        print("Fix or delete the config file, then run smclipy again.")
+        print(f"Error: could not read config at {CONFIG_PATH}: {exc}", file=sys.stderr)
+        print("Fix or delete the config file, then run smclipy again.", file=sys.stderr)
         raise SystemExit(1) from exc
     if not isinstance(raw, dict):
         print(
             f"Error: config at {CONFIG_PATH} must contain a JSON object, "
-            f"found {type(raw).__name__}."
+            f"found {type(raw).__name__}.",
+            file=sys.stderr,
         )
-        print("Fix or delete the config file, then run smclipy again.")
+        print("Fix or delete the config file, then run smclipy again.", file=sys.stderr)
         raise SystemExit(1)
     merged = {**DEFAULT_CONFIG, **raw}
     if merged != raw:

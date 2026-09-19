@@ -6,6 +6,33 @@ from PIL import Image
 import smclipy.musicbrainz as mb
 
 
+def test_configure_agent_identifies_app_with_contact(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(mb, "_AGENT_CONFIGURED", False)
+    monkeypatch.setattr(
+        mb.musicbrainzngs,
+        "set_useragent",
+        lambda app, version, contact: captured.update(
+            app=app, version=version, contact=contact
+        ),
+    )
+    mb._configure_agent()
+    assert captured["app"] == "smclipy"
+    assert captured["version"] == mb.__version__
+    assert captured["contact"].startswith("https://")
+
+
+def test_configure_agent_runs_once():
+    mb._AGENT_CONFIGURED = True
+    original = mb.musicbrainzngs.set_useragent
+    try:
+        mb.musicbrainzngs.set_useragent = Mock()
+        mb._configure_agent()
+        mb.musicbrainzngs.set_useragent.assert_not_called()
+    finally:
+        mb.musicbrainzngs.set_useragent = original
+
+
 def sample_recording(
     *,
     title="Comfortably Numb",
@@ -246,11 +273,11 @@ def test_release_details_prefers_track_on_second_medium():
     assert details[3] == "4"
 
 
-def test_release_details_falls_back_to_first_track_number():
+def test_release_details_does_not_guess_track_number():
     rec = sample_recording()
     release = rec["release-list"][0]
     details = mb._release_details(release, "Something Else")
-    assert details[3] == "4"
+    assert details[3] == ""
 
 
 def test_throttle_enforces_minimum_interval(monkeypatch):

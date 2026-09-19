@@ -13,6 +13,10 @@ from smclipy import __version__
 
 _AGENT_CONFIGURED = False
 
+# Contact for the MusicBrainz web-service User-Agent so API requests identify
+# the app (name, version, and a reachable URL), as required by MusicBrainz.
+_CONTACT_URL = "https://github.com/joaquinlarroca/smclipy"
+
 _SEARCH_LIMIT = 5
 
 # MusicBrainz permits about 1 request/second; keep a polite minimum gap.
@@ -53,7 +57,7 @@ class MusicBrainzMatch:
 def _configure_agent() -> None:
     global _AGENT_CONFIGURED
     if not _AGENT_CONFIGURED:
-        musicbrainzngs.set_useragent("smclipy", __version__)
+        musicbrainzngs.set_useragent("smclipy", __version__, _CONTACT_URL)
         _AGENT_CONFIGURED = True
 
 
