@@ -1,11 +1,12 @@
 import os
+import shutil
+import sys
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import suppress
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, NamedTuple
-
-from mutagen.id3 import APIC
 
 import smclipy.db as db
 from smclipy.config import Settings, settings
@@ -13,7 +14,6 @@ from smclipy.formats import (
     Track,
     audio_ext,
     format_of,
-    image_mime,
     open_for_tagging,
 )
 from smclipy.helpers import normalize_author, sanitize_filename, split_authors
@@ -35,16 +35,74 @@ class ScanSummary(NamedTuple):
     renamed: int = 0
     missing: int = 0
     changed: int = 0
+    changes: tuple["ScanChange", ...] = ()
+
+
+class ScanChange(NamedTuple):
+    """A single song-level change made during a scan."""
+
+    status: str
+    uuid: str
+    path: str
+    old_path: str | None = None
+
+
+_TEMP_MARKER = ".smclipy-tmp"
 
 
 def iter_audio_files() -> Iterator[Path]:
-    """Every supported audio file in the music folder, sorted by name."""
+    """Every supported audio file in the music folder, sorted by name.
+
+    In-progress atomic tag edits (``.<name>.smclipy-tmp.<ext>``) are skipped
+    so an interrupted write can never be mistaken for a library song.
+    """
     folder: Path = settings().music_folder
     if not folder.is_dir():
         return
     for file in sorted(folder.iterdir()):
+        if _TEMP_MARKER in file.name:
+            continue
         if file.is_file() and format_of(file) is not None:
             yield file
+
+
+def _edit_track_atomically(file: Path, edit: Callable[[Track], None]) -> bool:
+    """Apply ``edit`` to a copy of ``file``, then swap it in with os.replace.
+
+    Writing tags in place means an interrupted or failed save can corrupt the
+    library file. Editing a sibling temp copy and replacing the original only
+    once the save succeeds keeps the original intact on any failure.
+    """
+    temp: Path = file.with_name(f".{file.stem}{_TEMP_MARKER}{file.suffix}")
+    try:
+        shutil.copy2(file, temp)
+    except OSError as exc:
+        print(f"Warning: could not copy '{file.name}': {exc}", file=sys.stderr)
+        return False
+    track: Track | None = Track.open(temp)
+    if track is None:
+        with suppress(OSError):
+            temp.unlink()
+        print(
+            f"Warning: could not read '{file.name}', skipping update", file=sys.stderr
+        )
+        return False
+    try:
+        edit(track)
+        track.save()
+    except Exception as exc:
+        with suppress(OSError):
+            temp.unlink()
+        print(f"Warning: could not save '{file.name}': {exc}", file=sys.stderr)
+        return False
+    try:
+        os.replace(str(temp), str(file))
+    except OSError as exc:
+        with suppress(OSError):
+            temp.unlink()
+        print(f"Warning: could not replace '{file.name}': {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def read_song_uuid(file: Path) -> str | None:
@@ -59,14 +117,11 @@ def write_song_uuid(file: Path, song_uuid: str | None = None) -> str | None:
     """Write a tracking UUID into the file's tags and return it."""
     if song_uuid is None:
         song_uuid = str(uuid.uuid4())
-    track: Track | None = Track.open(file)
-    if track is None:
-        return None
-    try:
+
+    def edit(track: Track) -> None:
         track.write_uuid(song_uuid)
-        track.save()
-    except Exception as exc:
-        print(f"Warning: could not write tracking id to '{file.name}': {exc}")
+
+    if not _edit_track_atomically(file, edit):
         return None
     return song_uuid
 
@@ -99,18 +154,22 @@ def _matches_tags(title: str, artists: list[str], row: Any) -> bool:
     return True
 
 
-def scan_library() -> ScanSummary:
+def scan_library(collect_details: bool = False) -> ScanSummary:
     """Reconcile the database with the music folder.
 
     Every audio file is keyed by its tracking UUID: new files get a UUID
     written and a row inserted, renamed files keep their row (a
     ``renamed`` event is logged), and files that vanished are marked
     missing.
+
+    When ``collect_details`` is true the returned summary also carries the
+    individual changes, for machine-readable reporting.
     """
     s: Settings = settings()
     seen: set[str] = set()
     authors_seen: set[str] = set()
     added = renamed = missing = changed = 0
+    changes: list[ScanChange] = []
     with db.transaction() as conn:
         known: dict[str, Any] = {}
         by_path: dict[str, str] = {}
@@ -163,6 +222,8 @@ def scan_library() -> ScanSummary:
                 )
                 db.log_event(song_uuid, "appeared", {"path": rel}, conn=conn)
                 added += 1
+                if collect_details:
+                    changes.append(ScanChange("added", song_uuid, rel))
                 continue
             current: str | None = existing["current_path"]
             if current is not None and current != rel:
@@ -186,6 +247,8 @@ def scan_library() -> ScanSummary:
                     conn=conn,
                 )
                 renamed += 1
+                if collect_details:
+                    changes.append(ScanChange("renamed", song_uuid, rel, current))
             else:
                 db.touch_song(song_uuid, conn=conn)
                 if (
@@ -213,14 +276,20 @@ def scan_library() -> ScanSummary:
                         conn=conn,
                     )
                     changed += 1
+                    if collect_details:
+                        changes.append(ScanChange("changed", song_uuid, rel))
         for row in db.list_songs(conn):
             current = row["current_path"]
             if current is not None and current not in seen:
                 db.mark_song_missing(row["uuid"], conn=conn)
                 db.log_event(row["uuid"], "missing", {"path": current}, conn=conn)
                 missing += 1
+                if collect_details:
+                    changes.append(ScanChange("missing", row["uuid"], current))
         db.add_authors(sorted(authors_seen), conn=conn)
-    return ScanSummary(added, renamed, missing, changed)
+    return ScanSummary(
+        added, renamed, missing, changed, tuple(changes) if collect_details else ()
+    )
 
 
 def save_all_covers() -> None:
@@ -236,7 +305,7 @@ def get_image_from_file(file: Path, save_to_path: Path, save_as: str) -> Path | 
         return None
     track: Track | None = Track.open(file)
     if track is None:
-        print(f"Warning: could not read '{file.name}', skipping cover")
+        print(f"Warning: could not read '{file.name}', skipping cover", file=sys.stderr)
         return None
     return save_image(sanitize_filename(save_as), track, save_to_path)
 
@@ -250,16 +319,19 @@ def save_song_temp_to_main(
 ) -> tuple[SaveResult, Path | None]:
     authors_list: list[str] = split_authors(authors)
     if not authors_list:
-        print("Warning: no artists provided, skipping save")
+        print("Warning: no artists provided, skipping save", file=sys.stderr)
         return SaveResult.FAILED, None
     extension: str = audio_ext(format_of(file) or settings().audio_format)
     target_name: str = sanitize_filename(f"{authors_list[0]}-{title}{extension}")
     if not target_name:
-        print("Warning: artist/title produced an invalid filename, skipping save")
+        print(
+            "Warning: artist/title produced an invalid filename, skipping save",
+            file=sys.stderr,
+        )
         return SaveResult.FAILED, None
     target: Path = settings().music_folder.joinpath(target_name)
     if target.is_file():
-        print(f"Warning: '{target.name}' already exists")
+        print(f"Warning: '{target.name}' already exists", file=sys.stderr)
         if not prompt_overwrite():
             return SaveResult.SKIPPED, None
     if not _tag_file(file, title, authors_list, album, image):
@@ -273,7 +345,9 @@ def _tag_file(
 ) -> bool:
     track: Track | None = _open_audio(target)
     if track is None:
-        print(f"Warning: could not read '{target.name}', skipping save")
+        print(
+            f"Warning: could not read '{target.name}', skipping save", file=sys.stderr
+        )
         return False
     track.strip_unknown_tags()
     track.set_field("title", title)
@@ -285,7 +359,7 @@ def _tag_file(
     try:
         track.save()
     except Exception as exc:
-        print(f"Warning: could not save '{target.name}': {exc}")
+        print(f"Warning: could not save '{target.name}': {exc}", file=sys.stderr)
         return False
     return True
 
@@ -294,14 +368,11 @@ def read_song_profile(file: Path) -> tuple[dict[str, str], bool]:
     """Read an audio file's tag profile and whether it has embedded cover art."""
     track: Track | None = Track.open(file)
     if track is None:
-        print(f"Warning: could not read '{file.name}', skipping tag read")
+        print(
+            f"Warning: could not read '{file.name}', skipping tag read", file=sys.stderr
+        )
         return {}, False
     return track.read_profile()
-
-
-def read_song_tags(file: Path) -> dict[str, str]:
-    """Read the full tag profile of an audio file into a field -> value mapping."""
-    return read_song_profile(file)[0]
 
 
 def has_cover(file: Path) -> bool:
@@ -324,71 +395,33 @@ def apply_tag_update(
     image: Path | None = None,
 ) -> bool:
     """Apply a partial tag update, only overwriting fields that are not None."""
-    track: Track | None = _open_audio(file)
-    if track is None:
-        print(f"Warning: could not read '{file.name}', skipping update")
-        return False
-    if title is not None:
-        track.set_field("title", title)
-    if artists is not None:
-        track.set_artists(artists)
-    if album is not None:
-        track.set_field("album", album)
-    if date is not None:
-        track.set_field("date", date)
-    if genre is not None:
-        track.set_field("genre", genre)
-    if album_artist is not None:
-        track.set_field("album_artist", album_artist)
-    if track_number is not None:
-        track.set_field("track_number", track_number)
-    if image is not None:
-        track.set_cover(image)
-    try:
-        track.save()
-    except Exception as exc:
-        print(f"Warning: could not save '{file.name}': {exc}")
-        return False
-    return True
 
+    def edit(track: Track) -> None:
+        if title is not None:
+            track.set_field("title", title)
+        if artists is not None:
+            track.set_artists(artists)
+        if album is not None:
+            track.set_field("album", album)
+        if date is not None:
+            track.set_field("date", date)
+        if genre is not None:
+            track.set_field("genre", genre)
+        if album_artist is not None:
+            track.set_field("album_artist", album_artist)
+        if track_number is not None:
+            track.set_field("track_number", track_number)
+        if image is not None:
+            track.set_cover(image)
 
-def _get_image_mime(image: Path) -> str:
-    return image_mime(image)
-
-
-def _set_cover(audio: Any, image: Path | None) -> None:
-    if isinstance(audio, Track):
-        audio.set_cover(image)
-        return
-    if audio.tags is None:
-        audio.add_tags()
-    if image is None or not image.is_file():
-        return
-    tags = audio.tags
-    if tags is None:
-        raise RuntimeError("MP3 has no ID3 tag stream to embed cover into")
-    tags.delall("APIC")
-    tags.add(
-        APIC(
-            encoding=3,
-            mime=_get_image_mime(image),
-            type=3,
-            desc="Cover",
-            data=image.read_bytes(),
-        )
-    )
+    return _edit_track_atomically(file, edit)
 
 
 def change_cover(image: Path, file: Path) -> None:
-    track: Track | None = _open_audio(file)
-    if track is None:
-        print(f"Warning: could not read '{file.name}', skipping cover re-embed")
-        return
-    track.set_cover(image)
-    try:
-        track.save()
-    except Exception as exc:
-        print(f"Warning: could not save '{file.name}': {exc}")
+    def edit(track: Track) -> None:
+        track.set_cover(image)
+
+    _edit_track_atomically(file, edit)
 
 
 COVER_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
@@ -422,14 +455,14 @@ def save_image(name: str, song_file: Any, path: Path) -> Path | None:
     if isinstance(song_file, Track):
         cover: tuple[str, bytes] | None = song_file.read_cover()
         if cover is None:
-            print(f"Couldn't find '{stem}' cover")
+            print(f"Couldn't find '{stem}' cover", file=sys.stderr)
             return None
         mime: str = cover[0]
         data: bytes = cover[1]
     else:
         apic_key = next((key for key in song_file if key.startswith("APIC")), None)
         if not apic_key:
-            print(f"Couldn't find '{stem}' cover")
+            print(f"Couldn't find '{stem}' cover", file=sys.stderr)
             return None
         artwork = song_file[apic_key]
         mime = artwork.mime
@@ -437,7 +470,10 @@ def save_image(name: str, song_file: Any, path: Path) -> Path | None:
     ext: str = _mime_to_ext(mime)
     known_mime: bool = mime in _MIME_TO_EXT
     if not known_mime:
-        print(f"Warning: unrecognized cover mime '{mime}' for '{stem}', assuming PNG")
+        print(
+            f"Warning: unrecognized cover mime '{mime}' for '{stem}', assuming PNG",
+            file=sys.stderr,
+        )
     target: Path = path.joinpath(f"{stem}{ext}")
     existing: Path | None = next(
         (

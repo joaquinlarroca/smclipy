@@ -1,3 +1,4 @@
+import sys
 from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit import prompt
@@ -18,6 +19,11 @@ from smclipy.downloader import get_author
 
 if TYPE_CHECKING:
     from smclipy.musicbrainz import MusicBrainzMatch
+
+
+def msg(*args: Any) -> None:
+    """Print a status/progress message to stderr, keeping stdout for data."""
+    print(*args, file=sys.stderr)
 
 
 def show_video_info(info_dictionary: dict[str, Any]) -> None:
@@ -136,6 +142,32 @@ def prompt_song_selection(count: int) -> list[int]:
             print(f"Selection out of range. Choose between 1 and {count}.")
             continue
         return [number - 1 for number in dict.fromkeys(numbers)]
+
+
+def prompt_position_selection(count: int, message: str) -> int | None:
+    """Let the user pick one position, returning a 0-based index or None.
+
+    Supports cancel via blank, ``q``, ``quit``, ``0``, or Ctrl+C.
+    """
+    while True:
+        try:
+            answer: str = prompt(message)
+        except KeyboardInterrupt:
+            print("\nInterrupted, exiting...")
+            raise SystemExit(130) from None
+        answer = answer.strip()
+        if not answer or answer.casefold() in ("q", "quit", "exit", "cancel", "0"):
+            print("Cancelled.")
+            return None
+        try:
+            number = int(answer)
+        except ValueError:
+            print(f"Invalid selection. Enter a number between 1 and {count}.")
+            continue
+        if number < 1 or number > count:
+            print(f"Selection out of range. Choose between 1 and {count}.")
+            continue
+        return number - 1
 
 
 def prompt_match_selection(matches: list["MusicBrainzMatch"]) -> int | None:

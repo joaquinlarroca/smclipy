@@ -309,3 +309,236 @@ def test_requeue_preserves_processed_metadata(app_settings):
             "SELECT title, artists, attempts FROM queue WHERE url = 'A'"
         ).fetchone()
     assert row == ("Song", "Artist", 1)
+
+
+def test_playlist_crud(app_settings):
+    assert db.create_playlist("Chill")
+    assert not db.create_playlist("Chill")
+    assert not db.create_playlist("")
+
+    row = db.get_playlist("Chill")
+    assert row is not None and row["description"] == ""
+    rows = db.list_playlists()
+    assert [r["name"] for r in rows] == ["Chill"]
+    assert rows[0]["song_count"] == 0
+
+    assert db.rename_playlist("Chill", "Weekend")
+    assert db.get_playlist("Chill") is None
+    assert db.get_playlist("Weekend") is not None
+    assert not db.rename_playlist("Weekend", "Weekend")
+    db.create_playlist("Occupied")
+    assert not db.rename_playlist("Weekend", "Occupied")
+
+    assert db.delete_playlist("Weekend")
+    assert db.get_playlist("Weekend") is None
+
+
+def test_playlist_entries_add_ordered_and_deduped(app_settings):
+    db.create_playlist("P")
+    alpha = db.insert_song(current_path="a.mp3", title="Alpha")
+    beta = db.insert_song(current_path="b.mp3", title="Beta")
+    gamma = db.insert_song(current_path="c.mp3", title="Gamma")
+
+    assert db.add_song_to_playlist("P", gamma)
+    assert db.add_song_to_playlist("P", alpha)
+    assert not db.add_song_to_playlist("P", gamma)
+    assert db.add_song_to_playlist("P", beta)
+
+    rows = db.get_playlist_songs("P")
+    assert [r["uuid"] for r in rows] == [gamma, alpha, beta]
+    assert [r["position"] for r in rows] == [1, 2, 3]
+    assert rows[0]["title"] == "Gamma"
+
+    assert not db.add_song_to_playlist("Missing", alpha)
+
+
+def test_playlist_remove_renumbers(app_settings):
+    db.create_playlist("P")
+    first = db.insert_song(current_path="a.mp3")
+    second = db.insert_song(current_path="b.mp3")
+    third = db.insert_song(current_path="c.mp3")
+    for song_uuid in (first, second, third):
+        db.add_song_to_playlist("P", song_uuid)
+
+    assert db.remove_song_from_playlist("P", second)
+    rows = db.get_playlist_songs("P")
+    assert [r["uuid"] for r in rows] == [first, third]
+    assert [r["position"] for r in rows] == [1, 2]
+    assert not db.remove_song_from_playlist("P", second)
+
+
+def test_playlist_move(app_settings):
+    db.create_playlist("P")
+    ids = [db.insert_song(current_path=f"{c}.mp3") for c in "abcd"]
+    for song_uuid in ids:
+        db.add_song_to_playlist("P", song_uuid)
+
+    db.move_playlist_song("P", ids[3], 1)
+    assert [r["uuid"] for r in db.get_playlist_songs("P")] == [
+        ids[3],
+        ids[0],
+        ids[1],
+        ids[2],
+    ]
+
+    db.move_playlist_song("P", ids[0], 4)
+    assert [r["uuid"] for r in db.get_playlist_songs("P")] == [
+        ids[3],
+        ids[1],
+        ids[2],
+        ids[0],
+    ]
+
+    db.move_playlist_song("P", ids[0], 2)
+    assert [r["uuid"] for r in db.get_playlist_songs("P")] == [
+        ids[3],
+        ids[0],
+        ids[1],
+        ids[2],
+    ]
+
+    db.move_playlist_song("P", ids[0], 2)
+    assert [r["uuid"] for r in db.get_playlist_songs("P")] == [
+        ids[3],
+        ids[0],
+        ids[1],
+        ids[2],
+    ]
+
+    db.move_playlist_song("P", ids[3], 999)
+    assert [r["uuid"] for r in db.get_playlist_songs("P")] == ids
+
+    assert not db.move_playlist_song("P", "nope", 1)
+
+
+def test_playlist_sort_by_title_and_reverse(app_settings):
+    db.create_playlist("P")
+    ids = [
+        db.insert_song(current_path=f"{c}.mp3", title=title)
+        for c, title in (("z", "Zeta"), ("a", "Alpha"), ("m", "Mike"))
+    ]
+    for song_uuid in ids:
+        db.add_song_to_playlist("P", song_uuid)
+
+    db.sort_playlist("P", key="title")
+    assert [r["title"] for r in db.get_playlist_songs("P")] == [
+        "Alpha",
+        "Mike",
+        "Zeta",
+    ]
+
+    db.sort_playlist("P", key="title", reverse=True)
+    assert [r["title"] for r in db.get_playlist_songs("P")] == [
+        "Zeta",
+        "Mike",
+        "Alpha",
+    ]
+
+
+def test_playlist_sort_falls_back_to_path_and_missing_last(app_settings):
+    db.create_playlist("P")
+    path_only = db.insert_song(current_path="zzz.mp3", title="")
+    titled = db.insert_song(current_path="aaa.mp3", title="beta")
+    missing = db.insert_song(current_path="gone.mp3", title="")
+    db.mark_song_missing(missing)
+    for song_uuid in (path_only, titled, missing):
+        db.add_song_to_playlist("P", song_uuid)
+
+    db.sort_playlist("P", key="title")
+    rows = db.get_playlist_songs("P")
+    assert [r["uuid"] for r in rows] == [titled, path_only, missing]
+
+
+def test_playlist_set_contents_replaces_and_dedupes(app_settings):
+    db.create_playlist("P")
+    ids = [db.insert_song(current_path=f"{c}.mp3") for c in "abc"]
+    db.set_playlist_songs("P", [ids[1], ids[0], ids[1], ids[2]])
+
+    rows = db.get_playlist_songs("P")
+    assert [r["uuid"] for r in rows] == [ids[1], ids[0], ids[2]]
+
+
+def test_playlist_delete_cascades_entries(app_settings):
+    db.create_playlist("P")
+    song_uuid = db.insert_song(current_path="a.mp3")
+    db.add_song_to_playlist("P", song_uuid)
+
+    assert db.delete_playlist("P")
+    assert db.get_playlist_songs("P") == []
+
+
+def test_playlist_entries_cascade_when_song_deleted(app_settings):
+    import sqlite3
+
+    db.create_playlist("P")
+    first = db.insert_song(current_path="a.mp3")
+    second = db.insert_song(current_path="b.mp3")
+    db.add_song_to_playlist("P", first)
+    db.add_song_to_playlist("P", second)
+
+    with sqlite3.connect(app_settings.db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM songs WHERE uuid = ?", (first,))
+        conn.commit()
+
+    rows = db.get_playlist_songs("P")
+    assert [r["uuid"] for r in rows] == [second]
+
+
+def test_v2_database_migrates_to_v3_with_playlists(app_settings):
+    import sqlite3
+
+    if app_settings.db_path.exists():
+        app_settings.db_path.unlink()
+    app_settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(app_settings.db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta VALUES ('schema_version', '2');
+            CREATE TABLE songs (
+        """
+            + db._SONGS_COLUMNS
+            + """
+            );
+            CREATE TABLE song_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                song_uuid TEXT,
+                event TEXT,
+                detail TEXT NOT NULL DEFAULT '{}',
+                at TEXT NOT NULL
+            );
+            CREATE TABLE queue (
+                url TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                title TEXT,
+                artists TEXT,
+                saved_at TEXT
+            );
+            CREATE TABLE authors (
+                name TEXT NOT NULL,
+                normalized TEXT NOT NULL,
+                PRIMARY KEY (normalized)
+            );
+            CREATE TABLE false_positives (stem TEXT PRIMARY KEY);
+            """
+        )
+        conn.commit()
+
+    db.get_authors()
+
+    with sqlite3.connect(app_settings.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {"playlists", "playlist_entries"} <= tables
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert version["value"] == "3"

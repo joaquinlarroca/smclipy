@@ -3,17 +3,14 @@ import os
 
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import APIC, ID3
-from mutagen.mp3 import MP3
 from PIL import Image
 
 import smclipy.db as db
 from smclipy.metadata import (
     SaveResult,
     ScanSummary,
-    _get_image_mime,
     _mime_to_ext,
     _open_audio,
-    _set_cover,
     _tag_file,
     apply_tag_update,
     change_cover,
@@ -100,7 +97,7 @@ def test_get_image_from_file_warns_on_corrupt_file(tmp_path, capsys):
     corrupt.write_bytes(b"not an mp3 at all")
     assert get_image_from_file(corrupt, tmp_path, "cover.png") is None
     assert not (tmp_path / "cover.png").exists()
-    assert "could not read" in capsys.readouterr().out
+    assert "could not read" in capsys.readouterr().err
 
 
 def test_scan_library_tracks_songs_and_authors(app_settings):
@@ -506,46 +503,7 @@ def test_save_image_keeps_existing_cover_on_unknown_mime(tmp_path, capsys):
     assert saved == existing
     assert existing.read_bytes() == b"new-bytes"
     assert not (tmp_path / "artist-title.png").exists()
-    assert "unrecognized cover mime" in capsys.readouterr().out
-
-
-def test_get_image_mime_detects_format(tmp_path):
-    png = tmp_path / "img.png"
-    png.write_bytes(make_png_bytes())
-    jpg = tmp_path / "img.jpg"
-    jpg.write_bytes(make_jpeg_bytes())
-    assert _get_image_mime(png) == "image/png"
-    assert _get_image_mime(jpg) == "image/jpeg"
-
-
-def test_set_cover_uses_detected_mime(tmp_path):
-    mp3_file = tmp_path / "cover.mp3"
-    mp3_file.write_bytes(MINIMAL_MP3)
-    jpg = tmp_path / "cover.jpg"
-    jpg.write_bytes(make_jpeg_bytes())
-    audio = MP3(mp3_file, ID3=ID3)
-    _set_cover(audio, jpg)
-    audio.save()
-    apic = ID3(mp3_file).getall("APIC")
-    assert len(apic) == 1
-    assert apic[0].mime == "image/jpeg"
-    assert apic[0].data == make_jpeg_bytes()
-
-
-def test_set_cover_missing_image_does_not_add_apic(tmp_path):
-    mp3_file = tmp_path / "cover.mp3"
-    mp3_file.write_bytes(MINIMAL_MP3)
-    audio = MP3(mp3_file, ID3=ID3)
-    _set_cover(audio, tmp_path / "missing.png")
-    assert not audio.tags.getall("APIC")
-
-
-def test_set_cover_none_image_does_not_add_apic(tmp_path):
-    mp3_file = tmp_path / "cover.mp3"
-    mp3_file.write_bytes(MINIMAL_MP3)
-    audio = MP3(mp3_file, ID3=ID3)
-    _set_cover(audio, None)
-    assert not audio.tags.getall("APIC")
+    assert "unrecognized cover mime" in capsys.readouterr().err
 
 
 def test_save_song_temp_to_main_tags_then_moves(app_settings, tmp_path):
@@ -606,7 +564,7 @@ def test_save_song_temp_to_main_warns_on_collision(
     source.write_bytes(MINIMAL_MP3)
     save_song_temp_to_main(source, image, "Song", "Artist A", "Album")
 
-    assert "already exists" in capsys.readouterr().out
+    assert "already exists" in capsys.readouterr().err
 
 
 def test_save_song_temp_to_main_declined_overwrite_is_skipped(
@@ -641,7 +599,7 @@ def test_save_song_temp_to_main_empty_authors_skips(app_settings, tmp_path, caps
 
     assert result is SaveResult.FAILED
     assert source.exists()
-    assert "no artists" in capsys.readouterr().out
+    assert "no artists" in capsys.readouterr().err
 
 
 def test_save_song_temp_to_main_missing_file_skips(app_settings, tmp_path, capsys):
@@ -702,7 +660,7 @@ def test_read_song_profile_missing_file_warns(app_settings, tmp_path, capsys):
     profile, has_cover_flag = read_song_profile(tmp_path / "missing.mp3")
     assert profile == {}
     assert has_cover_flag is False
-    assert "could not read" in capsys.readouterr().out
+    assert "could not read" in capsys.readouterr().err
 
 
 def test_has_cover_true_and_false(app_settings, tmp_path):
@@ -761,3 +719,43 @@ def test_apply_tag_update_garbage_returns_false(app_settings, tmp_path, capsys):
     bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_bytes(b"not an mp3 at all")
     assert apply_tag_update(bad, title="Song") is False
+
+
+def test_apply_tag_update_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "song.mp3"
+    path.write_bytes(MINIMAL_MP3)
+
+    assert apply_tag_update(path, title="New") is True
+
+    assert read_song_profile(path)[0]["title"] == "New"
+    assert [p.name for p in tmp_path.iterdir()] == ["song.mp3"]
+
+
+def test_apply_tag_update_failure_keeps_original(tmp_path, monkeypatch, capsys):
+    from smclipy.formats import Track
+
+    path = tmp_path / "song.mp3"
+    write_tagged_mp3(path, title="Original")
+    original = path.read_bytes()
+
+    def boom(self):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(Track, "save", boom)
+    ok = apply_tag_update(path, title="New")
+
+    assert ok is False
+    assert path.read_bytes() == original
+    assert [p.name for p in tmp_path.iterdir()] == ["song.mp3"]
+    assert "could not save" in capsys.readouterr().err
+
+
+def test_write_song_uuid_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "song.mp3"
+    path.write_bytes(MINIMAL_MP3)
+
+    song_uuid = write_song_uuid(path)
+
+    assert song_uuid is not None
+    assert read_song_uuid(path) == song_uuid
+    assert [p.name for p in tmp_path.iterdir()] == ["song.mp3"]

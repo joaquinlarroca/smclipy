@@ -94,6 +94,25 @@ CREATE TABLE IF NOT EXISTS authors (
 CREATE TABLE IF NOT EXISTS false_positives (
     stem TEXT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS playlists (
+    name TEXT PRIMARY KEY,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS playlist_entries (
+    playlist_name TEXT NOT NULL REFERENCES playlists(name)
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    song_uuid TEXT NOT NULL REFERENCES songs(uuid) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (playlist_name, song_uuid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entries_playlist_position
+    ON playlist_entries(playlist_name, position);
 """
 
 MB_STATUS_TAGGED = "tagged"
@@ -196,6 +215,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             """
         )
         conn.execute("PRAGMA foreign_keys = ON")
+    # Playlists arrive in v3. connect() runs SCHEMA before this function, and
+    # SCHEMA already creates the playlist tables, so only the version bump
+    # below is needed to finish the migration.
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
         (str(_SCHEMA_VERSION),),
@@ -727,6 +749,279 @@ def add_false_positive(stem: str, conn: sqlite3.Connection | None = None) -> Non
     c, owner = _rw(conn)
     try:
         c.execute("INSERT OR REPLACE INTO false_positives (stem) VALUES (?)", (stem,))
+        if owner:
+            c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
+def _touch_playlist(conn: sqlite3.Connection, name: str) -> None:
+    conn.execute("UPDATE playlists SET updated_at = ? WHERE name = ?", (_now(), name))
+
+
+def _renumber_uuids(conn: sqlite3.Connection, name: str, song_uuids: list[str]) -> None:
+    """Rewrite positions 1..n preserving each entry's added_at timestamp."""
+    for position, song_uuid in enumerate(song_uuids, start=1):
+        conn.execute(
+            "UPDATE playlist_entries SET position = ?"
+            " WHERE playlist_name = ? AND song_uuid = ?",
+            (position, name, song_uuid),
+        )
+
+
+def list_playlists(conn: sqlite3.Connection | None = None) -> list[sqlite3.Row]:
+    c, owner = _rw(conn)
+    try:
+        return c.execute(
+            "SELECT p.*, COUNT(e.song_uuid) AS song_count"
+            " FROM playlists p LEFT JOIN playlist_entries e"
+            " ON e.playlist_name = p.name GROUP BY p.name"
+            " ORDER BY p.name COLLATE NOCASE"
+        ).fetchall()
+    finally:
+        if owner:
+            c.close()
+
+
+def get_playlist(
+    name: str, conn: sqlite3.Connection | None = None
+) -> sqlite3.Row | None:
+    c, owner = _rw(conn)
+    try:
+        return c.execute(  # type: ignore[no-any-return]
+            "SELECT * FROM playlists WHERE name = ?", (name,)
+        ).fetchone()
+    finally:
+        if owner:
+            c.close()
+
+
+def create_playlist(
+    name: str, description: str = "", conn: sqlite3.Connection | None = None
+) -> bool:
+    if not name:
+        return False
+    now: str = _now()
+    c, owner = _rw(conn)
+    try:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO playlists (name, description, created_at,"
+            " updated_at) VALUES (?, ?, ?, ?)",
+            (name, description, now, now),
+        )
+        if owner:
+            c.commit()
+        return bool(cur.rowcount)
+    finally:
+        if owner:
+            c.close()
+
+
+def rename_playlist(
+    old_name: str, new_name: str, conn: sqlite3.Connection | None = None
+) -> bool:
+    if not old_name or not new_name or old_name == new_name:
+        return False
+    if get_playlist(new_name, conn=conn) is not None:
+        return False
+    c, owner = _rw(conn)
+    try:
+        cur = c.execute(
+            "UPDATE playlists SET name = ?, updated_at = ? WHERE name = ?",
+            (new_name, _now(), old_name),
+        )
+        if owner:
+            c.commit()
+        return bool(cur.rowcount)
+    finally:
+        if owner:
+            c.close()
+
+
+def delete_playlist(name: str, conn: sqlite3.Connection | None = None) -> bool:
+    """Delete a playlist; its entries are removed by the ON DELETE CASCADE."""
+    c, owner = _rw(conn)
+    try:
+        cur = c.execute("DELETE FROM playlists WHERE name = ?", (name,))
+        if owner:
+            c.commit()
+        return bool(cur.rowcount)
+    finally:
+        if owner:
+            c.close()
+
+
+def add_song_to_playlist(
+    name: str, song_uuid: str, conn: sqlite3.Connection | None = None
+) -> bool:
+    """Append ``song_uuid`` to the playlist; False when already present."""
+    c, owner = _rw(conn)
+    try:
+        row = c.execute("SELECT 1 FROM playlists WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            return False
+        existing = c.execute(
+            "SELECT 1 FROM playlist_entries WHERE playlist_name = ? AND song_uuid = ?",
+            (name, song_uuid),
+        ).fetchone()
+        if existing is not None:
+            return False
+        row = c.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM playlist_entries"
+            " WHERE playlist_name = ?",
+            (name,),
+        ).fetchone()
+        c.execute(
+            "INSERT INTO playlist_entries (playlist_name, song_uuid, position,"
+            " added_at) VALUES (?, ?, ?, ?)",
+            (name, song_uuid, int(row[0]) + 1, _now()),
+        )
+        _touch_playlist(c, name)
+        if owner:
+            c.commit()
+        return True
+    finally:
+        if owner:
+            c.close()
+
+
+def remove_song_from_playlist(
+    name: str, song_uuid: str, conn: sqlite3.Connection | None = None
+) -> bool:
+    """Remove ``song_uuid`` and renumber the remaining positions 1..n."""
+    c, owner = _rw(conn)
+    try:
+        cur = c.execute(
+            "DELETE FROM playlist_entries WHERE playlist_name = ? AND song_uuid = ?",
+            (name, song_uuid),
+        )
+        if cur.rowcount:
+            remaining = [
+                row["song_uuid"]
+                for row in c.execute(
+                    "SELECT song_uuid FROM playlist_entries WHERE playlist_name = ?"
+                    " ORDER BY position",
+                    (name,),
+                )
+            ]
+            _renumber_uuids(c, name, remaining)
+            _touch_playlist(c, name)
+        if owner:
+            c.commit()
+        return bool(cur.rowcount)
+    finally:
+        if owner:
+            c.close()
+
+
+def get_playlist_songs(
+    name: str, conn: sqlite3.Connection | None = None
+) -> list[sqlite3.Row]:
+    c, owner = _rw(conn)
+    try:
+        return c.execute(
+            "SELECT e.position, e.added_at, s.*"
+            " FROM playlist_entries e JOIN songs s ON s.uuid = e.song_uuid"
+            " WHERE e.playlist_name = ? ORDER BY e.position",
+            (name,),
+        ).fetchall()
+    finally:
+        if owner:
+            c.close()
+
+
+def move_playlist_song(
+    name: str,
+    song_uuid: str,
+    target_position: int,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Move ``song_uuid`` so it lands at 1-based ``target_position``."""
+    c, owner = _rw(conn)
+    try:
+        rows = c.execute(
+            "SELECT song_uuid FROM playlist_entries WHERE playlist_name = ?"
+            " ORDER BY position",
+            (name,),
+        ).fetchall()
+        uuids: list[str] = [row["song_uuid"] for row in rows]
+        if song_uuid not in uuids or len(uuids) < 2:
+            return False
+        target_position = max(1, min(target_position, len(uuids)))
+        uuids.remove(song_uuid)
+        uuids.insert(target_position - 1, song_uuid)
+        _renumber_uuids(c, name, uuids)
+        _touch_playlist(c, name)
+        if owner:
+            c.commit()
+        return True
+    finally:
+        if owner:
+            c.close()
+
+
+def sort_playlist(
+    name: str,
+    key: str = "title",
+    reverse: bool = False,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Rewrites playlist order by a song column, case-insensitively.
+
+    Empty title/artists/album values fall back to the current path, and
+    missing songs keep their slot but sort last. ``key`` may be ``title``,
+    ``artists``, ``album``, ``path``, or ``added`` (time added).
+    """
+    if key not in {"title", "artists", "album", "path", "added"}:
+        raise ValueError(f"Unknown sort key {key!r}")
+    if key == "added":
+        sort_expr: str = "e.added_at"
+    elif key == "path":
+        sort_expr = "s.current_path"
+    else:
+        sort_expr = f"COALESCE(NULLIF(s.{key}, ''), s.current_path)"
+    order: str = "DESC" if reverse else "ASC"
+    c, owner = _rw(conn)
+    try:
+        rows = c.execute(
+            "SELECT e.song_uuid FROM playlist_entries e"
+            " JOIN songs s ON s.uuid = e.song_uuid"
+            " WHERE e.playlist_name = ?"
+            " ORDER BY s.current_path IS NULL ASC,"
+            f" lower({sort_expr}) {order}, e.position",
+            (name,),
+        ).fetchall()
+        _renumber_uuids(c, name, [row["song_uuid"] for row in rows])
+        _touch_playlist(c, name)
+        if owner:
+            c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
+def set_playlist_songs(
+    name: str, song_uuids: list[str], conn: sqlite3.Connection | None = None
+) -> None:
+    """Replace a playlist's contents in the given order (skips duplicates)."""
+    unique: list[str] = list(dict.fromkeys(song_uuids))
+    c, owner = _rw(conn)
+    try:
+        if (
+            c.execute("SELECT 1 FROM playlists WHERE name = ?", (name,)).fetchone()
+            is None
+        ):
+            return
+        c.execute("DELETE FROM playlist_entries WHERE playlist_name = ?", (name,))
+        now: str = _now()
+        for position, song_uuid in enumerate(unique, start=1):
+            c.execute(
+                "INSERT INTO playlist_entries (playlist_name, song_uuid, position,"
+                " added_at) VALUES (?, ?, ?, ?)",
+                (name, song_uuid, position, now),
+            )
+        _touch_playlist(c, name)
         if owner:
             c.commit()
     finally:

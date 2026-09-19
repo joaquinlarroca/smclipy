@@ -369,7 +369,11 @@ def cmd_tag(args: object) -> None:
     for index, song in enumerate(songs, start=1):
         print(f"{index:3}. {song.display_name}")
 
-    selected: list[int] = prompt_song_selection(len(songs))
+    select_all: bool = bool(getattr(args, "all", False))
+    if select_all:
+        selected: list[int] = list(range(len(songs)))
+    else:
+        selected = prompt_song_selection(len(songs))
     updated = 0
     skipped = 0
     tagged_by_uuid: dict[str, bool] = {

@@ -93,7 +93,11 @@ def _has_official_release(recording: dict[str, Any]) -> bool:
 
 
 def _best_track_number(release: dict[str, Any], recording_title: str) -> str:
-    fallback = ""
+    """The track number of ``recording_title`` inside ``release``.
+
+    Only an exact track-title match wins; anything else returns "" so a
+    guessed number for a different song is never written into the tags.
+    """
     expected: str = recording_title.casefold().strip()
     for medium in release.get("medium-list", []):
         for track in medium.get("track-list", []):
@@ -102,9 +106,7 @@ def _best_track_number(release: dict[str, Any], recording_title: str) -> str:
                 continue
             if str(track.get("title", "")).strip().casefold() == expected:
                 return number
-            if not fallback:
-                fallback = number
-    return fallback
+    return ""
 
 
 def _release_details(

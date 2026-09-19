@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 from contextlib import suppress
 from pathlib import Path
@@ -39,8 +40,10 @@ from smclipy.metadata import (
     save_song_temp_to_main,
     scan_library,
 )
+from smclipy.playlists import cmd_playlist
 from smclipy.tag import TAG_COVER_PREFIX, cmd_tag
 from smclipy.ui import (
+    msg,
     prompt_album,
     prompt_authors,
     prompt_crop,
@@ -52,13 +55,15 @@ from smclipy.ui import (
 
 def collect_urls() -> list[str]:
     print("Enter '' as url to finish inputting urls")
+    prior_pending: list[str] = db.get_pending_urls()
     urls_list: list[str] = []
     while True:
         try:
             url: str = input("Enter your URL: ")
         except (KeyboardInterrupt, EOFError):
             print("\nInterrupted while collecting URLs...")
-            db.reset_queue(urls_list)
+            saved: list[str] = list(dict.fromkeys(prior_pending + urls_list))
+            db.reset_queue(saved)
             if urls_list:
                 print(
                     f"Saved partial queue of {len(urls_list)} url/s for a later resume."
@@ -74,7 +79,29 @@ def collect_urls() -> list[str]:
     return urls_list
 
 
-def process_video(url: str, authors_list: list[str]) -> SaveResult:
+def _collect_batch(batch_file: Path) -> list[str]:
+    """Read one URL (or a blob of text) per line from a file, non-interactively."""
+    try:
+        text: str = batch_file.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        print(
+            f"Error: could not read batch file '{batch_file}': {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+    urls: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        urls.extend(url for url in extract_urls(line) if url not in urls)
+    print(f"Read {len(urls)} URL(s) from '{batch_file.name}'.")
+    db.reset_queue(urls)
+    return urls
+
+
+def process_video(
+    url: str, authors_list: list[str], *, no_prompt: bool = False
+) -> SaveResult:
     s: Settings = settings()
     stem: str = temp_stem(url)
     temp_track: Path = s.temp_folder.joinpath(f"{stem}{audio_ext(s.audio_format)}")
@@ -101,20 +128,32 @@ def process_video(url: str, authors_list: list[str]) -> SaveResult:
 
     title_value = info_dictionary.get("title")
     default_title = title_value.strip() if isinstance(title_value, str) else ""
-    title: str = prompt_title(default=default_title)
-    while not title.strip():
-        print("Title cannot be empty.")
+    title: str
+    album: str
+    artists: list[str]
+    authors: str
+    if no_prompt:
+        title = default_title or stem
+        if not default_title:
+            print(f"Warning: no title in video info, using '{stem}'.")
+        album = get_album(info_dictionary)
+        artists = get_author(info_dictionary)
+        authors = "\\".join(resolve_known_authors(artists, authors_list))
+    else:
         title = prompt_title(default=default_title)
-    title = title.strip()
+        while not title.strip():
+            print("Title cannot be empty.")
+            title = prompt_title(default=default_title)
+        title = title.strip()
 
-    album: str = prompt_album(default=get_album(info_dictionary))
+        album = prompt_album(default=get_album(info_dictionary))
 
-    artists: list[str] = get_author(info_dictionary)
-    authors_default: str = "\\".join(resolve_known_authors(artists, authors_list))
-    authors: str = prompt_authors(authors_list, default=authors_default)
-    while not split_authors(authors):
-        print("At least one artist is required.")
+        artists = get_author(info_dictionary)
+        authors_default: str = "\\".join(resolve_known_authors(artists, authors_list))
         authors = prompt_authors(authors_list, default=authors_default)
+        while not split_authors(authors):
+            print("At least one artist is required.")
+            authors = prompt_authors(authors_list, default=authors_default)
 
     current_authors_list: list[str] = split_authors(authors)
     new_authors: list[str] = distinct_authors(current_authors_list, authors_list)
@@ -174,8 +213,10 @@ def _cleanup_temp_files(s: Settings) -> None:
                 temp_file.unlink()
 
 
-def cmd_download(_args: argparse.Namespace) -> None:
+def cmd_download(args: argparse.Namespace) -> None:
     s: Settings = init()
+    no_prompt: bool = bool(getattr(args, "no_prompt", False))
+    batch_raw: str | None = getattr(args, "batch", None)
 
     print("Scanning music files...")
     scan_library()
@@ -185,7 +226,9 @@ def cmd_download(_args: argparse.Namespace) -> None:
 
     pending_ids: list[str] = db.get_pending_urls()
 
-    if pending_ids and prompt_resume():
+    if batch_raw is not None:
+        pending_ids = _collect_batch(Path(batch_raw))
+    elif pending_ids and prompt_resume():
         db.reset_queue(pending_ids)
     else:
         pending_ids = _collect_new_queue()
@@ -198,7 +241,9 @@ def cmd_download(_args: argparse.Namespace) -> None:
         for index, video_id in enumerate(pending_ids, start=1):
             print(f"\n[{index}/{total}] {video_id}")
             try:
-                result: SaveResult = process_video(video_id, authors_list)
+                result: SaveResult = process_video(
+                    video_id, authors_list, no_prompt=no_prompt
+                )
             except VideoDownloadError as exc:
                 print(f"Skipping '{video_id}': {exc}")
                 skipped_ids.append(video_id)
@@ -338,16 +383,50 @@ def cmd_directories(args: argparse.Namespace) -> None:
         print(f"{label:<13}{value}")
 
 
-def cmd_update(_args: argparse.Namespace) -> None:
+def cmd_update(args: argparse.Namespace) -> None:
     s: Settings = init()
+    as_json: bool = bool(getattr(args, "json", False))
 
     if not s.music_folder.is_dir():
-        print(f"Music folder not found at '{s.music_folder}'.")
-        print("Create it or fix 'path_to_music_folder' in the config.")
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "error": "music_folder_not_found",
+                        "path": str(s.music_folder),
+                    }
+                )
+            )
+        else:
+            print(f"Music folder not found at '{s.music_folder}'.")
+            print("Create it or fix 'path_to_music_folder' in the config.")
         return
 
-    print("Scanning music files...")
-    summary: ScanSummary = scan_library()
+    msg("Scanning music files...")
+    summary: ScanSummary = scan_library(collect_details=as_json)
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "added": summary.added,
+                    "renamed": summary.renamed,
+                    "missing": summary.missing,
+                    "changed": summary.changed,
+                    "songs": [
+                        {
+                            "status": change.status,
+                            "uuid": change.uuid,
+                            "path": change.path,
+                            "old_path": change.old_path,
+                        }
+                        for change in summary.changes
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
 
     parts: list[str] = []
     for count, label in (
@@ -365,6 +444,25 @@ def cmd_update(_args: argparse.Namespace) -> None:
 
 
 _TTY_REQUIRED_COMMANDS: frozenset[str] = frozenset({"download", "crop", "tag"})
+_TTY_REQUIRED_PLAYLIST_ACTIONS: frozenset[str] = frozenset({"add", "remove", "move"})
+
+
+def _requires_tty(args: argparse.Namespace) -> bool:
+    """Whether a command needs an interactive terminal for this invocation."""
+    if sys.stdin.isatty():
+        return False
+    if args.command == "download":
+        return not (getattr(args, "batch", None) and getattr(args, "no_prompt", False))
+    if args.command == "tag":
+        return not (
+            bool(getattr(args, "auto", False)) and bool(getattr(args, "all", False))
+        )
+    if args.command in _TTY_REQUIRED_COMMANDS:
+        return True
+    return (
+        args.command == "playlist"
+        and getattr(args, "playlist_action", None) in _TTY_REQUIRED_PLAYLIST_ACTIONS
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -374,11 +472,19 @@ def main(argv: list[str] | None = None) -> None:
         epilog=(
             "examples:\n"
             "  smclipy download   Batch download songs and tag them interactively\n"
+            "  smclipy download --batch urls.txt --no-prompt  Headless batch download\n"
             "  smclipy tag        Retag library songs using MusicBrainz metadata\n"
             "  smclipy tag --auto Full-auto retag: top match applied to each song\n"
             "  smclipy tag --semi Auto-pick the top match, confirm each change\n"
+            "  smclipy tag --auto --all  Headless retag of every untagged song\n"
             "  smclipy crop       Crop pillarboxed cover images and re-embed them\n"
             "  smclipy update     Rescan the library and sync the tracking database\n"
+            "  smclipy update --json  Machine-readable scan report on stdout\n"
+            "  smclipy playlist create Chill  Create an empty playlist\n"
+            "  smclipy playlist add Chill     Interactively add library songs to it\n"
+            "  smclipy playlist export Chill -f m3u  Export it as an .m3u file\n"
+            "  smclipy playlist import mix.m3u       Import a playlist from a file\n"
+            "  smclipy playlist show Chill --json    Print its songs as JSON\n"
             "  smclipy -d         Print the directories smclipy uses\n"
             "  smclipy -v         Print the version and exit\n"
         ),
@@ -395,12 +501,29 @@ def main(argv: list[str] | None = None) -> None:
         parser.add_subparsers(dest="command", metavar="command")
     )
 
-    subparsers.add_parser(
+    download_parser = subparsers.add_parser(
         "download",
         help="Batch download songs from YouTube or SoundCloud and tag them.",
         description=(
             "Batch download songs from YouTube or SoundCloud, then interactively "
             "tag each one with a title, artist, and album before saving it."
+        ),
+    )
+    download_parser.add_argument(
+        "-b",
+        "--batch",
+        metavar="FILE",
+        help=(
+            "Read URLs from FILE (one per line) instead of prompting, so download "
+            "can run without an interactive terminal."
+        ),
+    )
+    download_parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help=(
+            "Accept the default title, album, and artists for each download "
+            "without asking (useful with --batch)."
         ),
     )
 
@@ -444,8 +567,161 @@ def main(argv: list[str] | None = None) -> None:
             "each change set (checkbox dialog) before applying."
         ),
     )
+    tag_parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Tag every untagged song in the library instead of asking for a range. "
+            "Combine with --auto to run without an interactive terminal."
+        ),
+    )
 
-    subparsers.add_parser(
+    playlist_parser: argparse.ArgumentParser = subparsers.add_parser(
+        "playlist",
+        help="Create and manage library playlists, and import/export them.",
+        description=(
+            "Create, rename, delete, list, and show playlists of your tracked "
+            "library songs. Playlists live in the tracking database and reference "
+            "songs by UUID, so renames and relocations never break them. Songs can "
+            "be added, removed, moved, or sorted by metadata, and playlists can be "
+            "exported to .m3u or .json and imported back."
+        ),
+    )
+    playlist_sub: argparse._SubParsersAction[argparse.ArgumentParser] = (
+        playlist_parser.add_subparsers(
+            dest="playlist_action", metavar="action", required=True
+        )
+    )
+
+    playlist_create = playlist_sub.add_parser(
+        "create",
+        help="Create a new playlist.",
+        description="Create a new, empty playlist.",
+    )
+    playlist_create.add_argument("name", help="Name of the playlist.")
+    playlist_create.add_argument(
+        "--description", default="", help="Optional description of the playlist."
+    )
+
+    playlist_rename = playlist_sub.add_parser(
+        "rename",
+        help="Rename a playlist.",
+        description="Rename an existing playlist.",
+    )
+    playlist_rename.add_argument("name", help="Current name of the playlist.")
+    playlist_rename.add_argument("new_name", help="New name for the playlist.")
+
+    playlist_delete = playlist_sub.add_parser(
+        "delete",
+        help="Delete a playlist and its entries.",
+        description="Delete a playlist and remove all of its entries.",
+    )
+    playlist_delete.add_argument("name", help="Name of the playlist to delete.")
+
+    playlist_list = playlist_sub.add_parser(
+        "list",
+        help="List all playlists and their song counts.",
+        description="List every playlist with its song count.",
+    )
+    playlist_list.add_argument(
+        "-j", "--json", action="store_true", help="Print the list as JSON."
+    )
+
+    playlist_show = playlist_sub.add_parser(
+        "show",
+        help="Show the songs in a playlist.",
+        description="List the songs in a playlist in order.",
+    )
+    playlist_show.add_argument("name", help="Name of the playlist to show.")
+    playlist_show.add_argument(
+        "-j", "--json", action="store_true", help="Print the songs as JSON."
+    )
+
+    playlist_add = playlist_sub.add_parser(
+        "add",
+        help="Interactively add library songs to a playlist.",
+        description="Pick songs from your library to append to a playlist.",
+    )
+    playlist_add.add_argument("name", help="Name of the playlist to add to.")
+
+    playlist_remove = playlist_sub.add_parser(
+        "remove",
+        help="Interactively remove songs from a playlist.",
+        description="Pick songs from a playlist to remove.",
+    )
+    playlist_remove.add_argument("name", help="Name of the playlist to remove from.")
+
+    playlist_move = playlist_sub.add_parser(
+        "move",
+        help="Interactively move a song to a new position.",
+        description="Pick a song in a playlist and give it a new position.",
+    )
+    playlist_move.add_argument("name", help="Name of the playlist to reorder.")
+
+    playlist_sort = playlist_sub.add_parser(
+        "sort",
+        help="Sort a playlist's songs by metadata.",
+        description=(
+            "Reorder a playlist's songs by title, artists, album, path, or the "
+            "time they were added."
+        ),
+    )
+    playlist_sort.add_argument("name", help="Name of the playlist to sort.")
+    playlist_sort.add_argument(
+        "--key",
+        choices=("title", "artists", "album", "path", "added"),
+        default="title",
+        help="What to sort by (default: title).",
+    )
+    playlist_sort.add_argument(
+        "--reverse", action="store_true", help="Sort in descending order."
+    )
+
+    playlist_export = playlist_sub.add_parser(
+        "export",
+        help="Export a playlist to .m3u or .json.",
+        description=(
+            "Export a playlist to an .m3u or .json file. Paths are written "
+            "relative to the exported file unless --absolute is given."
+        ),
+    )
+    playlist_export.add_argument("name", help="Name of the playlist to export.")
+    playlist_export.add_argument(
+        "-f",
+        "--format",
+        choices=("m3u", "json"),
+        help="Export format (default: inferred from --output, else m3u).",
+    )
+    playlist_export.add_argument(
+        "-o",
+        "--output",
+        help="Where to write the file (default: <name>.<ext> in the current dir).",
+    )
+    playlist_export.add_argument(
+        "--absolute", action="store_true", help="Write absolute paths."
+    )
+
+    playlist_import = playlist_sub.add_parser(
+        "import",
+        help="Import a playlist from .m3u or .json.",
+        description=(
+            "Import an .m3u/.m3u8 or smclipy .json playlist. Entries are matched "
+            "to your tracked library songs by path (relative to the file, your "
+            "music folder, or absolute) or UUID; unmatched entries are skipped and "
+            "reported."
+        ),
+    )
+    playlist_import.add_argument("file", help="Path to the .m3u/.m3u8/.json file.")
+    playlist_import.add_argument(
+        "--name", help="Playlist name (default: the file's name or the JSON name)."
+    )
+    playlist_import.add_argument(
+        "--replace",
+        action="store_true",
+        help="Overwrite the playlist if it already exists.",
+    )
+
+    update_parser = subparsers.add_parser(
         "update",
         help="Rescan the library and sync the tracking database.",
         description=(
@@ -454,6 +730,12 @@ def main(argv: list[str] | None = None) -> None:
             "vanished as missing. Does not require an interactive terminal, so it "
             "can be run from scripts or cron."
         ),
+    )
+    update_parser.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="Print a machine-readable JSON report to stdout.",
     )
 
     parser.add_argument(
@@ -465,14 +747,14 @@ def main(argv: list[str] | None = None) -> None:
 
     args: argparse.Namespace = parser.parse_args(argv)
 
-    if args.directories:
-        cmd_directories(args)
+    if args.command is None:
+        if args.directories:
+            cmd_directories(args)
+        else:
+            parser.error("the following arguments are required: command")
         return
 
-    if args.command is None:
-        parser.error("the following arguments are required: command")
-
-    if args.command in _TTY_REQUIRED_COMMANDS and not sys.stdin.isatty():
+    if _requires_tty(args):
         print(
             "smclipy requires an interactive terminal. "
             "Piped or non-TTY input is not supported.",
@@ -486,5 +768,7 @@ def main(argv: list[str] | None = None) -> None:
         cmd_crop(args)
     elif args.command == "tag":
         cmd_tag(args)
+    elif args.command == "playlist":
+        cmd_playlist(args)
     elif args.command == "update":
         cmd_update(args)
