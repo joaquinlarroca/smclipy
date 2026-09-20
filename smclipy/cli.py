@@ -20,6 +20,7 @@ from smclipy.formats import SUPPORTED_EXTENSIONS, audio_ext
 from smclipy.helpers import (
     distinct_authors,
     resolve_known_authors,
+    sanitize_filename,
     split_authors,
 )
 from smclipy.images import (
@@ -32,15 +33,20 @@ from smclipy.metadata import (
     COVER_EXTENSIONS,
     SaveResult,
     ScanSummary,
+    backup_cover,
     change_cover,
     get_image_from_file,
     has_cover,
+    library_target_path,
     read_song_uuid,
     save_all_covers,
     save_song_temp_to_main,
     scan_library,
+    snapshot_song,
 )
+from smclipy.modify import cmd_modify
 from smclipy.playlists import cmd_playlist
+from smclipy.restore import cmd_restore
 from smclipy.tag import TAG_COVER_PREFIX, cmd_tag
 from smclipy.ui import (
     msg,
@@ -111,7 +117,7 @@ def process_video(
     info_dictionary = download(url, stem)
     cover_path = get_image_from_file(temp_track, s.temp_folder, stem)
 
-    if cover_path:
+    if cover_path and not no_prompt:
         print("\n\n")
         display_image(cover_path)
 
@@ -159,10 +165,24 @@ def process_video(
     new_authors: list[str] = distinct_authors(current_authors_list, authors_list)
     authors_list.extend(new_authors)
 
+    # If the target already exists and is going to be overwritten, keep the
+    # tracked song's UUID so the existing database row is updated in place
+    # instead of orphaned and replaced with a phantom duplicate.
+    previous_uuid: str | None = None
+    planned: Path | None = library_target_path(temp_track, title, current_authors_list)
+    if planned is not None and planned.is_file():
+        previous_uuid = read_song_uuid(planned)
+
     result: SaveResult
     target: Path | None
     result, target = save_song_temp_to_main(
-        temp_track, cover_path, title, authors, album
+        temp_track,
+        cover_path,
+        title,
+        authors,
+        album,
+        overwrite=False if no_prompt else None,
+        song_uuid=previous_uuid,
     )
     if result is SaveResult.SAVED and target is not None:
         db.add_authors(new_authors)
@@ -292,32 +312,104 @@ def _audio_path_variants(filename: str) -> list[str]:
     return [f"{filename}{ext}" for ext in SUPPORTED_EXTENSIONS]
 
 
-def _record_cover_status(filename: str, status: str) -> None:
-    for rel_path in _audio_path_variants(filename):
-        for row in db.get_song_by_path(rel_path):
-            db.set_cover_status(row["uuid"], status)
-            db.log_event(row["uuid"], "cover", {"status": status, "path": filename})
+def _cover_to_song_uuids() -> dict[str, list[str]]:
+    """Map every cover image stem to the UUIDs of the songs it may belong to.
+
+    A cover is saved as ``artist-title`` derived from the song's tags, so a
+    song is matched both by re-deriving that stem from the recorded
+    title/artists (which survive a rename) and by stripping the audio
+    extension from the recorded paths (current and first-seen). Building the
+    map once lets a whole ``crop`` run resolve every cover with a single
+    database read.
+    """
+    mapping: dict[str, list[str]] = {}
+    seen: dict[str, set[str]] = {}
+
+    def add(stem: str, uuid: str) -> None:
+        key: str = stem.casefold()
+        if uuid not in seen.setdefault(key, set()):
+            seen[key].add(uuid)
+            mapping.setdefault(key, []).append(uuid)
+
+    for row in db.list_songs():
+        uuid: str = str(row["uuid"])
+        title: str = (row["title"] or "").strip()
+        artists: list[str] = split_authors(row["artists"] or "")
+        if title and artists:
+            add(sanitize_filename(f"{artists[0]}-{title}"), uuid)
+        for rel_path in (row["current_path"], row["first_seen_path"]):
+            if not rel_path:
+                continue
+            for ext in SUPPORTED_EXTENSIONS:
+                if rel_path.casefold().endswith(ext):
+                    add(rel_path[: -len(ext)], uuid)
+                    break
+    return mapping
 
 
-def _crop_target_tracks(s: Settings, filename: str) -> list[Path]:
+def _song_uuids_for_cover(
+    filename: str, index: dict[str, list[str]] | None = None
+) -> list[str]:
+    """UUIDs of songs that the cover image stem ``filename`` belongs to.
+
+    ``index`` is a precomputed ``_cover_to_song_uuids()`` map; when omitted it
+    is built on demand, which is convenient for one-off lookups but wasteful
+    when many covers are resolved in a loop.
+    """
+    lookup: dict[str, list[str]] = (
+        index if index is not None else _cover_to_song_uuids()
+    )
+    return list(lookup.get(filename.casefold(), []))
+
+
+def _record_cover_status(
+    filename: str, status: str, *, index: dict[str, list[str]] | None = None
+) -> None:
+    for song_uuid in _song_uuids_for_cover(filename, index=index):
+        db.set_cover_status(song_uuid, status)
+        db.log_event(song_uuid, "cover", {"status": status, "path": filename})
+
+
+def _crop_target_tracks(
+    s: Settings, filename: str, *, index: dict[str, list[str]] | None = None
+) -> list[Path]:
     """Tracks that should receive the cropped cover ``filename``.
 
     The cover name is derived from the song's tags, which no longer match the
     on-disk name once a tracked file has been renamed, so resolve through the
-    database (which remembers both the current and first-seen paths).
+    database: both by path (remembers current and first-seen paths) and by
+    re-deriving the cover stem from the recorded title/artists.
     """
     candidates: list[Path] = [
         s.music_folder.joinpath(rel_path) for rel_path in _audio_path_variants(filename)
     ]
-    for rel_path in _audio_path_variants(filename):
-        for row in db.get_song_by_path(rel_path):
-            if row["current_path"]:
-                candidates.append(s.music_folder.joinpath(row["current_path"]))
+    for song_uuid in _song_uuids_for_cover(filename, index=index):
+        row = db.get_song_by_uuid(song_uuid)
+        if row is not None and row["current_path"]:
+            candidates.append(s.music_folder.joinpath(row["current_path"]))
     targets: list[Path] = []
     for candidate in candidates:
         if candidate.is_file() and candidate not in targets:
             targets.append(candidate)
     return targets
+
+
+def _cover_overlaps_many_songs(filename: str, *, index: dict[str, list[str]]) -> bool:
+    """Whether a cover image stem maps to more than one *distinct* song.
+
+    A cover is derived from the song's first artist and title, so two
+    different songs could share that stem. Re-embedding a cropped cover into
+    every match would then overwrite the wrong song's art; deduplicated
+    copies of the same song (same title and artists) are still safe to
+    re-embed.
+    """
+    seen: set[tuple[str, str]] = set()
+    for song_uuid in _song_uuids_for_cover(filename, index=index):
+        row = db.get_song_by_uuid(song_uuid)
+        if row is None:
+            continue
+        seen.add(((row["title"] or "").casefold(), (row["artists"] or "").casefold()))
+    return len(seen) > 1
 
 
 def cmd_crop(_args: argparse.Namespace) -> None:
@@ -330,6 +422,8 @@ def cmd_crop(_args: argparse.Namespace) -> None:
     print("Reading false positives...")
     false_positives: set[str] = db.get_false_positives()
 
+    cover_uuids: dict[str, list[str]] = _cover_to_song_uuids()
+
     print("Scanning images files...")
     cover_patterns = tuple(f"*{ext}" for ext in COVER_EXTENSIONS)
     cover_files: list[Path] = []
@@ -341,7 +435,9 @@ def cmd_crop(_args: argparse.Namespace) -> None:
                 if is_image_pillarbox(file):
                     cover_files.append(file)
                 else:
-                    _record_cover_status(file.stem, db.COVER_STATUS_NOT_PILLARBOX)
+                    _record_cover_status(
+                        file.stem, db.COVER_STATUS_NOT_PILLARBOX, index=cover_uuids
+                    )
             except Exception as exc:
                 print(f"Warning: could not analyze '{file.name}', skipping: {exc!r}")
 
@@ -353,18 +449,33 @@ def cmd_crop(_args: argparse.Namespace) -> None:
             try:
                 display_image(cover)
                 if prompt_crop(default=True):
+                    backup_cover(cover)
                     crop_image_1_to_1(cover)
-                    targets: list[Path] = _crop_target_tracks(s, filename)
-                    if targets:
+                    targets: list[Path] = _crop_target_tracks(
+                        s, filename, index=cover_uuids
+                    )
+                    if _cover_overlaps_many_songs(filename, index=cover_uuids):
+                        print(
+                            f"{filename}: cover matches multiple different songs, "
+                            "skipping re-embed"
+                        )
+                    elif targets:
                         for track_file in targets:
+                            snapshot_song(
+                                track_file, read_song_uuid(track_file), "crop"
+                            )
                             change_cover(cover, track_file)
                     else:
                         print(f"{filename}: track not found, skipping cover re-embed")
-                    _record_cover_status(filename, db.COVER_STATUS_CROPPED)
+                    _record_cover_status(
+                        filename, db.COVER_STATUS_CROPPED, index=cover_uuids
+                    )
                 else:
                     false_positives.add(filename)
                     db.add_false_positive(filename)
-                    _record_cover_status(filename, db.COVER_STATUS_FALSE_POSITIVE)
+                    _record_cover_status(
+                        filename, db.COVER_STATUS_FALSE_POSITIVE, index=cover_uuids
+                    )
             except Exception as exc:
                 print(f"Warning: could not process '{filename}': {exc!r}")
             print("\n\n")
@@ -384,6 +495,7 @@ def cmd_directories(args: argparse.Namespace) -> None:
         ("Temp:", str(s.temp_folder.resolve())),
         ("Covers:", str(s.covers_folder.resolve())),
         ("Database:", str(s.db_path.resolve())),
+        ("Backups:", str(s.backups_folder.resolve())),
     ]
     for label, value in fields:
         print(f"{label:<13}{value}")
@@ -406,7 +518,7 @@ def cmd_update(args: argparse.Namespace) -> None:
         else:
             print(f"Music folder not found at '{s.music_folder}'.")
             print("Create it or fix 'path_to_music_folder' in the config.")
-        return
+        raise SystemExit(1)
 
     msg("Scanning music files...")
     summary: ScanSummary = scan_library(collect_details=as_json)
@@ -449,7 +561,9 @@ def cmd_update(args: argparse.Namespace) -> None:
         print("Already up to date.")
 
 
-_TTY_REQUIRED_COMMANDS: frozenset[str] = frozenset({"download", "crop", "tag"})
+_TTY_REQUIRED_COMMANDS: frozenset[str] = frozenset(
+    {"download", "crop", "tag", "modify", "restore"}
+)
 _TTY_REQUIRED_PLAYLIST_ACTIONS: frozenset[str] = frozenset({"add", "remove", "move"})
 
 
@@ -483,6 +597,9 @@ def main(argv: list[str] | None = None) -> None:
             "  smclipy tag --auto Full-auto retag: top match applied to each song\n"
             "  smclipy tag --semi Auto-pick the top match, confirm each change\n"
             "  smclipy tag --auto --all  Headless retag of every untagged song\n"
+            "  smclipy tag --auto --all --json  Same, with a JSON report on stdout\n"
+            "  smclipy modify     Manually edit the tags of one or more songs\n"
+            "  smclipy restore    Roll back a song to an earlier tag backup\n"
             "  smclipy crop       Crop pillarboxed cover images and re-embed them\n"
             "  smclipy update     Rescan the library and sync the tracking database\n"
             "  smclipy update --json  Machine-readable scan report on stdout\n"
@@ -529,7 +646,9 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help=(
             "Accept the default title, album, and artists for each download "
-            "without asking (useful with --batch)."
+            "without asking (useful with --batch). A file that already exists "
+            "with the same artist-title name is kept and skipped without "
+            "prompting."
         ),
     )
 
@@ -584,6 +703,48 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "Tag every untagged song in the library instead of asking for a range. "
             "Combine with --auto to run without an interactive terminal."
+        ),
+    )
+    tag_parser.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help=(
+            "Print a machine-readable JSON report to stdout while human messages "
+            "go to stderr. Requires --auto --all (headless retag)."
+        ),
+    )
+
+    modify_parser: argparse.ArgumentParser = subparsers.add_parser(
+        "modify",
+        help="Manually edit the tags of one or more library songs.",
+        description=(
+            "Pick songs from your library (numbers or ranges) and edit their tags "
+            "by hand: title, artists, album, release date, genre, album artist, "
+            "track number, and cover art. One set of values is applied to every "
+            "selected song, so a range bulk-edits an album and a single number "
+            "edits just that song. A blank answer keeps the field, typing /clear "
+            "empties it."
+        ),
+    )
+    modify_parser.add_argument(
+        "--reset-mb",
+        action="store_true",
+        help=(
+            "Forget the MusicBrainz match of every modified song so the `tag` "
+            "command offers it again."
+        ),
+    )
+
+    subparsers.add_parser(
+        "restore",
+        help="Undo tag changes from recorded backups.",
+        description=(
+            "Pick songs from your library and roll back to an earlier backup. "
+            "A backup of each song's tags (and cover art) is recorded "
+            "automatically before every `tag`, `modify`, and `crop` change, so a "
+            "mistaken MusicBrainz match or manual edit can be undone here. The "
+            "restore itself is also backed up, so undoing an undo is possible."
         ),
     )
 
@@ -765,6 +926,15 @@ def main(argv: list[str] | None = None) -> None:
             parser.error("the following arguments are required: command")
         return
 
+    if (
+        args.command == "tag"
+        and getattr(args, "json", False)
+        and not (
+            bool(getattr(args, "auto", False)) and bool(getattr(args, "all", False))
+        )
+    ):
+        parser.error("--json requires --auto and --all (run a headless retag)")
+
     if _requires_tty(args):
         print(
             "smclipy requires an interactive terminal. "
@@ -779,6 +949,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_crop(args)
     elif args.command == "tag":
         cmd_tag(args)
+    elif args.command == "modify":
+        cmd_modify(args)
+    elif args.command == "restore":
+        cmd_restore(args)
     elif args.command == "playlist":
         cmd_playlist(args)
     elif args.command == "update":

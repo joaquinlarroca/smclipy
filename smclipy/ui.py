@@ -61,6 +61,11 @@ def prompt_crop(default: bool = False) -> bool:
     return _choice_yes_no("Crop cover to 1:1?", default=default)
 
 
+def prompt_confirm(message: str, default: bool = False) -> bool:
+    """Ask a plain Yes/No question, defaulting to ``default``."""
+    return _choice_yes_no(message, default=default)
+
+
 def prompt_resume() -> bool:
     return _choice_yes_no(
         "Found an interrupted download. Resume from where it stopped?", default=True
@@ -223,11 +228,12 @@ _TAG_FIELD_ORDER: list[str] = [
     "album_artist",
     "track_number",
 ]
-_TAG_FIELD_LABELS: dict[str, str] = {
+TAG_FIELD_LABELS: dict[str, str] = {
     "title": "Title",
     "artists": "Artist(s)",
     "album": "Album",
     "date": "Release date",
+    "genre": "Genre",
     "album_artist": "Album artist",
     "track_number": "Track number",
 }
@@ -244,8 +250,12 @@ def collect_tag_changes(
     ]
 
 
-def _tag_checkbox_dialog(
-    values: list[tuple[str, str]], default_values: list[str], style: Style
+def _checkbox_dialog(
+    title: str,
+    message: str,
+    values: list[tuple[str, str]],
+    default_values: list[str],
+    style: Style = _DARK_DIALOG_STYLE,
 ) -> Application[list[str]]:
     """Checkbox dialog where Enter applies and Space toggles the focused row."""
     cb_list: CheckboxList[str] = CheckboxList(
@@ -263,14 +273,10 @@ def _tag_checkbox_dialog(
     bindings.add("s-tab")(focus_previous)
 
     dialog = Dialog(
-        title="Confirm changes",
+        title=title,
         body=HSplit(
             [
-                Label(
-                    text="Space toggles a field, Enter applies (uncheck all to skip "
-                    "this song):",
-                    dont_extend_height=True,
-                ),
+                Label(text=message, dont_extend_height=True),
                 cb_list,
             ],
             padding=1,
@@ -302,7 +308,7 @@ def prompt_tag_changes(
     values: list[tuple[str, str]] = [
         (
             field,
-            f"{_TAG_FIELD_LABELS.get(field, field)}: {before or '(empty)'} -> {after}",
+            f"{TAG_FIELD_LABELS.get(field, field)}: {before or '(empty)'} -> {after}",
         )
         for field, before, after in changes
     ]
@@ -310,7 +316,9 @@ def prompt_tag_changes(
         values.append(("cover", "Cover image"))
     if not values:
         return []
-    selected: list[str] = _tag_checkbox_dialog(
+    selected: list[str] = _checkbox_dialog(
+        title="Confirm changes",
+        message="Space toggles a field, Enter applies (uncheck all to skip this song):",
         values=values,
         default_values=[field for field, _ in values],
         style=_DARK_DIALOG_STYLE,
@@ -318,3 +326,37 @@ def prompt_tag_changes(
     if selected is None:
         return None
     return list(dict.fromkeys(selected))
+
+
+def prompt_field_selection(
+    values: list[tuple[str, str]],
+) -> list[str] | None:
+    """Let the user tick which tag fields to modify.
+
+    Every field is unchecked by default. Pressing Enter applies the checked
+    fields immediately, Space toggles the focused row, and unchecking every
+    field and pressing Apply is treated like a cancel (an empty selection).
+    """
+    if not values:
+        return []
+    selected: list[str] = _checkbox_dialog(
+        title="Select fields to modify",
+        message="Space toggles a field, Enter applies the selected fields to the "
+        "chosen song(s) (uncheck all to cancel):",
+        values=values,
+        default_values=[],
+        style=_DARK_DIALOG_STYLE,
+    ).run()
+    if selected is None:
+        return None
+    return list(dict.fromkeys(selected))
+
+
+def prompt_field_value(label: str, default: str = "") -> str:
+    """Ask for one tag field's new value, prefilling the current one.
+
+    Enter keeps the default, editing replaces it, and the caller decides how
+    blank or special input is interpreted.
+    """
+    suffix: str = f" [{default}]" if default else ""
+    return prompt(f"{label}{suffix}: ", default=default)

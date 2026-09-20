@@ -1,6 +1,7 @@
 import io
 from unittest.mock import Mock
 
+import pytest
 from PIL import Image
 
 import smclipy.musicbrainz as mb
@@ -84,12 +85,13 @@ def test_search_recordings_empty_title_returns_none(monkeypatch):
     assert called == []
 
 
-def test_search_recordings_returns_empty_on_webservice_error(monkeypatch):
+def test_search_recordings_raises_on_webservice_error(monkeypatch):
     def boom(*args, **kwargs):
         raise mb.musicbrainzngs.NetworkError("boom")
 
     monkeypatch.setattr("smclipy.musicbrainz.musicbrainzngs.search_recordings", boom)
-    assert mb.search_recordings("Title", ["Artist"]) == []
+    with pytest.raises(mb.MusicBrainzUnavailable):
+        mb.search_recordings("Title", ["Artist"])
 
 
 def test_search_recordings_strips_quotes_from_query(monkeypatch):

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,17 @@ def test_settings_uses_valid_description_max_lines(tmp_path):
     assert s.description_max_lines == 3
 
 
+def test_settings_rejects_non_integral_description_max_lines(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "description_max_lines": 2.5,
+        }
+    )
+    assert s.description_max_lines == 5
+
+
 def test_settings_clamps_negative_description_max_lines(tmp_path):
     s = Settings(
         {
@@ -193,6 +205,33 @@ def test_settings_rejects_non_bool_write_album_if_same_as_title(tmp_path):
     assert s.write_album_if_same_as_title is False
 
 
+def test_settings_default_clean_unwanted_tags(tmp_path):
+    s = Settings({"name": "smclipy", "path_to_music_folder": str(tmp_path)})
+    assert s.clean_unwanted_tags is False
+
+
+def test_settings_honors_clean_unwanted_tags(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "clean_unwanted_tags": True,
+        }
+    )
+    assert s.clean_unwanted_tags is True
+
+
+def test_settings_rejects_non_bool_clean_unwanted_tags(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "clean_unwanted_tags": "yes",
+        }
+    )
+    assert s.clean_unwanted_tags is False
+
+
 def test_settings_coerces_non_string_music_folder(capsys):
     s = Settings({"name": "smclipy", "path_to_music_folder": None})
     assert s.music_folder == Path(".")
@@ -240,15 +279,38 @@ def test_settings_default_cookies_empty(tmp_path):
 
 
 def test_settings_parses_cookies(tmp_path):
+    cookies_file = tmp_path / "cookies.txt"
+    cookies_file.write_text("", encoding="utf-8")
     s = Settings(
         {
             "path_to_music_folder": str(tmp_path),
-            "cookies": " /home/user/cookies.txt ",
-            "cookies_from_browser": "firefox",
+            "cookies": f" {cookies_file} ",
         }
     )
-    assert s.cookies == "/home/user/cookies.txt"
+    assert s.cookies == str(cookies_file)
+
+
+def test_settings_parses_cookies_from_browser(tmp_path):
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "cookies_from_browser": " firefox ",
+        }
+    )
     assert s.cookies_from_browser == "firefox"
+
+
+def test_settings_expands_tilde_in_cookie_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cookies_file = tmp_path / "cookies.txt"
+    cookies_file.write_text("", encoding="utf-8")
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "cookies": "~/cookies.txt",
+        }
+    )
+    assert s.cookies == str(cookies_file)
 
 
 def test_settings_rejects_non_string_cookies(tmp_path, capsys):
@@ -264,3 +326,80 @@ def test_settings_rejects_non_string_cookies(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "cookies" in err
     assert "cookies_from_browser" in err
+
+
+def test_settings_rejects_blank_cookies(tmp_path, capsys):
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "cookies": "   ",
+            "cookies_from_browser": "  ",
+        }
+    )
+    assert s.cookies == ""
+    assert s.cookies_from_browser == ""
+    err = capsys.readouterr().err
+    assert "'cookies' is blank" in err
+    assert "'cookies_from_browser' is blank" in err
+
+
+def test_settings_rejects_missing_cookie_file(tmp_path, capsys):
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "cookies": str(tmp_path / "does-not-exist.txt"),
+        }
+    )
+    assert s.cookies == ""
+    assert "does not exist or is not readable" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read any file")
+def test_settings_rejects_unreadable_cookie_file(tmp_path, capsys):
+    cookies_file = tmp_path / "cookies.txt"
+    cookies_file.write_text("", encoding="utf-8")
+    cookies_file.chmod(0)
+    try:
+        s = Settings(
+            {"path_to_music_folder": str(tmp_path), "cookies": str(cookies_file)}
+        )
+        assert s.cookies == ""
+        assert "does not exist or is not readable" in capsys.readouterr().err
+    finally:
+        cookies_file.chmod(0o600)
+
+
+def test_settings_rejects_unsupported_browser(tmp_path, capsys):
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "cookies_from_browser": "firfox",
+        }
+    )
+    assert s.cookies_from_browser == ""
+    assert "not supported by yt-dlp" in capsys.readouterr().err
+
+
+def test_settings_accepts_browser_with_profile_suffix(tmp_path):
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "cookies_from_browser": "firefox:default",
+        }
+    )
+    assert s.cookies_from_browser == "firefox:default"
+
+
+def test_settings_cookie_file_wins_over_browser(tmp_path, capsys):
+    cookies_file = tmp_path / "cookies.txt"
+    cookies_file.write_text("", encoding="utf-8")
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "cookies": str(cookies_file),
+            "cookies_from_browser": "chrome",
+        }
+    )
+    assert s.cookies == str(cookies_file)
+    assert s.cookies_from_browser == ""
+    assert "cookies_from_browser" in capsys.readouterr().err

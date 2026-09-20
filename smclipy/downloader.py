@@ -1,6 +1,5 @@
 import hashlib
 import re
-import sys
 from typing import Any, cast
 
 import yt_dlp as yt_dlp
@@ -231,12 +230,6 @@ def _yt_dlp_opts(stem: str) -> dict[str, Any]:
         ],
     }
     if s.cookies:
-        if s.cookies_from_browser:
-            print(
-                "Warning: both 'cookies' and 'cookies_from_browser' are set; "
-                "using the cookies file and ignoring the browser.",
-                file=sys.stderr,
-            )
         opts["cookiefile"] = s.cookies
     elif s.cookies_from_browser:
         opts["cookiesfrombrowser"] = (s.cookies_from_browser,)

@@ -11,8 +11,9 @@
 - **Video Info Preview:** Before tagging, the video's title, artist/s, and the first `description_max_lines` lines of its description are shown for context.
 - **Cover Art Cropping:** Crop cover art to a perfect 1:1 square ratio during tagging, with a terminal preview of the art.
 - **Cover Rescan (`crop`):** Re-extracts covers from your existing audio files, detects pillarboxed art, lets you crop it to 1:1, and re-embeds it into the matching files. Images you decline to crop are remembered so you're not asked twice.
+- **Manual Editing (`modify`):** Edit the tags of any library song by hand — title, artists, album, release date, genre, album artist, track number, and cover art. Pick a range to bulk-apply one set of values (e.g., the songs of an album) or a single number to edit one song; a blank answer keeps a field, and typing `/clear` empties it.
 - **Interrupt & Retry Friendly:** Queues are saved as you paste them — pressing Ctrl+C saves what you've entered, queues survive interruptions, and `download` detects an unfinished queue and offers to resume. Videos that fail (e.g., HTTP errors) are kept pending for a later retry up to `max_download_attempts` times, after which they're marked permanently failed and reported; already-processed ones are never re-downloaded.
-- **Overwrite Protection:** Asks before overwriting an existing audio file with the same `artist-title` name, with a per-track `[i/N]` progress line while processing. A choice to keep your existing copy is remembered, so that track isn't re-asked on a later resume.
+- **Overwrite Protection:** Asks before overwriting an existing audio file with the same `artist-title` name, with a per-track `[i/N]` progress line while processing. A choice to keep your existing copy is remembered, so that track isn't re-asked on a later resume. In headless `--no-prompt` mode every prompt is skipped (title, album, artists, cover-crop, overwrite), so an existing file is simply kept and skipped.
 - **Clean Cleanup:** Uses a `.temp` directory (inside your music folder's `smclipy` subfolder) during the download and tagging process to keep your main library clean.
 
 ## Requirements
@@ -31,7 +32,7 @@ pip install smclipy
 
 smclipy relies on a configuration file to know where to organize your files.
 
-On the first run of `download`, `crop`, `tag`, `update`, or any `playlist` action, a default config file is created at `~/.config/smclipy/config.json` and the program exits so you can edit it to your liking. The `-d`/`--directories` and `-v`/`--version` options work immediately using defaults, so you can preview where everything will live before a config exists. To store the config somewhere else, set the `SMCLIPY_CONFIG` environment variable to your preferred path (respects `$XDG_CONFIG_HOME`). If a key is missing from your existing config, it is re-added with its default value the next time you run smclipy.
+On the first run of `download`, `crop`, `tag`, `modify`, `restore`, `update`, or any `playlist` action, a default config file is created at `~/.config/smclipy/config.json` and the program exits so you can edit it to your liking. The `-d`/`--directories` and `-v`/`--version` options work immediately using defaults, so you can preview where everything will live before a config exists. To store the config somewhere else, set the `SMCLIPY_CONFIG` environment variable to your preferred path (respects `$XDG_CONFIG_HOME`). If a key is missing from your existing config, it is re-added with its default value the next time you run smclipy.
 
 ```json
 {
@@ -39,6 +40,7 @@ On the first run of `download`, `crop`, `tag`, `update`, or any `playlist` actio
   "path_to_music_folder": "./Music",
   "description_max_lines": 5,
   "write_album_if_same_as_title": false,
+  "clean_unwanted_tags": false,
   "audio_format": "mp3",
   "max_download_attempts": 3,
   "cookies": "",
@@ -53,10 +55,11 @@ On the first run of `download`, `crop`, `tag`, `update`, or any `playlist` actio
 - `path_to_music_folder`: The base directory where your music library lives (default is `./Music`, relative to wherever you run the command from).
 - `description_max_lines`: How many lines of the video description to show while tagging (default is 5).
 - `write_album_if_same_as_title`: When `true`, the `tag` command writes the album even if it equals the song title. When `false` (default), an album that matches the title is left empty.
+- `clean_unwanted_tags`: When `true`, MP3 downloads strip every tag except title, artists, album, cover art, and the tracking UUID before embedding new tags (FLAC, M4A, OGG, and OPUS encode their own minimal tag sets, so there is nothing extra to strip there). When `false` (default), any tags the source provided (genre, date, lyrics, comments, ...) are kept untouched; the `tag` command still overwrites the fields you confirm.
 - `audio_format`: The format new downloads are saved in. Valid values are `mp3` (default), `m4a`, `flac`, `opus`, and `ogg` (Ogg Vorbis). Existing files in other supported formats are still recognized and re-tagged, so changing this never orphans your library.
 - `max_download_attempts`: How many times `download` tries a URL before giving up on it permanently. After this many failed attempts the URL is marked failed, reported at the start of the next run, and not re-queued again (default is 3).
-- `cookies`: Path to a Netscape-format `cookies.txt` file passed to yt-dlp. Needed for age-restricted or sign-in-required videos (see the [yt-dlp cookie guide](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)). Leave empty to disable.
-- `cookies_from_browser`: Browser name to extract cookies from (e.g. `firefox`, `chrome`). Lower priority than `cookies` — if both are set, the cookies file wins. Leave empty to disable.
+- `cookies`: Path to a Netscape-format `cookies.txt` file passed to yt-dlp. Needed for age-restricted or sign-in-required videos (see the [yt-dlp cookie guide](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)). `~` is expanded; a missing or unreadable file is ignored with a warning. Leave empty to disable.
+- `cookies_from_browser`: Browser name to extract cookies from (e.g. `firefox`, `chrome`) — must be one of the browsers yt-dlp supports, otherwise it is ignored with a warning. Lower priority than `cookies` — if both are set, the cookies file wins. Leave empty to disable.
 - `tag_fields`: Which metadata fields the `tag` command may apply to your library songs. Valid values are `title`, `artists`, `album`, `date`, `album_artist`, `track_number`, and `cover`.
 
 ## Usage
@@ -67,7 +70,7 @@ Run it from your music library's parent directory:
 smclipy <command>
 ```
 
-You can also invoke it as a module: `python -m smclipy <command>`. Note that `download`, `crop`, `tag`, and the interactive playlist actions (`add`, `remove`, `move`) require an interactive terminal, with two headless exceptions: `download --batch FILE --no-prompt` and `tag --auto --all`. `update`, the JSON modes, and the remaining playlist actions never require a terminal, so they can be scripted or scheduled.
+You can also invoke it as a module: `python -m smclipy <command>`. Note that `download`, `crop`, `tag`, `modify`, `restore`, and the interactive playlist actions (`add`, `remove`, `move`) require an interactive terminal, with two headless exceptions: `download --batch FILE --no-prompt` and `tag --auto --all`. `update`, the JSON modes, and the remaining playlist actions never require a terminal, so they can be scripted or scheduled.
 
 ### Commands
 
@@ -77,9 +80,13 @@ You can also invoke it as a module: `python -m smclipy <command>`. Note that `do
   - `smclipy tag --auto` (`-a`) — **Full-auto:** after you pick the song range, the top MusicBrainz match is applied to each selected song automatically with no further prompts, writing every enabled `tag_fields` value (including the title). Shows a per-song progress line instead of the match picker and confirm dialog.
   - `smclipy tag --semi` (`-s`) — **Semi-auto:** the top match is picked automatically per song, but you still review and confirm each change set (checkbox dialog) before it is applied.
   - `smclipy tag --all` — Skip the range prompt and select every untagged song. Combine with `--auto` (`smclipy tag --auto --all`) to retag the whole library without an interactive terminal.
+  - `smclipy tag --json` (`-j`) — Print a machine-readable JSON report to stdout (per-song outcome, recording used, fields written) while human progress goes to stderr. Requires `--auto --all`; use it for a scriptable headless retag report.
+- **`smclipy modify`** — Pick songs from the library list (numbers, ranges, or `all`) and edit their tags by hand: title, artists, album, release date, genre, album artist, track number, and cover art. You choose which fields to touch in a checkbox dialog, then type one value per field that's applied to every selected song — so a range bulk-edits an album and a single number edits just that song. A blank answer keeps the field, typing `/clear` empties it (e.g., to remove a bad album). For cover art, give a path to an image file to embed it, or `/clear` to remove the current image.
+  - `smclipy modify --reset-mb` — Also forget the MusicBrainz match of every modified song, so a later `smclipy tag` run offers it again.
+- **`smclipy restore`** — Undo a mistaken `tag`, `modify`, or `crop` change. Every mutation records a backup of the song's previous tags and cover art first, so you can pick a song, choose one of its snapshots, and roll it back; the restore itself is backed up too. Also handy after a bad `tag --auto` run caught in time.
 - **`smclipy playlist`** — Create, rename, delete, list, show, fill, reorder, sort, and import/export playlists of your library songs. Every action is documented below in the CLI reference. `list` and `show` accept `--json` (`-j`) for machine-readable output.
 - **`smclipy update`** — Rescan the music folder and sync the tracking database: new files get registered, renames are recorded, and vanished files are marked missing. Prints a summary of what changed, or a JSON report with `--json`; safe to run anytime, including from scripts or cron.
-- **`smclipy -d` / `--directories`** — Print the directories and files smclipy uses (config, music, library, temp, covers, database) and exit.
+- **`smclipy -d` / `--directories`** — Print the directories and files smclipy uses (config, music, library, temp, covers, backups, database) and exit.
 - **`smclipy -v` / `--version`** — Print the version and exit.
 
 **MusicBrainz attribution:** the `tag` command searches [MusicBrainz](https://musicbrainz.org), a community-maintained music encyclopedia run by the [MetaBrainz Foundation](https://metabrainz.org). MusicBrainz core data is released as CC0; supplementary data and the MusicBrainz documentation are licensed under [CC BY-NC-SA 3.0](https://creativecommons.org/licenses/by-nc-sa/3.0/). See [MusicBrainz's data license page](https://musicbrainz.org/doc/About/Data_License) for the full breakdown. Cover art is served by the [Cover Art Archive](https://coverartarchive.org/), a joint project of the Internet Archive and MusicBrainz; the images are copyrighted by their respective copyright holders.
@@ -95,7 +102,7 @@ You can also invoke it as a module: `python -m smclipy <command>`. Note that `do
    - Enter the **Title** of the track (prefilled with the video's title).
    - Enter the **Album** (prefilled when the video provides one).
    - Enter the **Artist/s** (prefilled from the channel name; if it matches an author already known — ignoring case and spaces — your existing spelling is kept). To tag multiple artists, separate them using a backslash `\` or a comma (e.g., `Artist 1\Artist 2\Artist 3` or `Artist 1, Artist 2`).
-4. **Save / Skip:** Once tagged, the file is moved to your music folder as `artist-title.<audio_format>` (e.g., `Rick Astley-Never Gonna Give You Up.mp3`). If a file with that name already exists, you're asked whether to overwrite it or keep your existing copy; keeping it is remembered so you aren't asked about that track again. Successfully processed videos are recorded so they're skipped on resume; failed videos stay pending and are reported at the end so you can retry them later — up to `max_download_attempts`, after which a dead URL is reported as permanently failed instead of being re-queued.
+4. **Save / Skip:** Once tagged, the file is moved to your music folder as `artist-title.<audio_format>` (e.g., `Rick Astley-Never Gonna Give You Up.mp3`). If a file with that name already exists, you're asked whether to overwrite it or keep your existing copy; keeping it is remembered so you aren't asked about that track again. Overwriting a tracked song keeps its existing tracking UUID, so the database row is updated in place and no phantom duplicate is created. Successfully processed videos are recorded so they're skipped on resume; failed videos stay pending and are reported at the end so you can retry them later — up to `max_download_attempts`, after which a dead URL is reported as permanently failed instead of being re-queued.
 
 ## Folder Structure Example
 
@@ -110,14 +117,21 @@ After running the script and tagging a few songs, your output directory will loo
 └── 📁 smclipy
     ├── 📁 .temp                       <-- Temp files during processing
     ├── 📁 covers                      <-- Cover art extracted from your audio files
+    ├── 📁 backups                     <-- Tag snapshots used by `smclipy restore`
     └── 📄 smclipy.db                  <-- Tracking database (songs, history, queue, authors)
 ```
+
+> **Snapshots & undo:** before every tag, modify, or crop change, smclipy records the song's current tags (and cover art) as a snapshot in `smclipy/backups/<uuid>/`. A mistaken `tag --auto` run, a bad manual edit, or a wrongly-cropped cover can therefore be rolled back at any time with `smclipy restore`, which rewrites the file's tags (and — for restore-candidates below — re-embeds the saved cover art) and re-syncs the database. Every write to the audio files is atomic (a sibling temp file renamed over the original), so an interrupted run never leaves a half-written song, and leftovers are swept by the next scan. Original cover files are also copied into `smclipy/backups/covers/` before a crop, so a false-positive crop is never permanently destructive.
+
+> **Subfolders are scanned too:** `update`, `tag`, `modify`, and `crop` no longer look only at files in the root of the music folder — albums organized into subdirectories are registered and tracked the same way (paths are recorded relative to the music folder). The smclipy state folder, its subtrees (`.temp`, `covers`, `backups`) and any hidden directories (`.stfolder`, `.stversions`, etc.) are skipped, so scanning never mistakes the script's own data for music. Songs in hidden folders are intentionally not scanned.
 
 > **Tracker:** every song is identified by a UUID stored in its tags, so renaming a file keeps it tracked (the rename is recorded). The database keeps the download URL, MusicBrainz match status (tagged / skipped / not found), cover status (not pillarbox / false positive / cropped), and an append-only event history per song, all inspectable directly in `smclipy.db`.
 >
 > **Re-process a song:** to re-tag a song that was already tagged, or be offered a cover you previously declined, reset its MusicBrainz / cover status in `smclipy.db` (or delete the row to forget it entirely). A song that is missing from the music folder is marked missing but keeps its history; put the file back and it re-appears under the same tracking ID.
 >
 > **Upgrading:** the old text-file tracking (`authors.txt`, `tagged_files.txt`, the queue files, and `cropping_tool_false_positives.txt`) is imported once into `smclipy.db` on the first run of a version that has the database, after which those files are ignored. The database schema is versioned, so future releases upgrade it in place without losing history. Legacy rows are imported as untagged, so the first `tag` run offers every existing library song for MusicBrainz metadata.
+>
+> **Syncthing & other synced shares:** if your music folder is shared between devices, the smclipy state that lives inside it (`smclipy.db`, `.temp`, `covers`, `backups`) should not sync — two devices writing the SQLite database independently with last-writer-wins whole-file copies will corrupt it, and half-downloaded temp files replicate mid-write. An `.stignore` template is provided in the repo (`stignore.example`): copy it to `.stignore` in the shared folder's root (or un-ignore just the `backups/` directory if you want restores mirrored).
 
 ## Development
 
@@ -138,7 +152,7 @@ uv run mypy            # type checks
 
 ## Roadmap
 
-See [roadmap.md](roadmap.md) for planned work: async/concurrent downloads, an interactive library edit/re-tag mode, a configurable library folder structure, and a full TUI upgrade.
+See [roadmap.md](roadmap.md) for planned work: async/concurrent downloads, a configurable library folder structure, and a full TUI upgrade.
 
 ## CLI reference
 
@@ -157,6 +171,8 @@ positional arguments:
                      them.
     crop             Crop pillarboxed cover images and re-embed them.
     tag              Retag library songs using MusicBrainz metadata.
+    modify           Manually edit the tags of one or more library songs.
+    restore          Undo tag changes from recorded backups.
     playlist         Create and manage library playlists, and import/export
                      them.
     update           Rescan the library and sync the tracking database.
@@ -173,6 +189,9 @@ examples:
   smclipy tag --auto Full-auto retag: top match applied to each song
   smclipy tag --semi Auto-pick the top match, confirm each change
   smclipy tag --auto --all  Headless retag of every untagged song
+  smclipy tag --auto --all --json  Same, with a JSON report on stdout
+  smclipy modify     Manually edit the tags of one or more songs
+  smclipy restore    Roll back a song to an earlier tag backup
   smclipy crop       Crop pillarboxed cover images and re-embed them
   smclipy update     Rescan the library and sync the tracking database
   smclipy update --json  Machine-readable scan report on stdout
@@ -229,7 +248,9 @@ options:
                         prompting, so download can run without an interactive
                         terminal.
   --no-prompt           Accept the default title, album, and artists for each
-                        download without asking (useful with --batch).
+                        download without asking (useful with --batch). A file
+                        that already exists with the same artist-title name is
+                        kept and skipped without prompting.
 ```
 
 #### `smclipy update`
@@ -250,7 +271,7 @@ options:
 #### `smclipy tag`
 
 ```text
-usage: smclipy tag [-h] [-a | -s] [--all]
+usage: smclipy tag [-h] [-a | -s] [--all] [-j]
 
 List every song in the library, fetch matching metadata from MusicBrainz, and
 interactively review and apply title, artist, album, release date, track
@@ -266,10 +287,44 @@ options:
   --all       Tag every untagged song in the library instead of asking for a
               range. Combine with --auto to run without an interactive
               terminal.
+  -j, --json  Print a machine-readable JSON report to stdout while human
+              messages go to stderr. Requires --auto --all (headless retag).
 
 Metadata is provided by MusicBrainz (core data is CC0, supplementary data and
 docs are CC BY-NC-SA 3.0; https://musicbrainz.org ), and cover art is served
 by the Cover Art Archive (coverartarchive.org).
+```
+
+#### `smclipy modify`
+
+```text
+usage: smclipy modify [-h] [--reset-mb]
+
+Pick songs from your library (numbers or ranges) and edit their tags by hand:
+title, artists, album, release date, genre, album artist, track number, and
+cover art. One set of values is applied to every selected song, so a range
+bulk-edits an album and a single number edits just that song. A blank answer
+keeps the field, typing /clear empties it.
+
+options:
+  -h, --help  show this help message and exit
+  --reset-mb  Forget the MusicBrainz match of every modified song so the `tag`
+              command offers it again.
+```
+
+#### `smclipy restore`
+
+```text
+usage: smclipy restore [-h]
+
+Pick songs from your library and roll back to an earlier backup. A backup of
+each song's tags (and cover art) is recorded automatically before every `tag`,
+`modify`, and `crop` change, so a mistaken MusicBrainz match or manual edit
+can be undone here. The restore itself is also backed up, so undoing an undo
+is possible.
+
+options:
+  -h, --help  show this help message and exit
 ```
 
 #### `smclipy crop`

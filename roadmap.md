@@ -21,7 +21,6 @@ The development of `smclipy` is organized into the following areas, focusing on 
 
 - **Dynamic Library Structure:** Upgrade the configuration file to support custom path schemas, e.g. a flat structure or an organized hierarchy using templates like `/(main_artist)/(album)/(track_number).(format)` or `/(main_artist) - (title).(format)`.
 - **TUI (Text User Interface) Upgrade:** Transition from standard CLI prompts to a rich, interactive terminal dashboard using libraries like `Textual` or `Rich`, featuring live download progress bars and enhanced autocompletion menus.
-- **`modify` Command:** Add a command to change arbitrary aspects of a song, accepting a range to reset or bulk-edit several songs at once.
 - **`-f/--file` Flag:** Let `crop`, `modify`, and similar commands accept an explicit file path instead of only library songs.
 - **Ordered Ranges:** Add a flag so `tag`, `modify`, and similar commands accept a range against a differently ordered song list (e.g. sorted by artist, title, or album).
 - **Remembered Checkbox Opt-Outs:** If a field is unchecked in the tag dialog, keep that field opted out by default on future prompts.

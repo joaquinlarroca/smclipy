@@ -105,6 +105,42 @@ def test_process_video_skips_crop_prompt_when_already_1_to_1(
     assert "Already 1:1" in capsys.readouterr().out
 
 
+def test_process_video_no_prompt_skips_cover_display_and_crop(
+    monkeypatch, app_settings
+):
+    import smclipy.cli as cli
+
+    temp = app_settings.temp_folder
+    temp.mkdir(parents=True, exist_ok=True)
+    cover_path = temp / "temp.png"
+    cover_path.write_bytes(b"image")
+
+    monkeypatch.setattr(cli, "download", lambda url, stem="temp": {"title": "Song"})
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: cover_path)
+    for name in (
+        "display_image",
+        "is_image_1_to_1",
+        "prompt_crop",
+        "prompt_title",
+        "prompt_album",
+        "prompt_authors",
+    ):
+        monkeypatch.setattr(cli, name, Mock(side_effect=AssertionError(name)))
+    monkeypatch.setattr(cli, "get_album", lambda info: "")
+    monkeypatch.setattr(cli, "get_author", lambda info: ["Artist"])
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli,
+        "save_song_temp_to_main",
+        lambda *a, **k: (
+            SaveResult.SAVED,
+            app_settings.music_folder / "Artist-Song.mp3",
+        ),
+    )
+
+    process_video("https://soundcloud.com/artist/track", [], no_prompt=True)
+
+
 def test_process_video_no_prompt_uses_defaults(monkeypatch, app_settings):
     import smclipy.cli as cli
 
@@ -120,7 +156,7 @@ def test_process_video_no_prompt_uses_defaults(monkeypatch, app_settings):
     for name in ("prompt_title", "prompt_album", "prompt_authors", "prompt_crop"):
         monkeypatch.setattr(cli, name, Mock(side_effect=AssertionError(name)))
 
-    def fake_save(temp, cover, title, authors, album):
+    def fake_save(temp, cover, title, authors, album, **kwargs):
         captured.update(title=title, authors=authors, album=album)
         return SaveResult.SAVED, None
 
@@ -148,7 +184,7 @@ def test_process_video_no_prompt_falls_back_to_stem_title(monkeypatch, app_setti
     for name in ("prompt_title", "prompt_album", "prompt_authors", "prompt_crop"):
         monkeypatch.setattr(cli, name, Mock(side_effect=AssertionError(name)))
 
-    def fake_save(temp, cover, title, authors, album):
+    def fake_save(temp, cover, title, authors, album, **kwargs):
         captured["title"] = title
         return SaveResult.SAVED, None
 
@@ -157,6 +193,69 @@ def test_process_video_no_prompt_falls_back_to_stem_title(monkeypatch, app_setti
     process_video("https://soundcloud.com/artist/track", [], no_prompt=True)
 
     assert captured["title"] == "sc-artist-track"
+
+
+def test_process_video_no_prompt_passes_overwrite_false(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    captured = {}
+
+    monkeypatch.setattr(
+        cli, "download", lambda url, stem="temp": {"title": "Song Title"}
+    )
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "get_album", lambda info: "Album Name")
+    monkeypatch.setattr(cli, "get_author", lambda info: ["Artist"])
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    for name in ("prompt_title", "prompt_album", "prompt_authors", "prompt_crop"):
+        monkeypatch.setattr(cli, name, Mock(side_effect=AssertionError(name)))
+
+    def fake_save(temp, cover, title, authors, album, **kwargs):
+        captured["overwrite"] = kwargs.get("overwrite")
+        return SaveResult.SAVED, None
+
+    monkeypatch.setattr(cli, "save_song_temp_to_main", fake_save)
+
+    process_video("https://soundcloud.com/artist/track", [], no_prompt=True)
+    assert captured["overwrite"] is False
+
+    monkeypatch.setattr(cli, "prompt_title", lambda *a, **k: "Song")
+    monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
+    monkeypatch.setattr(cli, "prompt_authors", lambda *a, **k: "Artist")
+
+    process_video("https://soundcloud.com/artist/track", [])
+    assert captured["overwrite"] is None
+
+
+def test_process_video_reuses_existing_song_uuid(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    target = app_settings.music_folder / "Artist-Song.mp3"
+    target.write_bytes(MINIMAL_MP3)
+    existing_uuid = write_song_uuid(target)
+    assert existing_uuid is not None
+
+    captured = {}
+
+    monkeypatch.setattr(cli, "download", lambda url, stem="temp": {})
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "get_album", lambda info: "Album Name")
+    monkeypatch.setattr(cli, "get_author", lambda info: ["Artist"])
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "prompt_title", lambda *a, **k: "Song")
+    monkeypatch.setattr(cli, "prompt_album", lambda *a, **k: "Album")
+    monkeypatch.setattr(cli, "prompt_authors", lambda *a, **k: "Artist")
+    monkeypatch.setattr(cli, "prompt_crop", lambda *a, **k: False)
+
+    def fake_save(temp, cover, title, authors, album, **kwargs):
+        captured["song_uuid"] = kwargs.get("song_uuid")
+        return SaveResult.SAVED, target
+
+    monkeypatch.setattr(cli, "save_song_temp_to_main", fake_save)
+
+    process_video("https://soundcloud.com/artist/track", [])
+    assert captured["song_uuid"] == existing_uuid
 
 
 def test_process_video_prefills_corrected_authors(monkeypatch, app_settings):
@@ -301,7 +400,7 @@ def test_process_video_passes_album_to_save(monkeypatch, app_settings):
 
     captured = {}
 
-    def fake_save(temp_mp3, temp_png, title, authors, album):
+    def fake_save(temp_mp3, temp_png, title, authors, album, **kwargs):
         captured["album"] = album
         return (SaveResult.SAVED, None)
 
@@ -431,6 +530,30 @@ def test_cmd_crop_reembeds_into_renamed_mp3(monkeypatch, app_settings):
     assert change_cover.call_args.args[1] == music / "Renamed.mp3"
 
 
+def test_cmd_crop_records_status_for_renamed_song(app_settings):
+    import smclipy.cli as cli
+
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    original = music / "Artist-Song.mp3"
+    original.write_bytes(MINIMAL_MP3)
+    song_uuid = write_song_uuid(original, "11111111-1111-1111-1111-111111111111")
+    assert song_uuid is not None
+    db.insert_song(
+        song_uuid=song_uuid,
+        current_path="Artist-Song.mp3",
+        title="Song",
+        artists="Artist",
+    )
+    db.set_song_path(song_uuid, "Renamed.mp3")
+    original.rename(music / "Renamed.mp3")
+
+    cli._record_cover_status("Artist-Song", db.COVER_STATUS_CROPPED)
+
+    row = db.get_song_by_uuid(song_uuid)
+    assert row["cover_status"] == db.COVER_STATUS_CROPPED
+
+
 def test_cmd_directories_prints_all_paths(monkeypatch, tmp_path, capsys):
     import json
 
@@ -551,6 +674,85 @@ def test_main_rejects_tag_auto_and_semi_together(monkeypatch, capsys):
     assert exc.value.code == 2
     captured = capsys.readouterr()
     assert "not allowed with argument" in captured.err
+
+
+def test_main_rejects_tag_json_without_auto_all(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["tag", "--json"])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert "--json requires --auto and --all" in captured.err
+
+
+def test_main_rejects_tag_json_semi(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["tag", "--json", "--semi", "--all"])
+    assert exc.value.code == 2
+    assert "requires --auto and --all" in capsys.readouterr().err
+
+
+def test_main_accepts_tag_json_auto_all(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+
+    def fake_cmd_tag(_args):
+        calls.append(_args)
+
+    monkeypatch.setattr(cli, "cmd_tag", fake_cmd_tag)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    cli.main(["tag", "--json", "--auto", "--all"])
+    assert len(calls) == 1
+    assert calls[0].json is True
+    assert calls[0].auto is True
+    assert calls[0].all is True
+
+
+def test_main_exits_when_stdin_not_a_tty_for_modify(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["modify"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_dispatch_dispatches_modify(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+
+    def fake_cmd_modify(_args):
+        calls.append(_args)
+
+    monkeypatch.setattr(cli, "cmd_modify", fake_cmd_modify)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    cli.main(["modify"])
+    assert len(calls) == 1
+    assert calls[0].reset_mb is False
+
+
+def test_main_dispatch_dispatches_modify_reset_mb(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+
+    def fake_cmd_modify(_args):
+        calls.append(_args)
+
+    monkeypatch.setattr(cli, "cmd_modify", fake_cmd_modify)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    cli.main(["modify", "--reset-mb"])
+    assert len(calls) == 1
+    assert calls[0].reset_mb is True
 
 
 def test_main_dispatch_dispatches_update(monkeypatch, app_settings):
@@ -740,6 +942,7 @@ def test_process_video_reprompts_on_empty_authors(monkeypatch, app_settings):
         title: str,
         authors: str,
         album: str,
+        **kwargs: object,
     ) -> tuple[SaveResult, Path | None]:
         captured["authors"] = authors
         return (SaveResult.SAVED, None)
@@ -1208,6 +1411,30 @@ def test_main_download_batch_without_no_prompt_requires_tty(monkeypatch, capsys)
     assert "interactive terminal" in captured.out + captured.err
 
 
+def test_main_restore_dispatches(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_restore", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["restore"])
+    assert len(calls) == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" not in captured.out + captured.err
+
+
+def test_main_restore_requires_tty(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["restore"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
 def test_cmd_update_json_reports_changes(monkeypatch, app_settings, capsys):
     import smclipy.cli as cli
 
@@ -1234,6 +1461,27 @@ def test_cmd_update_json_reports_changes(monkeypatch, app_settings, capsys):
     assert song["path"] == "Artist-Song.mp3"
     assert song["old_path"] is None
     assert song["uuid"]
+
+
+def test_cmd_update_missing_music_folder_exits(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_update(argparse.Namespace(json=False))
+    assert exc.value.code == 1
+    assert "Music folder not found" in capsys.readouterr().out
+
+
+def test_cmd_update_json_missing_music_folder_exits(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_update(argparse.Namespace(json=True))
+    assert exc.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "music_folder_not_found"
 
 
 def test_collect_urls_interrupt_preserves_prior_pending(

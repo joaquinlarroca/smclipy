@@ -1,7 +1,10 @@
 """Interactive library tagging using MusicBrainz metadata."""
 
-from contextlib import suppress
+import json
+import sys
+from contextlib import nullcontext, redirect_stdout, suppress
 from pathlib import Path
+from typing import Any
 
 import smclipy.db as db
 from smclipy.config import COVER_FIELD, TAG_FIELDS, Settings, init, settings
@@ -14,8 +17,14 @@ from smclipy.metadata import (
     read_song_profile,
     read_song_uuid,
     scan_library,
+    snapshot_song,
 )
-from smclipy.musicbrainz import MusicBrainzMatch, fetch_cover_art, search_recordings
+from smclipy.musicbrainz import (
+    MusicBrainzMatch,
+    MusicBrainzUnavailable,
+    fetch_cover_art,
+    search_recordings,
+)
 from smclipy.ui import (
     collect_tag_changes,
     prompt_match_selection,
@@ -176,6 +185,7 @@ def process_song(
     total: int | None = None,
     *,
     mode: str = "interactive",
+    report: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Fetch candidates, pick one, and apply confirmed changes.
 
@@ -184,6 +194,10 @@ def process_song(
     - ``"semi"``: auto-pick the top candidate but still confirm the changes.
     - ``"auto"``: auto-pick the top candidate and apply all configured fields
       without asking.
+
+    When ``report`` is given, an entry describing the outcome (applied /
+    not_found / unavailable / skipped / already_matching / error) is appended
+    for machine-readable retagging reports.
     """
     s: Settings = settings()
     title, artists, album = _search_query(song)
@@ -192,10 +206,34 @@ def process_song(
         print(f"{progress}Auto-tagging '{song.display_name}'...")
     else:
         print(f"\n{progress}=== {song.display_name} ===\n")
-    matches: list[MusicBrainzMatch] = search_recordings(title, artists, album)
+
+    def append(outcome: str, **extra: Any) -> None:
+        if report is not None:
+            report.append(
+                {
+                    "outcome": outcome,
+                    "display_name": song.display_name,
+                    "title": song.current.get("title") or song.path.stem,
+                    "artists": song.current.get("artists", ""),
+                    "recording_id": None,
+                    "release_group_id": None,
+                    **extra,
+                }
+            )
+
+    try:
+        matches: list[MusicBrainzMatch] = search_recordings(title, artists, album)
+    except MusicBrainzUnavailable:
+        print(
+            "MusicBrainz is unreachable, skipping without recording a result "
+            "(the song will be offered again next run)."
+        )
+        append("unavailable")
+        return False
     if not matches:
         print("No MusicBrainz matches found, skipping.")
         _record_mb_outcome(song.uuid, db.MB_STATUS_NOT_FOUND)
+        append("not_found")
         return False
 
     if mode == "interactive":
@@ -203,6 +241,7 @@ def process_song(
         if selected is None:
             print("Skipped.")
             _record_mb_outcome(song.uuid, db.MB_STATUS_SKIPPED)
+            append("skipped")
             return False
     else:
         selected = 0
@@ -229,10 +268,17 @@ def process_song(
     if not changes and not cover_pending:
         print("Tags already match MusicBrainz; marking song as tagged.")
         _record_already_matching(song, match)
+        append(
+            "already_matching",
+            recording_id=match.recording_id or None,
+            release_group_id=match.release_group_id,
+            fields=[],
+        )
         return False
     to_apply: list[str] | None = None
     if mode != "auto":
         to_apply = prompt_tag_changes(changes, cover_pending=cover_pending)
+    requested_fields: set[str] = set()
     try:
         fields: set[str] | None
         if mode == "auto":
@@ -242,12 +288,32 @@ def process_song(
         else:
             print("Skipped.")
             _record_mb_outcome(song.uuid, db.MB_STATUS_SKIPPED)
+            append("skipped")
             return False
-        _apply(song, match, cover_path, fields)
+        # Mirror how ``_apply`` resolves a ``None`` field set: every enabled
+        # field, plus the cover when one was fetched.
+        requested_fields = set(_enabled_fields()) if fields is None else fields
+        if fields is None and cover_path is not None:
+            requested_fields.add(COVER_FIELD)
+        if not _apply(song, match, cover_path, fields):
+            append("error")
+            return False
     finally:
         if cover_path is not None:
             with suppress(OSError):
                 cover_path.unlink()
+    # The report lists only what was really written: fields whose value changed
+    # (``_apply`` skips fields the tags already match) plus the embedded cover.
+    changed_fields: set[str] = {field for field, _, _ in changes}
+    applied_fields: set[str] = requested_fields & changed_fields
+    if cover_path is not None and COVER_FIELD in requested_fields:
+        applied_fields.add(COVER_FIELD)
+    append(
+        "applied",
+        recording_id=match.recording_id or None,
+        release_group_id=match.release_group_id,
+        fields=sorted(applied_fields),
+    )
     return True
 
 
@@ -256,7 +322,8 @@ def _apply(
     match: MusicBrainzMatch,
     cover_path: Path | None,
     fields: set[str] | None = None,
-) -> None:
+) -> bool:
+    """Apply ``fields`` to ``song`` from ``match``; returns whether it applied."""
     if fields is None:
         fields = set(_enabled_fields())
         if cover_path is not None:
@@ -278,6 +345,9 @@ def _apply(
     track_number: str | None = (
         _intend_track_number(match, current) if "track_number" in fields else None
     )
+    # Record the pre-change profile so a mistaken match can be undone with
+    # the `restore` command.
+    snapshot_song(song.path, song.uuid, "tag")
     ok: bool = apply_tag_update(
         song.path,
         title=title,
@@ -290,7 +360,7 @@ def _apply(
     )
     if not ok:
         print(f"Warning: could not apply changes to '{song.path.name}'.")
-        return
+        return False
     previous_artists: list[str] = split_authors(current.get("artists", ""))
     new_artists: list[str] = distinct_authors(artists or [], previous_artists)
     db.add_authors(new_artists)
@@ -323,6 +393,7 @@ def _apply(
             },
         )
     print(f"Updated '{song.path.name}'.")
+    return True
 
 
 def _cleanup_tag_cover_files() -> None:
@@ -335,70 +406,128 @@ def _cleanup_tag_cover_files() -> None:
             temp_file.unlink()
 
 
+def _run_tag(
+    args: object, mode: str, report: list[dict[str, Any]] | None
+) -> tuple[int, int]:
+    """Run the retag workflow; returns ``(updated, already-tagged-skipped)``.
+
+    While ``report`` is collecting, every human-facing message is sent to
+    stderr so the caller can emit a machine-readable JSON report on stdout.
+    """
+    with redirect_stdout(sys.stderr) if report is not None else nullcontext():
+        if mode == "auto":
+            print(
+                "Auto mode: the top MusicBrainz match will be applied to each "
+                "selected song with no further prompts."
+            )
+        elif mode == "semi":
+            print(
+                "Semi-auto mode: the top MusicBrainz match is picked per song, "
+                "but you still review the changes before applying."
+            )
+        init()
+        print("Scanning music files...")
+        scan_library()
+        songs: list[LibrarySong] = list_library_songs()
+        if not songs:
+            print("No audio files found in the library to tag.")
+            return 0, 0
+        enabled: frozenset[str] = _enabled_fields()
+        print(f"Found {len(songs)} audio file(s) in the library.")
+        if enabled:
+            print(f"Fields to auto-fill: {', '.join(sorted(enabled))}")
+        else:
+            print("Warning: no tag fields are enabled (config 'tag_fields' is empty).")
+            print(
+                "Add fields such as 'title', 'artists', 'album' to tag song metadata."
+            )
+        print("\nSongs in your library:")
+        for index, song in enumerate(songs, start=1):
+            print(f"{index:3}. {song.display_name}")
+
+        select_all: bool = bool(getattr(args, "all", False))
+        if select_all:
+            selected: list[int] = list(range(len(songs)))
+        else:
+            selected = prompt_song_selection(len(songs))
+        tagged_by_uuid: dict[str, bool] = {
+            row["uuid"]: bool(row["tagged"]) for row in db.list_songs()
+        }
+        updated = 0
+        skipped = 0
+        try:
+            for index, position in enumerate(selected, start=1):
+                song = songs[position]
+                if song.uuid is not None and tagged_by_uuid.get(song.uuid):
+                    print(f"Skipping '{song.display_name}': already tagged before.")
+                    skipped += 1
+                    if report is not None:
+                        report.append(
+                            {
+                                "outcome": "already_tagged",
+                                "display_name": song.display_name,
+                                "title": song.current.get("title") or song.path.stem,
+                                "artists": song.current.get("artists", ""),
+                                "recording_id": None,
+                                "release_group_id": None,
+                            }
+                        )
+                    continue
+                try:
+                    if process_song(
+                        song,
+                        position=index,
+                        total=len(selected),
+                        mode=mode,
+                        report=report,
+                    ):
+                        updated += 1
+                except KeyboardInterrupt:
+                    print("\nInterrupted, exiting...")
+                    raise SystemExit(130) from None
+                except Exception as exc:
+                    print(f"Warning: could not process '{song.display_name}': {exc!r}")
+                    if report is not None:
+                        report.append(
+                            {
+                                "outcome": "error",
+                                "display_name": song.display_name,
+                                "title": song.current.get("title") or song.path.stem,
+                                "artists": song.current.get("artists", ""),
+                                "recording_id": None,
+                                "release_group_id": None,
+                                "error": repr(exc),
+                            }
+                        )
+        finally:
+            _cleanup_tag_cover_files()
+    return updated, skipped
+
+
 def cmd_tag(args: object) -> None:
     auto: bool = bool(getattr(args, "auto", False))
     semi: bool = bool(getattr(args, "semi", False))
+    as_json: bool = bool(getattr(args, "json", False))
     mode: str = "auto" if auto else "semi" if semi else "interactive"
-    if mode == "auto":
+
+    report: list[dict[str, Any]] | None = [] if as_json else None
+    updated: int
+    skipped: int
+    updated, skipped = _run_tag(args, mode, report)
+
+    if as_json:
         print(
-            "Auto mode: the top MusicBrainz match will be applied to each "
-            "selected song with no further prompts."
+            json.dumps(
+                {
+                    "updated": updated,
+                    "skipped": skipped,
+                    "songs": report,
+                },
+                indent=2,
+            )
         )
-    elif mode == "semi":
-        print(
-            "Semi-auto mode: the top MusicBrainz match is picked per song, "
-            "but you still review the changes before applying."
-        )
-    init()
-    print("Scanning music files...")
-    scan_library()
-
-    songs: list[LibrarySong] = list_library_songs()
-    if not songs:
-        print("No audio files found in the library to tag.")
-        return
-
-    enabled: frozenset[str] = _enabled_fields()
-    print(f"Found {len(songs)} audio file(s) in the library.")
-    if enabled:
-        print(f"Fields to auto-fill: {', '.join(sorted(enabled))}")
     else:
-        print("Warning: no tag fields are enabled (config 'tag_fields' is empty).")
-        print("Add fields such as 'title', 'artists', 'album' to tag song metadata.")
-    print("\nSongs in your library:")
-    for index, song in enumerate(songs, start=1):
-        print(f"{index:3}. {song.display_name}")
-
-    select_all: bool = bool(getattr(args, "all", False))
-    if select_all:
-        selected: list[int] = list(range(len(songs)))
-    else:
-        selected = prompt_song_selection(len(songs))
-    updated = 0
-    skipped = 0
-    tagged_by_uuid: dict[str, bool] = {
-        row["uuid"]: bool(row["tagged"]) for row in db.list_songs()
-    }
-    try:
-        if not selected:
-            return
-        for index, position in enumerate(selected, start=1):
-            song = songs[position]
-            if song.uuid is not None and tagged_by_uuid.get(song.uuid):
-                print(f"Skipping '{song.display_name}': already tagged before.")
-                skipped += 1
-                continue
-            try:
-                if process_song(song, position=index, total=len(selected), mode=mode):
-                    updated += 1
-            except KeyboardInterrupt:
-                print("\nInterrupted, exiting...")
-                raise SystemExit(130) from None
-            except Exception as exc:
-                print(f"Warning: could not process '{song.display_name}': {exc!r}")
-    finally:
-        _cleanup_tag_cover_files()
-    message: str = f"\nDone. Updated {updated} song(s)."
-    if skipped:
-        message += f" Skipped {skipped} already-tagged song(s)."
-    print(message)
+        message: str = f"\nDone. Updated {updated} song(s)."
+        if skipped:
+            message += f" Skipped {skipped} already-tagged song(s)."
+        print(message)

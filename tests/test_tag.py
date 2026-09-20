@@ -1,6 +1,8 @@
 import argparse
 import io
+import json
 from typing import Any
+from unittest.mock import Mock
 
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, TALB, TIT2, TPE1
@@ -8,7 +10,7 @@ from PIL import Image
 
 import smclipy.db as db
 from smclipy import tag
-from smclipy.metadata import read_song_uuid, scan_library
+from smclipy.metadata import has_cover, read_song_uuid, scan_library
 from smclipy.musicbrainz import MusicBrainzMatch
 
 MINIMAL_MP3 = (bytes.fromhex("FFFB9064") + bytes(413)) * 2
@@ -769,3 +771,139 @@ def test_cmd_tag_warns_on_empty_tag_fields(monkeypatch, app_settings, capsys):
     tag.cmd_tag(argparse.Namespace())
 
     assert "no tag fields are enabled" in capsys.readouterr().out
+
+
+def test_process_song_unreachable_records_no_mb_outcome(monkeypatch, app_settings):
+    app_settings.tag_fields = ["title"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-Song.mp3", title="Song", artist="Artist")
+    scan_library()
+    song_uuid = read_song_uuid(music / "Artist-Song.mp3")
+    assert song_uuid is not None
+
+    monkeypatch.setattr(
+        tag,
+        "search_recordings",
+        Mock(side_effect=tag.MusicBrainzUnavailable("down")),
+    )
+
+    report: list[dict[str, Any]] = []
+    result = tag.process_song(tag.LibrarySong(music / "Artist-Song.mp3"), report=report)
+
+    assert result is False
+    row = db.get_song_by_uuid(song_uuid)
+    assert row["musicbrainz_status"] is None
+    assert report == [
+        {
+            "outcome": "unavailable",
+            "display_name": "Song - Artist",
+            "title": "Song",
+            "artists": "Artist",
+            "recording_id": None,
+            "release_group_id": None,
+        }
+    ]
+
+
+def test_cmd_tag_json_report(monkeypatch, app_settings, capsys):
+    app_settings.tag_fields = ["title", "artists", "album"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-One.mp3", title="One", artist="Artist", album="Album"
+    )
+
+    monkeypatch.setattr(tag, "scan_library", lambda: None)
+    monkeypatch.setattr(
+        tag,
+        "search_recordings",
+        lambda *a, **k: [a_match(title="Renamed", artists=["Artist"], album="Album")],
+    )
+    monkeypatch.setattr(tag, "fetch_cover_art", lambda *a, **k: None)
+
+    tag.cmd_tag(argparse.Namespace(auto=True, all=True, json=True))
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["updated"] == 1
+    assert payload["skipped"] == 0
+    assert len(payload["songs"]) == 1
+    assert payload["songs"][0]["outcome"] == "applied"
+    assert payload["songs"][0]["title"] == "One"
+    assert "title" in payload["songs"][0]["fields"]
+    assert payload["songs"][0]["recording_id"] == "rec-1"
+    assert payload["songs"][0]["release_group_id"] == "rg-1"
+    assert "Auto-tagging" in captured.err
+
+    id3 = ID3(music / "Artist-One.mp3")
+    assert str(id3["TIT2"]) == "Renamed"
+
+
+def test_cmd_tag_json_empty_library_report(monkeypatch, app_settings, capsys):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(tag, "scan_library", lambda: None)
+
+    tag.cmd_tag(argparse.Namespace(auto=True, all=True, json=True))
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload == {"updated": 0, "skipped": 0, "songs": []}
+    assert "No audio files found" in captured.err
+
+
+def test_process_song_semi_report_excludes_unchecked_cover(monkeypatch, app_settings):
+    app_settings.tag_fields = ["title", "artists", "album", "cover"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="Artist")
+    scan_library()
+
+    cover_path = app_settings.temp_folder / "tag-cover-rec-1.jpg"
+    cover_path.parent.mkdir(parents=True, exist_ok=True)
+    cover_path.write_bytes(b"image-bytes")
+
+    monkeypatch.setattr(
+        tag, "search_recordings", lambda *a, **k: [a_match(title="New Title")]
+    )
+    monkeypatch.setattr(
+        tag, "fetch_cover_art", lambda release_group_id, dest: cover_path
+    )
+    monkeypatch.setattr(tag, "display_image", lambda *a, **k: None)
+    monkeypatch.setattr(tag, "prompt_tag_changes", lambda *a, **k: ["title"])
+
+    report: list[dict[str, Any]] = []
+    result = tag.process_song(
+        tag.LibrarySong(music / "Artist-One.mp3"), mode="semi", report=report
+    )
+
+    assert result is True
+    assert len(report) == 1
+    entry = report[0]
+    assert entry["outcome"] == "applied"
+    assert entry["fields"] == ["title"]
+    assert "cover" not in entry["fields"]
+    assert entry["recording_id"] == "rec-1"
+    assert entry["release_group_id"] == "rg-1"
+    assert not has_cover(music / "Artist-One.mp3")
+
+
+def test_cmd_tag_json_reports_crashed_song(monkeypatch, app_settings, capsys):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        app_settings.music_folder / "Artist-One.mp3", title="One", artist="Artist"
+    )
+    monkeypatch.setattr(tag, "scan_library", lambda: None)
+    monkeypatch.setattr(tag, "process_song", Mock(side_effect=RuntimeError("boom")))
+
+    tag.cmd_tag(argparse.Namespace(auto=True, all=True, json=True))
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["updated"] == 0
+    assert payload["skipped"] == 0
+    assert len(payload["songs"]) == 1
+    assert payload["songs"][0]["outcome"] == "error"
+    assert payload["songs"][0]["error"] == "RuntimeError('boom')"
+    assert payload["songs"][0]["recording_id"] is None
+    assert payload["songs"][0]["release_group_id"] is None

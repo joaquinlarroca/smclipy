@@ -185,7 +185,7 @@ def _patch_checkboxlist(monkeypatch, result):
         captured.update(kwargs)
         return FakeApp()
 
-    monkeypatch.setattr(ui, "_tag_checkbox_dialog", fake)
+    monkeypatch.setattr(ui, "_checkbox_dialog", fake)
     return captured
 
 
@@ -209,3 +209,49 @@ def test_prompt_tag_changes_cancel_returns_none(monkeypatch):
 
 def test_prompt_tag_changes_empty_returns_empty():
     assert ui.prompt_tag_changes([]) == []
+
+
+def test_prompt_field_selection_unchecked_by_default(monkeypatch):
+    captured = _patch_checkboxlist(monkeypatch, ["title", "album"])
+    result = ui.prompt_field_selection(
+        [("title", "Title"), ("artists", "Artist(s)"), ("album", "Album")]
+    )
+    assert result == ["title", "album"]
+    assert captured["default_values"] == []
+    assert captured["values"] == [
+        ("title", "Title"),
+        ("artists", "Artist(s)"),
+        ("album", "Album"),
+    ]
+    assert "Select fields to modify" in captured["title"]
+
+
+def test_prompt_field_selection_cancel_returns_none(monkeypatch):
+    _patch_checkboxlist(monkeypatch, None)
+    assert ui.prompt_field_selection([("title", "Title")]) is None
+
+
+def test_prompt_field_selection_empty_is_cancel():
+    assert ui.prompt_field_selection([]) == []
+
+
+def test_prompt_field_value_prefills_default(monkeypatch):
+    captured = {}
+
+    def fake_prompt(message, **kwargs):
+        captured.update(message=message, kwargs=kwargs)
+        return "New Value"
+
+    monkeypatch.setattr(ui, "prompt", fake_prompt)
+    assert ui.prompt_field_value("Title", default="Old Title") == "New Value"
+    assert captured["message"] == "Title [Old Title]: "
+    assert captured["kwargs"]["default"] == "Old Title"
+
+
+def test_prompt_field_value_no_default_no_suffix(monkeypatch):
+    def fake_prompt(message, **kwargs):
+        assert message == "Genre: "
+        return ""
+
+    monkeypatch.setattr(ui, "prompt", fake_prompt)
+    assert ui.prompt_field_value("Genre") == ""

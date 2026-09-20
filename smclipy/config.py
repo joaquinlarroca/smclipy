@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from yt_dlp.cookies import SUPPORTED_BROWSERS
+
 from smclipy.formats import SUPPORTED_FORMATS
 from smclipy.helpers import sanitize_filename
 
@@ -12,6 +14,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "path_to_music_folder": "./Music",
     "description_max_lines": 5,
     "write_album_if_same_as_title": False,
+    "clean_unwanted_tags": False,
     "audio_format": "mp3",
     "max_download_attempts": 3,
     "cookies": "",
@@ -82,17 +85,41 @@ class Settings:
         )
         self.db_path: Path = self.script_folder.joinpath("smclipy.db")
         self.covers_folder: Path = self.script_folder.joinpath("covers")
+        self.backups_folder: Path = self.script_folder.joinpath("backups")
         raw_value = raw.get("description_max_lines", 5)
         if isinstance(raw_value, bool):
             raw_value = 5
+            print(
+                "Warning: 'description_max_lines' must be a non-negative "
+                "integer, using 5",
+                file=sys.stderr,
+            )
         try:
+            if isinstance(raw_value, float) and raw_value != int(raw_value):
+                raise ValueError
             parsed = int(raw_value)
         except (TypeError, ValueError):
             parsed = 5
-        self.description_max_lines: int = max(0, parsed)
+            print(
+                "Warning: 'description_max_lines' must be a non-negative "
+                "integer, using 5",
+                file=sys.stderr,
+            )
+        if parsed < 0:
+            parsed = 0
+            print(
+                "Warning: 'description_max_lines' must be a non-negative "
+                "integer, using 0",
+                file=sys.stderr,
+            )
+        self.description_max_lines: int = parsed
         raw_flag = raw.get("write_album_if_same_as_title", False)
         self.write_album_if_same_as_title: bool = (
             raw_flag if isinstance(raw_flag, bool) else False
+        )
+        raw_clean = raw.get("clean_unwanted_tags", False)
+        self.clean_unwanted_tags: bool = (
+            raw_clean if isinstance(raw_clean, bool) else False
         )
         raw_fields = raw.get("tag_fields", list(DEFAULT_CONFIG.get("tag_fields", [])))
         if isinstance(raw_fields, list):
@@ -114,6 +141,10 @@ class Settings:
         raw_attempts = raw.get("max_download_attempts", 3)
         if isinstance(raw_attempts, bool):
             raw_attempts = 3
+            print(
+                "Warning: 'max_download_attempts' must be a positive integer, using 3",
+                file=sys.stderr,
+            )
         try:
             parsed_attempts = int(raw_attempts)
         except (TypeError, ValueError):
@@ -122,7 +153,13 @@ class Settings:
                 "Warning: 'max_download_attempts' must be a positive integer, using 3",
                 file=sys.stderr,
             )
-        self.max_download_attempts: int = max(1, parsed_attempts)
+        if parsed_attempts < 1:
+            parsed_attempts = 3
+            print(
+                "Warning: 'max_download_attempts' must be a positive integer, using 3",
+                file=sys.stderr,
+            )
+        self.max_download_attempts: int = parsed_attempts
         raw_cookies = raw.get("cookies", "")
         if not isinstance(raw_cookies, str):
             raw_cookies = ""
@@ -130,7 +167,22 @@ class Settings:
                 "Warning: 'cookies' must be a non-empty string path, ignoring it",
                 file=sys.stderr,
             )
-        self.cookies: str = raw_cookies.strip()
+        elif raw_cookies and not raw_cookies.strip():
+            raw_cookies = ""
+            print("Warning: 'cookies' is blank, ignoring it", file=sys.stderr)
+        cookies_value: str = raw_cookies.strip()
+        if cookies_value:
+            cookies_path = Path(cookies_value).expanduser()
+            if not cookies_path.is_file() or not os.access(cookies_path, os.R_OK):
+                print(
+                    f"Warning: 'cookies' file does not exist or is not readable: "
+                    f"'{cookies_path}', ignoring it",
+                    file=sys.stderr,
+                )
+                cookies_value = ""
+            else:
+                cookies_value = str(cookies_path)
+        self.cookies: str = cookies_value
         raw_browser = raw.get("cookies_from_browser", "")
         if not isinstance(raw_browser, str):
             raw_browser = ""
@@ -139,7 +191,28 @@ class Settings:
                 "ignoring it",
                 file=sys.stderr,
             )
-        self.cookies_from_browser: str = raw_browser.strip()
+        elif raw_browser and not raw_browser.strip():
+            raw_browser = ""
+            print(
+                "Warning: 'cookies_from_browser' is blank, ignoring it",
+                file=sys.stderr,
+            )
+        browser_value: str = raw_browser.strip()
+        if browser_value and browser_value.split(":", 1)[0] not in SUPPORTED_BROWSERS:
+            print(
+                f"Warning: 'cookies_from_browser' '{browser_value}' is not "
+                f"supported by yt-dlp, ignoring it",
+                file=sys.stderr,
+            )
+            browser_value = ""
+        if cookies_value and browser_value:
+            browser_value = ""
+            print(
+                "Warning: both 'cookies' and 'cookies_from_browser' are set; "
+                "using the cookies file and ignoring the browser.",
+                file=sys.stderr,
+            )
+        self.cookies_from_browser: str = browser_value
 
 
 # Global settings singleton. This is a CLI: a single settings object lives for
@@ -183,7 +256,12 @@ def _load_raw_config(create_if_missing: bool = True) -> dict[str, Any]:
 def setup_folders() -> None:
     s: Settings = settings()
     try:
-        for folder in (s.script_folder, s.covers_folder, s.temp_folder):
+        for folder in (
+            s.script_folder,
+            s.covers_folder,
+            s.temp_folder,
+            s.backups_folder,
+        ):
             folder.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         print(

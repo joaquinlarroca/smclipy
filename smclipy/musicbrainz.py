@@ -31,6 +31,10 @@ _SNIFFED_EXT_BY_FORMAT: dict[str, str] = {
 }
 
 
+class MusicBrainzUnavailable(Exception):
+    """MusicBrainz could not be reached or returned an unusable response."""
+
+
 def _throttle() -> None:
     global _last_request_at
     elapsed: float = time.monotonic() - _last_request_at
@@ -194,7 +198,9 @@ def search_recordings(
             query="".join(query_parts), limit=limit
         )
     except (musicbrainzngs.WebServiceError, OSError, ValueError):
-        return []
+        raise MusicBrainzUnavailable(
+            "The MusicBrainz web service could not be reached."
+        ) from None
     recordings = result.get("recording-list", [])
     recordings.sort(key=_rank_recording, reverse=True)
     return [_match_from_recording(recording) for recording in recordings]

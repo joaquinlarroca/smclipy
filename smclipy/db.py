@@ -571,6 +571,23 @@ def set_cover_status(
             c.close()
 
 
+def reset_mb_status(song_uuid: str, conn: sqlite3.Connection | None = None) -> None:
+    """Forget a song's MusicBrainz match so the `tag` command offers it again."""
+    c, owner = _rw(conn)
+    try:
+        c.execute(
+            "UPDATE songs SET musicbrainz_status = NULL,"
+            " musicbrainz_recording_id = NULL, musicbrainz_release_group_id = NULL,"
+            " tagged = 0, updated_at = ? WHERE uuid = ?",
+            (_now(), song_uuid),
+        )
+        if owner:
+            c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
 def log_event(
     song_uuid: str,
     event: str,

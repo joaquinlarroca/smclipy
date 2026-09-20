@@ -1,13 +1,24 @@
+import os
+from contextlib import suppress
 from pathlib import Path
 
 import climage
 from PIL import Image, ImageOps, ImageStat
 
+_TEMP_MARKER = ".smclipy-tmp"
+
 
 def crop_image_1_to_1(path: Path) -> None:
     with Image.open(str(path)) as image:
         side: int = min(image.size)
-        ImageOps.fit(image, (side, side)).save(str(path))
+        cropped: Image.Image = ImageOps.fit(image, (side, side))
+    temp: Path = path.with_name(f".{path.stem}{_TEMP_MARKER}{path.suffix}")
+    try:
+        cropped.save(str(temp))
+        os.replace(str(temp), str(path))
+    finally:
+        with suppress(OSError):
+            temp.unlink()
 
 
 def is_image_1_to_1(path: Path) -> bool:

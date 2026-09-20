@@ -119,13 +119,12 @@ def test_yt_dlp_opts_passes_cookies_from_browser(app_settings):
     assert "cookiefile" not in opts
 
 
-def test_yt_dlp_opts_cookie_file_wins_over_browser(app_settings, capsys):
+def test_yt_dlp_opts_cookie_file_wins_over_browser(app_settings):
     app_settings.cookies = "/home/user/cookies.txt"
     app_settings.cookies_from_browser = "chrome"
     opts = _yt_dlp_opts("stem")
     assert opts["cookiefile"] == "/home/user/cookies.txt"
     assert "cookiesfrombrowser" not in opts
-    assert "cookies_from_browser" in capsys.readouterr().err
 
 
 @requires_ffmpeg

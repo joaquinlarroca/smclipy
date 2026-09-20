@@ -1,11 +1,13 @@
 import io
 import os
+from unittest.mock import Mock
 
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import APIC, ID3
 from PIL import Image
 
 import smclipy.db as db
+from smclipy.formats import Track
 from smclipy.metadata import (
     SaveResult,
     ScanSummary,
@@ -13,15 +15,19 @@ from smclipy.metadata import (
     _open_audio,
     _tag_file,
     apply_tag_update,
+    backup_cover,
     change_cover,
     get_image_from_file,
     has_cover,
+    list_snapshots,
     read_song_profile,
     read_song_uuid,
+    restore_song_from_snapshot,
     save_all_covers,
     save_image,
     save_song_temp_to_main,
     scan_library,
+    snapshot_song,
     write_song_uuid,
 )
 
@@ -450,7 +456,8 @@ def test_tag_file_preserves_existing_tracking_uuid(tmp_path):
     assert read_song_uuid(mp3_file) == song_uuid
 
 
-def test_tag_file_clears_stale_frames(tmp_path):
+def test_tag_file_clears_stale_frames(app_settings, tmp_path):
+    app_settings.clean_unwanted_tags = True
     mp3_file = tmp_path / "song.mp3"
     mp3_file.write_bytes(MINIMAL_MP3)
     audio = EasyID3()
@@ -473,6 +480,31 @@ def test_tag_file_clears_stale_frames(tmp_path):
     assert "TCON" not in tags
     assert "TPE2" not in tags
     assert "TRCK" not in tags
+
+
+def test_tag_file_preserves_extra_frames_by_default(tmp_path):
+    mp3_file = tmp_path / "song.mp3"
+    mp3_file.write_bytes(MINIMAL_MP3)
+    audio = EasyID3()
+    audio["title"] = ["Old"]
+    audio["artist"] = ["Old Artist"]
+    audio["album"] = ["Old Album"]
+    audio["date"] = ["1999"]
+    audio["genre"] = ["Rock"]
+    audio["albumartist"] = ["Old Album Artist"]
+    audio["tracknumber"] = ["7"]
+    audio.save(mp3_file)
+
+    assert _tag_file(mp3_file, "New", ["Artist"], "Album", None) is True
+
+    tags = ID3(mp3_file)
+    assert str(tags["TIT2"]) == "New"
+    assert str(tags["TPE1"]) == "Artist"
+    assert str(tags["TALB"]) == "Album"
+    assert str(tags["TDRC"]) == "1999"
+    assert str(tags["TCON"]) == "Rock"
+    assert str(tags["TPE2"]) == "Old Album Artist"
+    assert str(tags["TRCK"]) == "7"
 
 
 def test_change_cover_replaces_existing_apic(tmp_path):
@@ -586,6 +618,72 @@ def test_save_song_temp_to_main_declined_overwrite_is_skipped(
     assert result is SaveResult.SKIPPED
     assert target.read_bytes() == b"original"
     assert source.exists()
+
+
+def test_save_song_temp_to_main_overwrite_false_skips_without_prompt(
+    app_settings, tmp_path, monkeypatch
+):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    target = app_settings.music_folder / "Artist A-Song.mp3"
+    target.write_bytes(b"original")
+
+    source = tmp_path / "temp.mp3"
+    source.write_bytes(MINIMAL_MP3)
+    image = tmp_path / "cover.png"
+    image.write_bytes(make_png_bytes())
+
+    monkeypatch.setattr(
+        "smclipy.metadata.prompt_overwrite",
+        Mock(side_effect=AssertionError("headless runs must not prompt")),
+    )
+
+    result, _ = save_song_temp_to_main(
+        source, image, "Song", "Artist A", "Album", overwrite=False
+    )
+
+    assert result is SaveResult.SKIPPED
+    assert target.read_bytes() == b"original"
+    assert source.exists()
+
+
+def test_save_song_temp_to_main_overwrite_true_replaces_without_prompt(
+    app_settings, tmp_path, monkeypatch
+):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    target = app_settings.music_folder / "Artist A-Song.mp3"
+    target.write_bytes(b"original")
+
+    source = tmp_path / "temp.mp3"
+    source.write_bytes(MINIMAL_MP3)
+    image = tmp_path / "cover.png"
+    image.write_bytes(make_png_bytes())
+
+    monkeypatch.setattr(
+        "smclipy.metadata.prompt_overwrite",
+        Mock(side_effect=AssertionError("headless runs must not prompt")),
+    )
+
+    result, _ = save_song_temp_to_main(
+        source, image, "Song", "Artist A", "Album", overwrite=True
+    )
+
+    assert result is SaveResult.SAVED
+    assert target.is_file()
+    assert not source.exists()
+
+
+def test_scan_library_removes_orphan_temp_files(app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Foo.mp3")
+    orphan = music / ".Foo.smclipy-tmp.mp3"
+    orphan.write_bytes(MINIMAL_MP3)
+
+    scan_library()
+
+    assert not orphan.exists()
+    assert (music / "Foo.mp3").exists()
+    assert "leftover temp file(s)" in capsys.readouterr().err
 
 
 def test_save_song_temp_to_main_empty_authors_skips(app_settings, tmp_path, capsys):
@@ -759,3 +857,182 @@ def test_write_song_uuid_leaves_no_temp_file(tmp_path):
     assert song_uuid is not None
     assert read_song_uuid(path) == song_uuid
     assert [p.name for p in tmp_path.iterdir()] == ["song.mp3"]
+
+
+def test_scan_library_includes_subfolders_and_skips_state(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    sub = music / "Coldplay"
+    sub.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "one.mp3", title="Song", artist="Artist A")
+    write_tagged_mp3(sub / "nested.mp3", title="Nested", artist="Artist B")
+    app_settings.script_folder.mkdir(parents=True, exist_ok=True)
+    (app_settings.script_folder / "state.mp3").write_bytes(MINIMAL_MP3)
+    (app_settings.script_folder / ".temp").mkdir()
+    (app_settings.script_folder / ".temp" / "yt-abc.mp3").write_bytes(MINIMAL_MP3)
+
+    scan_library()
+
+    songs = db.list_songs()
+    assert {row["title"] for row in songs} == {"Song", "Nested"}
+    assert {row["current_path"] for row in songs} == {
+        "Coldplay/nested.mp3",
+        "one.mp3",
+    }
+
+
+def test_scan_library_ignores_hidden_directories(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "one.mp3", title="Song", artist="Artist A")
+    hidden = music / ".archive"
+    hidden.mkdir()
+    write_tagged_mp3(hidden / "old.mp3", title="Old", artist="Artist Z")
+
+    scan_library()
+
+    assert [row["title"] for row in db.list_songs()] == ["Song"]
+
+
+def test_save_song_temp_to_main_reuses_existing_uuid(app_settings, tmp_path):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    target = app_settings.music_folder / "Artist A-Song.mp3"
+    write_tagged_mp3(target, title="Old", artist="Artist A")
+    existing_uuid = write_song_uuid(target)
+    assert existing_uuid is not None
+
+    source = tmp_path / "temp.mp3"
+    source.write_bytes(MINIMAL_MP3)
+
+    result, saved = save_song_temp_to_main(
+        source,
+        None,
+        "Song",
+        "Artist A",
+        "Album",
+        overwrite=True,
+        song_uuid=existing_uuid,
+    )
+
+    assert result is SaveResult.SAVED
+    assert saved == target
+    assert target.is_file()
+    assert read_song_uuid(target) == existing_uuid
+
+
+def test_snapshot_and_restore_roundtrip(app_settings, tmp_path):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    path = app_settings.music_folder / "A-Song.mp3"
+    write_tagged_mp3(path, title="Song", artist="Artist A", album="LP")
+    scan_library()
+    song_uuid = read_song_uuid(path)
+    assert song_uuid is not None
+
+    snap = snapshot_song(path, song_uuid, "tag")
+    assert snap is not None
+    assert snap.is_file()
+
+    assert apply_tag_update(path, title="Wrong", artists=["Wrong Artist"]) is True
+
+    snapshots = list_snapshots(song_uuid)
+    assert len(snapshots) == 1
+    assert snapshots[0].title == "Song"
+    assert snapshots[0].artists == "Artist A"
+
+    assert restore_song_from_snapshot(path, snapshots[0]) is True
+
+    profile, _ = read_song_profile(path)
+    assert profile["title"] == "Song"
+    assert profile["artists"] == "Artist A"
+    assert profile["album"] == "LP"
+    assert read_song_uuid(path) == song_uuid
+
+
+def test_snapshot_keeps_cover_art(app_settings, tmp_path):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    path = app_settings.music_folder / "A-Song.mp3"
+    write_tagged_mp3(path, title="Song", artist="Artist A")
+    song_uuid = write_song_uuid(path)
+    assert song_uuid is not None
+    image = tmp_path / "cover.png"
+    image.write_bytes(make_png_bytes())
+    change_cover(image, path)
+    assert has_cover(path) is True
+
+    snapshot_song(path, song_uuid, "tag")
+
+    snapshots = list_snapshots(song_uuid)
+    assert len(snapshots) == 1
+    assert snapshots[0].cover is not None
+    assert snapshots[0].cover.read_bytes() == make_png_bytes()
+
+
+def test_backup_cover_copies_into_backups(app_settings, tmp_path):
+    cover = tmp_path / "A-Song.png"
+    cover.write_bytes(make_png_bytes())
+
+    assert backup_cover(cover) is True
+
+    backed = app_settings.backups_folder / "covers" / "A-Song.png"
+    assert backed.is_file()
+    assert backed.read_bytes() == make_png_bytes()
+
+
+def test_save_image_relabel_backs_up_previous(app_settings, tmp_path):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    covered = tmp_path / "covered.mp3"
+    write_tagged_mp3(covered, title="Song", artist="Artist A")
+    img = ID3(covered)
+    img.add(
+        APIC(
+            encoding=3,
+            mime="image/png",
+            type=3,
+            desc="Cover",
+            data=make_png_bytes(),
+        )
+    )
+    img.save()
+    track = Track.open(covered)
+    assert track is not None
+
+    app_settings.covers_folder.mkdir(parents=True, exist_ok=True)
+    old = app_settings.covers_folder / "A-Song.webp"
+    old.write_bytes(make_png_bytes())
+
+    saved = save_image("A-Song.webp", track, app_settings.covers_folder)
+
+    assert saved == app_settings.covers_folder / "A-Song.png"
+    assert not old.exists()
+    assert (app_settings.backups_folder / "covers" / "A-Song.webp").is_file()
+
+
+def test_save_image_changed_cover_backs_up_previous(app_settings, tmp_path):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    covered = tmp_path / "covered.mp3"
+    write_tagged_mp3(covered, title="Song", artist="Artist A")
+    img = ID3(covered)
+    img.add(
+        APIC(
+            encoding=3,
+            mime="image/png",
+            type=3,
+            desc="Cover",
+            data=make_png_bytes(),
+        )
+    )
+    img.save()
+    track = Track.open(covered)
+    assert track is not None
+
+    app_settings.covers_folder.mkdir(parents=True, exist_ok=True)
+    target = app_settings.covers_folder / "A-Song.png"
+    target.write_bytes(b"old-bytes")
+
+    saved = save_image("A-Song.png", track, app_settings.covers_folder)
+
+    assert saved == target
+    assert target.read_bytes() == make_png_bytes()
+    assert (app_settings.backups_folder / "covers" / "A-Song.png").is_file()
+    backed = app_settings.backups_folder / "covers" / "A-Song.png"
+    assert backed.read_bytes() == b"old-bytes"

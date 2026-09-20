@@ -3,6 +3,7 @@
     "path_to_music_folder": "./Music",
     "description_max_lines": 5,
     "write_album_if_same_as_title": false,
+    "clean_unwanted_tags": false,
     "audio_format": "mp3",
     "max_download_attempts": 3,
     "cookies": "",

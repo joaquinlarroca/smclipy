@@ -1,0 +1,29 @@
+// smclipy ignores for the Syncthing folder that holds your music library
+// (rename this file to ".stignore" inside the shared music folder to use it).
+//
+// smclipy keeps its database, covers cache, temporary download files and tag
+// backups *inside* the music folder. Syncing those to other devices can
+// corrupt the SQLite database (both peers write it independently) and
+// re-syncs half-written temp files, so they should not be shared.
+
+// Per-song tag backups made before every tag/modify/crop change (used by
+// `smclipy restore` to undo mistakes). Share these ONLY if you want restores
+// mirrored across devices.
+smclipy/backups/
+
+// SQLite database + per-song state. Do NOT share: concurrent writes from two
+// devices will corrupt it.
+smclipy/smclipy.db
+smclipy/smclipy.db-journal
+smclipy/smclipy.db-wal
+smclipy/smclipy.db-shm
+
+// Temporary download/cover files and per-run state.
+smclipy/.temp/
+smclipy/*.txt
+smclipy/covers/
+// Also change these if the config key "name" is not "smclipy".
+
+// Atomic-edit leftovers that should never be synced (e.g. a hard kill during
+// a tag write). They are cleaned up automatically on the next scan.
+*smclipy-tmp*
