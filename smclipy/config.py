@@ -14,6 +14,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "write_album_if_same_as_title": False,
     "audio_format": "mp3",
     "max_download_attempts": 3,
+    "cookies": "",
+    "cookies_from_browser": "",
     "tag_fields": [
         "title",
         "artists",
@@ -121,6 +123,23 @@ class Settings:
                 file=sys.stderr,
             )
         self.max_download_attempts: int = max(1, parsed_attempts)
+        raw_cookies = raw.get("cookies", "")
+        if not isinstance(raw_cookies, str):
+            raw_cookies = ""
+            print(
+                "Warning: 'cookies' must be a non-empty string path, ignoring it",
+                file=sys.stderr,
+            )
+        self.cookies: str = raw_cookies.strip()
+        raw_browser = raw.get("cookies_from_browser", "")
+        if not isinstance(raw_browser, str):
+            raw_browser = ""
+            print(
+                "Warning: 'cookies_from_browser' must be a non-empty string, "
+                "ignoring it",
+                file=sys.stderr,
+            )
+        self.cookies_from_browser: str = raw_browser.strip()
 
 
 # Global settings singleton. This is a CLI: a single settings object lives for

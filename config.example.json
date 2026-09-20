@@ -4,5 +4,8 @@
     "description_max_lines": 5,
     "write_album_if_same_as_title": false,
     "audio_format": "mp3",
+    "max_download_attempts": 3,
+    "cookies": "",
+    "cookies_from_browser": "",
     "tag_fields": ["title", "artists", "album", "date", "album_artist", "track_number", "cover"]
 }

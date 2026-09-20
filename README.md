@@ -41,6 +41,8 @@ On the first run of `download`, `crop`, `tag`, `update`, or any `playlist` actio
   "write_album_if_same_as_title": false,
   "audio_format": "mp3",
   "max_download_attempts": 3,
+  "cookies": "",
+  "cookies_from_browser": "",
   "tag_fields": ["title", "artists", "album", "date", "album_artist", "track_number", "cover"]
 }
 ```
@@ -53,6 +55,8 @@ On the first run of `download`, `crop`, `tag`, `update`, or any `playlist` actio
 - `write_album_if_same_as_title`: When `true`, the `tag` command writes the album even if it equals the song title. When `false` (default), an album that matches the title is left empty.
 - `audio_format`: The format new downloads are saved in. Valid values are `mp3` (default), `m4a`, `flac`, `opus`, and `ogg` (Ogg Vorbis). Existing files in other supported formats are still recognized and re-tagged, so changing this never orphans your library.
 - `max_download_attempts`: How many times `download` tries a URL before giving up on it permanently. After this many failed attempts the URL is marked failed, reported at the start of the next run, and not re-queued again (default is 3).
+- `cookies`: Path to a Netscape-format `cookies.txt` file passed to yt-dlp. Needed for age-restricted or sign-in-required videos (see the [yt-dlp cookie guide](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)). Leave empty to disable.
+- `cookies_from_browser`: Browser name to extract cookies from (e.g. `firefox`, `chrome`). Lower priority than `cookies` — if both are set, the cookies file wins. Leave empty to disable.
 - `tag_fields`: Which metadata fields the `tag` command may apply to your library songs. Valid values are `title`, `artists`, `album`, `date`, `album_artist`, `track_number`, and `cover`.
 
 ## Usage

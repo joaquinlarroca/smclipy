@@ -231,3 +231,36 @@ def test_settings_rejects_bogus_max_download_attempts(tmp_path, capsys):
     )
     assert s.max_download_attempts == 3
     assert "max_download_attempts" in capsys.readouterr().err
+
+
+def test_settings_default_cookies_empty(tmp_path):
+    s = Settings({"path_to_music_folder": str(tmp_path)})
+    assert s.cookies == ""
+    assert s.cookies_from_browser == ""
+
+
+def test_settings_parses_cookies(tmp_path):
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "cookies": " /home/user/cookies.txt ",
+            "cookies_from_browser": "firefox",
+        }
+    )
+    assert s.cookies == "/home/user/cookies.txt"
+    assert s.cookies_from_browser == "firefox"
+
+
+def test_settings_rejects_non_string_cookies(tmp_path, capsys):
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "cookies": 5,
+            "cookies_from_browser": ["chrome"],
+        }
+    )
+    assert s.cookies == ""
+    assert s.cookies_from_browser == ""
+    err = capsys.readouterr().err
+    assert "cookies" in err
+    assert "cookies_from_browser" in err

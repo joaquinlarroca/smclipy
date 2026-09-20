@@ -99,6 +99,35 @@ def test_yt_dlp_opts_uses_configured_codec(app_settings, audio_format, codec):
     assert ("preferredquality" in extract_audio) is (audio_format == "mp3")
 
 
+def test_yt_dlp_opts_no_cookie_keys_by_default(app_settings):
+    opts = _yt_dlp_opts("stem")
+    assert "cookiefile" not in opts
+    assert "cookiesfrombrowser" not in opts
+
+
+def test_yt_dlp_opts_passes_cookie_file(app_settings):
+    app_settings.cookies = "/home/user/cookies.txt"
+    opts = _yt_dlp_opts("stem")
+    assert opts["cookiefile"] == "/home/user/cookies.txt"
+    assert "cookiesfrombrowser" not in opts
+
+
+def test_yt_dlp_opts_passes_cookies_from_browser(app_settings):
+    app_settings.cookies_from_browser = "firefox"
+    opts = _yt_dlp_opts("stem")
+    assert opts["cookiesfrombrowser"] == ("firefox",)
+    assert "cookiefile" not in opts
+
+
+def test_yt_dlp_opts_cookie_file_wins_over_browser(app_settings, capsys):
+    app_settings.cookies = "/home/user/cookies.txt"
+    app_settings.cookies_from_browser = "chrome"
+    opts = _yt_dlp_opts("stem")
+    assert opts["cookiefile"] == "/home/user/cookies.txt"
+    assert "cookiesfrombrowser" not in opts
+    assert "cookies_from_browser" in capsys.readouterr().err
+
+
 @requires_ffmpeg
 @pytest.mark.parametrize("audio_format", SUPPORTED_FORMATS)
 def test_track_round_trip(tmp_path, audio_format):
