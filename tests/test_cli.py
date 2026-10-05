@@ -359,7 +359,7 @@ def test_process_video_splits_comma_separated_autofill(monkeypatch, app_settings
 
     process_video("https://soundcloud.com/artist/track", [])
 
-    assert captured["default"] == "author1, author2"
+    assert captured["default"] == "author1\\author2"
     assert db.get_authors() == ["author1", "author2"]
 
 

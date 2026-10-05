@@ -301,6 +301,25 @@ def test_get_author_missing_or_empty():
     assert get_author({"channel": "   "}) == []
 
 
+def test_get_author_dedupes_repeated_artists():
+    assert get_author({"track": ["A", "B", "A", "C"]}) == ["A", "B", "C"]
+
+
+def test_get_author_dedupes_comma_separated_string():
+    assert get_author({"uploader": "artist1, artist2, artist1, artist3"}) == [
+        "artist1",
+        "artist2",
+        "artist3",
+    ]
+
+
+def test_get_author_dedupes_ignoring_case_and_whitespace():
+    assert get_author({"track": ["Artist", " artist ", "ARTIST", "Other"]}) == [
+        "Artist",
+        "Other",
+    ]
+
+
 def test_get_album():
     assert get_album({"album": " Great Album "}) == "Great Album"
 

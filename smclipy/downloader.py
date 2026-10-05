@@ -7,7 +7,7 @@ import yt_dlp.utils
 
 from smclipy.config import settings
 from smclipy.formats import FORMAT_TO_NATIVE_CODEC
-from smclipy.helpers import sanitize_filename
+from smclipy.helpers import normalize_author, sanitize_filename, split_authors
 
 YT_STEM_PREFIX = "yt-"
 SC_STEM_PREFIX = "sc-"
@@ -173,21 +173,39 @@ def temp_stem(url: str) -> str:
 
 
 def get_author(info: dict[str, Any]) -> list[str]:
-    artists: list[str] = []
+    raw: list[str] = []
 
     creators = info.get("artist") or info.get("creator")
     if creators:
-        artists.extend(creators if isinstance(creators, list) else [creators])
+        raw.extend(creators if isinstance(creators, list) else [creators])
     elif isinstance(info.get("track"), list):
-        artists.extend(info["track"])
+        raw.extend(info["track"])
     else:
         for key in ("uploader", "channel"):
             value = info.get(key)
             if isinstance(value, str) and value.strip():
-                artists.append(value.strip())
+                raw.append(value.strip())
                 break
 
-    return list(dict.fromkeys(a for a in artists if isinstance(a, str) and a.strip()))
+    # A single field often holds several artists
+    # ("artist1, artist2, artist1, artist3"), so split every entry on the
+    # reserved separators and drop repeats (case/whitespace-insensitive),
+    # keeping the first spelling.
+    flat: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        flat.extend(split_authors(entry))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for artist in flat:
+        normalized: str = normalize_author(artist)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(artist)
+    return deduped
 
 
 def get_album(info: dict[str, Any]) -> str:
