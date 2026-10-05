@@ -1,8 +1,10 @@
 """Interactive library tagging using MusicBrainz metadata."""
 
 import json
+import re
 import sys
 from contextlib import nullcontext, redirect_stdout, suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,106 @@ from smclipy.ui import (
 )
 
 TAG_COVER_PREFIX = "tag-cover-"
+
+_MAX_AGE_UNITS: dict[str, float] = {
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 3600,
+    "hr": 3600,
+    "hrs": 3600,
+    "hour": 3600,
+    "hours": 3600,
+    "d": 86400,
+    "day": 86400,
+    "days": 86400,
+    "w": 604800,
+    "week": 604800,
+    "weeks": 604800,
+}
+
+
+def parse_max_age(value: str) -> float:
+    """Parse a duration like ``24h``, ``30m``, ``7d`` into seconds."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]+)\s*", str(value))
+    if not match:
+        raise ValueError(
+            f"invalid age {value!r}: use a number plus a unit "
+            "(s/m/h/d/w, e.g. '30m', '24h', '7d')"
+        )
+    amount, unit = float(match.group(1)), match.group(2).casefold()
+    if unit not in _MAX_AGE_UNITS:
+        raise ValueError(
+            f"invalid age {value!r}: unknown unit {match.group(2)!r} "
+            "(use s/m/h/d/w, e.g. '30m', '24h', '7d')"
+        )
+    seconds = amount * _MAX_AGE_UNITS[unit]
+    if seconds <= 0:
+        raise ValueError(f"invalid age {value!r}: must be greater than zero")
+    return seconds
+
+
+def _max_age_seconds(args: object) -> tuple[float | None, str | None]:
+    """Return ``(seconds, raw)`` for the ``--max-age`` flag, if given."""
+    raw: object = getattr(args, "max_age", None)
+    if raw is None:
+        return None, None
+    if isinstance(raw, (int, float)):
+        seconds = float(raw)
+        if seconds <= 0:
+            print("error: --max-age must be greater than zero", file=sys.stderr)
+            raise SystemExit(2)
+        return seconds, str(raw)
+    try:
+        return parse_max_age(str(raw)), str(raw)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+
+def _filter_by_first_seen(
+    songs: list["LibrarySong"], max_age: float
+) -> list["LibrarySong"]:
+    """Keep songs first seen within the last ``max_age`` seconds.
+
+    ``scan_library`` rewrites files when backfilling UUIDs, so file mtimes
+    can't be trusted for recency — the database ``first_seen_at`` timestamp
+    is stable across rescans and renames. Songs with no UUID or no recorded
+    timestamp are kept so the filter never hides untracked songs.
+    """
+    cutoff = datetime.now(UTC) - timedelta(seconds=max_age)
+    seen_at_by_uuid: dict[str, str] = {}
+    for row in db.list_songs():
+        try:
+            seen_at_by_uuid[str(row["uuid"])] = str(row["first_seen_at"] or "")
+        except (KeyError, IndexError, TypeError):
+            continue
+    recent: list[LibrarySong] = []
+    for song in songs:
+        if song.uuid is None:
+            recent.append(song)
+            continue
+        raw: str = seen_at_by_uuid.get(song.uuid, "")
+        if not raw:
+            recent.append(song)
+            continue
+        try:
+            seen_at = datetime.fromisoformat(raw)
+        except ValueError:
+            recent.append(song)
+            continue
+        if seen_at.tzinfo is None:
+            seen_at = seen_at.replace(tzinfo=UTC)
+        if seen_at >= cutoff:
+            recent.append(song)
+    return recent
 
 
 class LibrarySong:
@@ -196,7 +298,8 @@ def process_song(
       without asking.
 
     When ``report`` is given, an entry describing the outcome (applied /
-    not_found / unavailable / skipped / already_matching / error) is appended
+    not_found / unavailable / skipped / skipped_not_found / already_tagged /
+    already_matching / error) is appended
     for machine-readable retagging reports.
     """
     s: Settings = settings()
@@ -409,8 +512,10 @@ def _cleanup_tag_cover_files() -> None:
 def _run_tag(
     args: object, mode: str, report: list[dict[str, Any]] | None
 ) -> tuple[int, int]:
-    """Run the retag workflow; returns ``(updated, already-tagged-skipped)``.
+    """Run the retag workflow; returns ``(updated, skipped)``.
 
+    ``skipped`` counts songs skipped because they were already tagged or,
+    with ``--skip-not-found``, because a previous lookup found no match.
     While ``report`` is collecting, every human-facing message is sent to
     stderr so the caller can emit a machine-readable JSON report on stdout.
     """
@@ -432,6 +537,17 @@ def _run_tag(
         if not songs:
             print("No audio files found in the library to tag.")
             return 0, 0
+        max_age, max_age_raw = _max_age_seconds(args)
+        if max_age is not None:
+            total_before: int = len(songs)
+            songs = _filter_by_first_seen(songs, max_age)
+            print(
+                f"Filtered to {len(songs)} of {total_before} song(s) "
+                f"added within the last {max_age_raw}."
+            )
+            if not songs:
+                print(f"No songs added within the last {max_age_raw}.")
+                return 0, 0
         enabled: frozenset[str] = _enabled_fields()
         print(f"Found {len(songs)} audio file(s) in the library.")
         if enabled:
@@ -450,9 +566,13 @@ def _run_tag(
             selected: list[int] = list(range(len(songs)))
         else:
             selected = prompt_song_selection(len(songs))
-        tagged_by_uuid: dict[str, bool] = {
-            row["uuid"]: bool(row["tagged"]) for row in db.list_songs()
-        }
+        tagged_by_uuid: dict[str, bool] = {}
+        mb_status_by_uuid: dict[str, str] = {}
+        for row in db.list_songs():
+            uuid = str(row["uuid"])
+            tagged_by_uuid[uuid] = bool(row["tagged"])
+            mb_status_by_uuid[uuid] = str(row["musicbrainz_status"] or "")
+        skip_not_found: bool = bool(getattr(args, "skip_not_found", False))
         updated = 0
         skipped = 0
         try:
@@ -465,6 +585,28 @@ def _run_tag(
                         report.append(
                             {
                                 "outcome": "already_tagged",
+                                "display_name": song.display_name,
+                                "title": song.current.get("title") or song.path.stem,
+                                "artists": song.current.get("artists", ""),
+                                "recording_id": None,
+                                "release_group_id": None,
+                            }
+                        )
+                    continue
+                if (
+                    skip_not_found
+                    and song.uuid is not None
+                    and mb_status_by_uuid.get(song.uuid) == db.MB_STATUS_NOT_FOUND
+                ):
+                    print(
+                        f"Skipping '{song.display_name}': no MusicBrainz match "
+                        "found before (run without --skip-not-found to retry)."
+                    )
+                    skipped += 1
+                    if report is not None:
+                        report.append(
+                            {
+                                "outcome": "skipped_not_found",
                                 "display_name": song.display_name,
                                 "title": song.current.get("title") or song.path.stem,
                                 "artists": song.current.get("artists", ""),
@@ -529,5 +671,11 @@ def cmd_tag(args: object) -> None:
     else:
         message: str = f"\nDone. Updated {updated} song(s)."
         if skipped:
-            message += f" Skipped {skipped} already-tagged song(s)."
+            if bool(getattr(args, "skip_not_found", False)):
+                message += (
+                    f" Skipped {skipped} song(s) "
+                    "(already tagged or no match found before)."
+                )
+            else:
+                message += f" Skipped {skipped} already-tagged song(s)."
         print(message)

@@ -4,6 +4,7 @@ import json
 from typing import Any
 from unittest.mock import Mock
 
+import pytest
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, TALB, TIT2, TPE1
 from PIL import Image
@@ -907,3 +908,121 @@ def test_cmd_tag_json_reports_crashed_song(monkeypatch, app_settings, capsys):
     assert payload["songs"][0]["error"] == "RuntimeError('boom')"
     assert payload["songs"][0]["recording_id"] is None
     assert payload["songs"][0]["release_group_id"] is None
+
+
+def test_parse_max_age_units():
+    assert tag.parse_max_age("30s") == 30
+    assert tag.parse_max_age("30m") == 1800
+    assert tag.parse_max_age("24h") == 86400
+    assert tag.parse_max_age("7d") == 604800
+    assert tag.parse_max_age("1w") == 604800
+    assert tag.parse_max_age("1.5h") == 5400
+
+
+def test_parse_max_age_rejects_bad_values():
+    for bad in ("", "24", "abc", "0h", "-5d", "10x"):
+        with pytest.raises(ValueError):
+            tag.parse_max_age(bad)
+
+
+def test_cmd_tag_skip_not_found(monkeypatch, app_settings, capsys):
+    app_settings.tag_fields = ["title", "artists", "album"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-Missing.mp3", title="Missing", artist="Artist", album="Album"
+    )
+    write_tagged_mp3(
+        music / "Artist-Found.mp3", title="Found", artist="Artist", album="Album"
+    )
+    scan_library()
+    missing_uuid = read_song_uuid(music / "Artist-Missing.mp3")
+    assert missing_uuid is not None
+    db.record_mb_status(missing_uuid, db.MB_STATUS_NOT_FOUND)
+
+    monkeypatch.setattr(
+        tag,
+        "search_recordings",
+        lambda *a, **k: [a_match(title="Renamed", artists=["Artist"], album="Album")],
+    )
+    monkeypatch.setattr(tag, "fetch_cover_art", lambda *a, **k: None)
+
+    tag.cmd_tag(argparse.Namespace(auto=True, all=True, json=True, skip_not_found=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["updated"] == 1
+    assert payload["skipped"] == 1
+    by_title = {entry["title"]: entry for entry in payload["songs"]}
+    assert by_title["Missing"]["outcome"] == "skipped_not_found"
+    assert by_title["Found"]["outcome"] == "applied"
+
+
+def test_cmd_tag_without_skip_not_found_retries(monkeypatch, app_settings, capsys):
+    app_settings.tag_fields = ["title", "artists", "album"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-Missing.mp3", title="Missing", artist="Artist", album="Album"
+    )
+    scan_library()
+    missing_uuid = read_song_uuid(music / "Artist-Missing.mp3")
+    assert missing_uuid is not None
+    db.record_mb_status(missing_uuid, db.MB_STATUS_NOT_FOUND)
+
+    monkeypatch.setattr(tag, "search_recordings", lambda *a, **k: [])
+
+    tag.cmd_tag(argparse.Namespace(auto=True, all=True, json=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["updated"] == 0
+    assert payload["skipped"] == 0
+    assert payload["songs"][0]["outcome"] == "not_found"
+
+
+def test_cmd_tag_max_age_only_processes_recent(monkeypatch, app_settings, capsys):
+    import datetime
+
+    app_settings.tag_fields = ["title", "artists", "album"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    old_path = music / "Artist-Old.mp3"
+    new_path = music / "Artist-New.mp3"
+    write_tagged_mp3(old_path, title="Old", artist="Artist", album="Album")
+    write_tagged_mp3(new_path, title="New", artist="Artist", album="Album")
+    scan_library()
+    old_seen = (
+        datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=3)
+    ).isoformat(timespec="seconds")
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE songs SET first_seen_at = ? WHERE current_path = ?",
+            (old_seen, "Artist-Old.mp3"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    processed: list[str] = []
+
+    def fake_process_song(song, **kwargs):
+        processed.append(song.path.name)
+        return True
+
+    monkeypatch.setattr(tag, "process_song", fake_process_song)
+
+    tag.cmd_tag(argparse.Namespace(auto=True, all=True, max_age="24h"))
+
+    assert processed == ["Artist-New.mp3"]
+    assert "Filtered to 1 of 2" in capsys.readouterr().out
+
+
+def test_cmd_tag_max_age_invalid_exits(monkeypatch, app_settings, capsys):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        app_settings.music_folder / "Artist-One.mp3", title="One", artist="Artist"
+    )
+    monkeypatch.setattr(tag, "scan_library", lambda: None)
+
+    with pytest.raises(SystemExit):
+        tag.cmd_tag(argparse.Namespace(auto=True, all=True, max_age="bogus"))

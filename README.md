@@ -81,6 +81,8 @@ You can also invoke it as a module: `python -m smclipy <command>`. Note that `do
   - `smclipy tag --semi` (`-s`) — **Semi-auto:** the top match is picked automatically per song, but you still review and confirm each change set (checkbox dialog) before it is applied.
   - `smclipy tag --all` — Skip the range prompt and select every untagged song. Combine with `--auto` (`smclipy tag --auto --all`) to retag the whole library without an interactive terminal.
   - `smclipy tag --json` (`-j`) — Print a machine-readable JSON report to stdout (per-song outcome, recording used, fields written) while human progress goes to stderr. Requires `--auto --all`; use it for a scriptable headless retag report.
+  - `smclipy tag --skip-not-found` — Skip songs whose last MusicBrainz lookup found no match instead of retrying them. Run without it to retry those songs.
+  - `smclipy tag --max-age AGE` — Only process songs added to the library within the last `AGE` (e.g. `30m`, `24h`, `7d`). Useful with `--auto --all` to retag only recent downloads.
 - **`smclipy modify`** — Pick songs from the library list (numbers, ranges, or `all`) and edit their tags by hand: title, artists, album, release date, genre, album artist, track number, and cover art. You choose which fields to touch in a checkbox dialog, then type one value per field that's applied to every selected song — so a range bulk-edits an album and a single number edits just that song. A blank answer keeps the field, typing `/clear` empties it (e.g., to remove a bad album). For cover art, give a path to an image file to embed it, or `/clear` to remove the current image.
   - `smclipy modify --reset-mb` — Also forget the MusicBrainz match of every modified song, so a later `smclipy tag` run offers it again.
 - **`smclipy restore`** — Undo a mistaken `tag`, `modify`, or `crop` change. Every mutation records a backup of the song's previous tags and cover art first, so you can pick a song, choose one of its snapshots, and roll it back; the restore itself is backed up too. Also handy after a bad `tag --auto` run caught in time.
@@ -271,7 +273,8 @@ options:
 #### `smclipy tag`
 
 ```text
-usage: smclipy tag [-h] [-a | -s] [--all] [-j]
+usage: smclipy tag [-h] [-a | -s] [--all] [-j] [--skip-not-found]
+                   [--max-age AGE]
 
 List every song in the library, fetch matching metadata from MusicBrainz, and
 interactively review and apply title, artist, album, release date, track
@@ -289,6 +292,14 @@ options:
               terminal.
   -j, --json  Print a machine-readable JSON report to stdout while human
               messages go to stderr. Requires --auto --all (headless retag).
+  --skip-not-found
+              Skip songs whose last MusicBrainz lookup found no match
+              instead of retrying them. Run without it to retry those
+              songs.
+  --max-age AGE
+              Only process songs added to the library within the last AGE
+              (e.g. '30m', '24h', '7d'). Useful with --auto --all to retag
+              only recent downloads.
 
 Metadata is provided by MusicBrainz (core data is CC0, supplementary data and
 docs are CC BY-NC-SA 3.0; https://musicbrainz.org ), and cover art is served

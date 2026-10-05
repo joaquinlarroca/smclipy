@@ -714,6 +714,24 @@ def main(argv: list[str] | None = None) -> None:
             "go to stderr. Requires --auto --all (headless retag)."
         ),
     )
+    tag_parser.add_argument(
+        "--skip-not-found",
+        action="store_true",
+        help=(
+            "Skip songs whose last MusicBrainz lookup found no match instead "
+            "of retrying them. Run without it to retry those songs."
+        ),
+    )
+    tag_parser.add_argument(
+        "--max-age",
+        metavar="AGE",
+        default=None,
+        help=(
+            "Only process songs added to the library within the last AGE "
+            "(e.g. '30m', '24h', '7d'). Useful with --auto --all to retag "
+            "only recent downloads."
+        ),
+    )
 
     modify_parser: argparse.ArgumentParser = subparsers.add_parser(
         "modify",
