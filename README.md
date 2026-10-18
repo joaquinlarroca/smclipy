@@ -88,6 +88,7 @@ You can also invoke it as a module: `python -m smclipy <command>`. Note that `do
 - **`smclipy restore`** — Undo a mistaken `tag`, `modify`, or `crop` change. Every mutation records a backup of the song's previous tags and cover art first, so you can pick a song, choose one of its snapshots, and roll it back; the restore itself is backed up too. Also handy after a bad `tag --auto` run caught in time.
 - **`smclipy playlist`** — Create, rename, delete, list, show, fill, reorder, sort, and import/export playlists of your library songs. Every action is documented below in the CLI reference. `list` and `show` accept `--json` (`-j`) for machine-readable output.
 - **`smclipy update`** — Rescan the music folder and sync the tracking database: new files get registered, renames are recorded, and vanished files are marked missing. Prints a summary of what changed, or a JSON report with `--json`; safe to run anytime, including from scripts or cron.
+- **`smclipy stats`** — Summarize the library: total songs, albums, and artists, total reproduction (playback) time, and the albums and artists with the most songs. Rescans first so the numbers are current; use `--no-scan` to report the database as-is, `--top N` to change how many albums/artists are listed (default 10), and `--json` for a machine-readable report. Safe to run from scripts or cron.
 - **`smclipy -d` / `--directories`** — Print the directories and files smclipy uses (config, music, library, temp, covers, backups, database) and exit.
 - **`smclipy -v` / `--version`** — Print the version and exit.
 
@@ -178,6 +179,7 @@ positional arguments:
     playlist         Create and manage library playlists, and import/export
                      them.
     update           Rescan the library and sync the tracking database.
+    stats            Report library totals: songs, albums, artists, playtime.
 
 options:
   -h, --help         show this help message and exit
@@ -197,6 +199,8 @@ examples:
   smclipy crop       Crop pillarboxed cover images and re-embed them
   smclipy update     Rescan the library and sync the tracking database
   smclipy update --json  Machine-readable scan report on stdout
+  smclipy stats      Totals, playtime, top albums and artists
+  smclipy stats --top 5 --json  Machine-readable stats report
   smclipy playlist create Chill  Create an empty playlist
   smclipy playlist add Chill     Interactively add library songs to it
   smclipy playlist export Chill -f m3u  Export it as an .m3u file
@@ -270,6 +274,24 @@ options:
   -j, --json  Print a machine-readable JSON report to stdout.
 ```
 
+#### `smclipy stats`
+
+```text
+usage: smclipy stats [-h] [-j] [--top N] [--no-scan]
+
+Summarize the library: total songs, albums, and artists, total reproduction
+time, and the albums and artists with the most songs. Rescans the library
+first so the numbers are current; use --no-scan to report the database as-is.
+Does not require an interactive terminal, so it can be run from scripts or
+cron.
+
+options:
+  -h, --help  show this help message and exit
+  -j, --json  Print a machine-readable JSON report to stdout.
+  --top N     How many albums and artists to list (default: 10).
+  --no-scan   Skip the library rescan and report the tracking database as-is.
+```
+
 #### `smclipy tag`
 
 ```text
@@ -281,25 +303,25 @@ interactively review and apply title, artist, album, release date, track
 number, album artist, and cover art changes.
 
 options:
-  -h, --help  show this help message and exit
-  -a, --auto  Fully automatic: pick the top match for each selected song and
-              apply the configured tag_fields without any further prompts
-              (only the initial range selection).
-  -s, --semi  Semi-automatic: pick the top match for each selected song but
-              confirm each change set (checkbox dialog) before applying.
-  --all       Tag every untagged song in the library instead of asking for a
-              range. Combine with --auto to run without an interactive
-              terminal.
-  -j, --json  Print a machine-readable JSON report to stdout while human
-              messages go to stderr. Requires --auto --all (headless retag).
-  --skip-not-found
-              Skip songs whose last MusicBrainz lookup found no match
-              instead of retrying them. Run without it to retry those
-              songs.
-  --max-age AGE
-              Only process songs added to the library within the last AGE
-              (e.g. '30m', '24h', '7d'). Useful with --auto --all to retag
-              only recent downloads.
+  -h, --help        show this help message and exit
+  -a, --auto        Fully automatic: pick the top match for each selected song
+                    and apply the configured tag_fields without any further
+                    prompts (only the initial range selection).
+  -s, --semi        Semi-automatic: pick the top match for each selected song
+                    but confirm each change set (checkbox dialog) before
+                    applying.
+  --all             Tag every untagged song in the library instead of asking
+                    for a range. Combine with --auto to run without an
+                    interactive terminal.
+  -j, --json        Print a machine-readable JSON report to stdout while human
+                    messages go to stderr. Requires --auto --all (headless
+                    retag).
+  --skip-not-found  Skip songs whose last MusicBrainz lookup found no match
+                    instead of retrying them. Run without it to retry those
+                    songs.
+  --max-age AGE     Only process songs added to the library within the last
+                    AGE (e.g. '30m', '24h', '7d'). Useful with --auto --all to
+                    retag only recent downloads.
 
 Metadata is provided by MusicBrainz (core data is CC0, supplementary data and
 docs are CC BY-NC-SA 3.0; https://musicbrainz.org ), and cover art is served

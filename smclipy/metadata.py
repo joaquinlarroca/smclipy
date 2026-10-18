@@ -279,6 +279,7 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
             title: str = profile["title"]
             artists_list: list[str] = track.read_artists()
             artists_str: str = ", ".join(artists_list)
+            duration: float | None = track.duration
             authors_seen.update(artists_list)
             song_uuid: str | None = track.read_uuid()
             if song_uuid is None:
@@ -304,6 +305,7 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
                     album_artist=profile["album_artist"],
                     track_number=profile["track_number"],
                     has_cover=has_cover,
+                    duration=duration,
                 )
                 db.log_event(song_uuid, "appeared", {"path": rel}, conn=conn)
                 added += 1
@@ -329,6 +331,7 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
                     album_artist=profile["album_artist"],
                     track_number=profile["track_number"],
                     has_cover=has_cover,
+                    duration=duration,
                     conn=conn,
                 )
                 renamed += 1
@@ -347,6 +350,7 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
                     or (existing["track_number"] or "")
                     != (profile["track_number"] or "")
                     or bool(existing["has_cover"]) != has_cover
+                    or (duration is not None and existing["duration"] != duration)
                 ):
                     db.update_song_metadata(
                         song_uuid,
@@ -358,6 +362,7 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
                         album_artist=profile["album_artist"],
                         track_number=profile["track_number"],
                         has_cover=has_cover,
+                        duration=duration,
                         conn=conn,
                     )
                     changed += 1
@@ -505,6 +510,14 @@ def has_cover(file: Path) -> bool:
     if track is None:
         return False
     return track.has_cover()
+
+
+def read_song_duration(file: Path) -> float | None:
+    """Playback length in seconds, or None when it cannot be read."""
+    track: Track | None = Track.open(file)
+    if track is None:
+        return None
+    return track.duration
 
 
 def apply_tag_update(

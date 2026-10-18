@@ -165,6 +165,17 @@ class Track:
     def tags(self) -> Any:
         return self._audio.tags
 
+    @property
+    def duration(self) -> float | None:
+        """Playback length in seconds, or None when the media info lacks it."""
+        info: Any = getattr(self._audio, "info", None)
+        length: Any = getattr(info, "length", None)
+        try:
+            value: float = float(length)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     @classmethod
     def open(cls, file: Path) -> "Track | None":
         audio_format: str | None = format_of(file)

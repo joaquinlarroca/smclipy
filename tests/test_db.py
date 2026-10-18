@@ -538,7 +538,7 @@ def test_playlist_entries_cascade_when_song_deleted(app_settings):
     assert [r["uuid"] for r in rows] == [second]
 
 
-def test_v2_database_migrates_to_v3_with_playlists(app_settings):
+def test_v2_database_migrates_with_playlists(app_settings):
     import sqlite3
 
     if app_settings.db_path.exists():
@@ -594,4 +594,54 @@ def test_v2_database_migrates_to_v3_with_playlists(app_settings):
         version = conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert version["value"] == "3"
+        assert version["value"] == str(db._SCHEMA_VERSION)
+
+
+def test_v3_database_gains_duration_column(app_settings):
+    import sqlite3
+
+    if app_settings.db_path.exists():
+        app_settings.db_path.unlink()
+    app_settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    old_columns = (
+        "\n".join(
+            line for line in db._SONGS_COLUMNS.splitlines() if "duration" not in line
+        )
+        .rstrip()
+        .removesuffix(",")
+    )
+    with sqlite3.connect(app_settings.db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta VALUES ('schema_version', '3');
+            CREATE TABLE songs (
+            """
+            + old_columns
+            + """
+            );
+            INSERT INTO songs (uuid, current_path) VALUES ('legacy-1', 'old.mp3');
+            """
+        )
+        conn.commit()
+
+    song = db.insert_song(current_path="new.mp3", duration=123.5)
+
+    with sqlite3.connect(app_settings.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        assert db._column_exists(conn, "songs", "duration")
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert version["value"] == str(db._SCHEMA_VERSION)
+    assert db.get_song_by_uuid(song)["duration"] == 123.5
+    legacy = db.get_song_by_uuid("legacy-1")
+    assert legacy is not None
+    assert legacy["duration"] is None
+
+
+def test_update_song_metadata_sets_duration(app_settings):
+    song = db.insert_song(current_path="a.mp3")
+    db.update_song_metadata(song, duration=42.0)
+    assert db.get_song_by_uuid(song)["duration"] == 42.0

@@ -778,6 +778,23 @@ def test_main_update_works_without_tty(monkeypatch, app_settings, capsys):
     assert "interactive terminal" not in capsys.readouterr().out
 
 
+def test_main_dispatch_dispatches_stats(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+
+    def fake_cmd_stats(_args):
+        calls.append(_args)
+
+    monkeypatch.setattr(cli, "cmd_stats", fake_cmd_stats)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    cli.main(["stats", "--json", "--top", "5", "--no-scan"])
+    assert len(calls) == 1
+    assert calls[0].json is True
+    assert calls[0].top == 5
+    assert calls[0].no_scan is True
+
+
 def test_cmd_update_reports_scan_summary(monkeypatch, app_settings, capsys):
     import smclipy.cli as cli
 
@@ -1210,6 +1227,7 @@ def test_process_video_records_song_source(monkeypatch, app_settings):
     assert row["artists"] == "Artist"
     assert any(e["event"] == "downloaded" for e in db.get_events(row["uuid"]))
     assert db.get_authors() == ["Artist"]
+    assert row["duration"] is not None and row["duration"] > 0
 
 
 def test_cmd_crop_records_cropped_status(monkeypatch, app_settings):

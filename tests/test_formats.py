@@ -169,6 +169,17 @@ def test_track_round_trip(tmp_path, audio_format):
 
 @requires_ffmpeg
 @pytest.mark.parametrize("audio_format", SUPPORTED_FORMATS)
+def test_track_reports_duration(tmp_path, audio_format):
+    audio_file = make_audio(tmp_path / f"song{audio_ext(audio_format)}", audio_format)
+    track = Track.open(audio_file)
+    assert track is not None
+    duration: float | None = track.duration
+    assert duration is not None
+    assert 0.1 < duration < 0.5
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("audio_format", SUPPORTED_FORMATS)
 def test_scan_library_tracks_each_format(app_settings, audio_format):
     extension = audio_ext(audio_format)
     app_settings.audio_format = audio_format
@@ -188,6 +199,9 @@ def test_scan_library_tracks_each_format(app_settings, audio_format):
     assert len(rows) == 1
     assert rows[0]["title"] == "Library Song"
     assert read_song_uuid(audio_file) == rows[0]["uuid"]
+    duration = rows[0]["duration"]
+    assert duration is not None
+    assert 0.1 < duration < 0.5
 
 
 @requires_ffmpeg

@@ -40,7 +40,8 @@ _SONGS_COLUMNS = """    uuid TEXT PRIMARY KEY,
     tagged INTEGER NOT NULL DEFAULT 0,
     first_seen_at TEXT,
     last_seen_at TEXT,
-    updated_at TEXT"""
+    updated_at TEXT,
+    duration REAL"""
 
 _SONGS_INDEXES = """CREATE INDEX IF NOT EXISTS idx_songs_current_path
     ON songs(current_path);
@@ -130,7 +131,7 @@ QUEUE_FAILED = "failed"
 _LEGACY_MIGRATED_KEY = "legacy_migrated"
 
 # Bumped when the schema changes; _migrate_schema applies incremental upgrades.
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 def _now() -> str:
@@ -150,6 +151,14 @@ def _read_legacy_file(path: Path) -> list[str]:
         ]
     except (FileNotFoundError, OSError):
         return []
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Whether ``table`` already has ``column`` (SQLite lacks IF NOT EXISTS for
+    ADD COLUMN, so migrations check first)."""
+    return any(
+        row["name"] == column for row in conn.execute(f"PRAGMA table_info('{table}')")
+    )
 
 
 def _songs_recording_id_unique(conn: sqlite3.Connection) -> bool:
@@ -202,6 +211,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         # A UNIQUE constraint on musicbrainz_recording_id makes a second song
         # matched against the same MusicBrainz recording raise an
         # IntegrityError; rebuild the table with a plain index instead.
+        old_columns: str = ", ".join(
+            row["name"] for row in conn.execute("PRAGMA table_info('songs')")
+        )
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.executescript(
             f"""
@@ -209,7 +221,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             CREATE TABLE songs_new (
 {_SONGS_COLUMNS}
             );
-            INSERT INTO songs_new SELECT * FROM songs;
+            INSERT INTO songs_new ({old_columns}) SELECT {old_columns} FROM songs;
             DROP TABLE songs;
             ALTER TABLE songs_new RENAME TO songs;
             {_SONGS_INDEXES}
@@ -219,6 +231,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     # Playlists arrive in v3. connect() runs SCHEMA before this function, and
     # SCHEMA already creates the playlist tables, so only the version bump
     # below is needed to finish the migration.
+    if not _column_exists(conn, "songs", "duration"):
+        # v4 tracks playback length for the stats command. Already present on
+        # fresh databases (SCHEMA) and on tables rebuilt above.
+        conn.execute("ALTER TABLE songs ADD COLUMN duration REAL")
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
         (str(_SCHEMA_VERSION),),
@@ -376,6 +392,7 @@ def insert_song(
     album_artist: str = "",
     track_number: str = "",
     has_cover: bool = False,
+    duration: float | None = None,
     source_url: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> str:
@@ -387,8 +404,8 @@ def insert_song(
         c.execute(
             "INSERT INTO songs (uuid, source_url, current_path, first_seen_path,"
             " title, artists, album, date, genre, album_artist, track_number,"
-            " has_cover, first_seen_at, last_seen_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " has_cover, first_seen_at, last_seen_at, updated_at, duration)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 song_uuid,
                 source_url,
@@ -405,6 +422,7 @@ def insert_song(
                 now,
                 now,
                 now,
+                duration,
             ),
         )
         if owner:
@@ -460,6 +478,7 @@ def update_song_metadata(
     album_artist: str | None = None,
     track_number: str | None = None,
     has_cover: bool | None = None,
+    duration: float | None = None,
     source_url: str | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> None:
@@ -489,6 +508,9 @@ def update_song_metadata(
     if has_cover is not None:
         assignments.append("has_cover = ?")
         values.append(int(has_cover))
+    if duration is not None:
+        assignments.append("duration = ?")
+        values.append(duration)
     if source_url is not None:
         assignments.append("source_url = ?")
         values.append(source_url)

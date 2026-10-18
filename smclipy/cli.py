@@ -38,6 +38,7 @@ from smclipy.metadata import (
     get_image_from_file,
     has_cover,
     library_target_path,
+    read_song_duration,
     read_song_uuid,
     save_all_covers,
     save_song_temp_to_main,
@@ -47,6 +48,7 @@ from smclipy.metadata import (
 from smclipy.modify import cmd_modify
 from smclipy.playlists import cmd_playlist
 from smclipy.restore import cmd_restore
+from smclipy.stats import DEFAULT_TOP, cmd_stats
 from smclipy.tag import TAG_COVER_PREFIX, cmd_tag
 from smclipy.ui import (
     msg,
@@ -189,6 +191,7 @@ def process_video(
         song_uuid: str | None = read_song_uuid(target)
         if song_uuid is not None:
             rel_path: str = target.relative_to(s.music_folder).as_posix()
+            duration: float | None = read_song_duration(target)
             existing = db.get_song_by_uuid(song_uuid)
             if existing is None:
                 db.insert_song(
@@ -198,6 +201,7 @@ def process_video(
                     artists=", ".join(current_authors_list),
                     album=album,
                     has_cover=has_cover(target),
+                    duration=duration,
                     source_url=url,
                 )
             else:
@@ -207,6 +211,7 @@ def process_video(
                     artists=", ".join(current_authors_list),
                     album=album,
                     has_cover=has_cover(target),
+                    duration=duration,
                     source_url=url,
                 )
             db.log_event(song_uuid, "downloaded", {"url": url, "path": rel_path})
@@ -603,6 +608,8 @@ def main(argv: list[str] | None = None) -> None:
             "  smclipy crop       Crop pillarboxed cover images and re-embed them\n"
             "  smclipy update     Rescan the library and sync the tracking database\n"
             "  smclipy update --json  Machine-readable scan report on stdout\n"
+            "  smclipy stats      Totals, playtime, top albums and artists\n"
+            "  smclipy stats --top 5 --json  Machine-readable stats report\n"
             "  smclipy playlist create Chill  Create an empty playlist\n"
             "  smclipy playlist add Chill     Interactively add library songs to it\n"
             "  smclipy playlist export Chill -f m3u  Export it as an .m3u file\n"
@@ -928,6 +935,37 @@ def main(argv: list[str] | None = None) -> None:
         help="Print a machine-readable JSON report to stdout.",
     )
 
+    stats_parser = subparsers.add_parser(
+        "stats",
+        help="Report library totals: songs, albums, artists, playtime.",
+        description=(
+            "Summarize the library: total songs, albums, and artists, total "
+            "reproduction time, and the albums and artists with the most songs. "
+            "Rescans the library first so "
+            "the numbers are current; use --no-scan to report the database as-is. "
+            "Does not require an interactive terminal, so it can be run from "
+            "scripts or cron."
+        ),
+    )
+    stats_parser.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="Print a machine-readable JSON report to stdout.",
+    )
+    stats_parser.add_argument(
+        "--top",
+        type=int,
+        default=DEFAULT_TOP,
+        metavar="N",
+        help=f"How many albums and artists to list (default: {DEFAULT_TOP}).",
+    )
+    stats_parser.add_argument(
+        "--no-scan",
+        action="store_true",
+        help="Skip the library rescan and report the tracking database as-is.",
+    )
+
     parser.add_argument(
         "-d",
         "--directories",
@@ -975,3 +1013,5 @@ def main(argv: list[str] | None = None) -> None:
         cmd_playlist(args)
     elif args.command == "update":
         cmd_update(args)
+    elif args.command == "stats":
+        cmd_stats(args)
