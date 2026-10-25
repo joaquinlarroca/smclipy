@@ -1,12 +1,13 @@
 import argparse
 import io
 
+import pytest
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3
 from PIL import Image
 
 import smclipy.db as db
-from smclipy import modify
+from smclipy import modify, search
 from smclipy.metadata import (
     apply_tag_update,
     has_cover,
@@ -415,3 +416,142 @@ def test_cmd_modify_untracked_song_still_edits(monkeypatch, app_settings, capsys
     id3 = ID3(music / "Artist-Song.mp3")
     assert str(id3["TIT2"]) == "Edited"
     assert db.get_song_by_path("Artist-Song.mp3") == []
+
+
+def test_cmd_modify_search_filters_and_picks_among_matches(
+    monkeypatch, app_settings, capsys
+):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-One.mp3", title="One", artist="Artist", album="Album"
+    )
+    write_tagged_mp3(
+        music / "Artist-Two.mp3", title="Two", artist="Other", album="Other Album"
+    )
+    seen: dict[str, int] = {}
+
+    def fake_selection(count):
+        seen["count"] = count
+        return [0]
+
+    def fake_field_value(label, default=""):
+        return "Renamed" if label.startswith("Title") else default
+
+    monkeypatch.setattr(modify, "prompt_song_selection", fake_selection)
+    monkeypatch.setattr(modify, "prompt_field_selection", lambda *a, **k: ["title"])
+    monkeypatch.setattr(modify, "prompt_field_value", fake_field_value)
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+
+    modify.cmd_modify(argparse.Namespace(search="other"))
+
+    out = capsys.readouterr().out
+    assert "Showing 1 of 2 song(s) matching 'other'." in out
+    assert "Matching songs:" in out
+    assert seen["count"] == 1
+    assert "[1/1] Updated" in out
+    assert str(ID3(music / "Artist-Two.mp3")["TIT2"]) == "Renamed"
+    assert str(ID3(music / "Artist-One.mp3")["TIT2"]) == "One"
+
+
+def test_cmd_modify_search_no_matches_stops_before_prompts(
+    monkeypatch, app_settings, capsys
+):
+    _make_two_songs(app_settings.music_folder)
+    selection_calls: list[int] = []
+
+    monkeypatch.setattr(
+        modify, "prompt_song_selection", lambda count: selection_calls.append(count)
+    )
+    monkeypatch.setattr(
+        modify,
+        "prompt_field_selection",
+        lambda *a, **k: pytest.fail("fields should not be prompted"),
+    )
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+
+    modify.cmd_modify(argparse.Namespace(search="zzzz"))
+
+    assert "No songs match 'zzzz'." in capsys.readouterr().out
+    assert selection_calls == []
+
+
+def test_cmd_modify_specific_autocompletes_and_filters(
+    monkeypatch, app_settings, capsys
+):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="A", album="First")
+    write_tagged_mp3(music / "Artist-Two.mp3", title="Two", artist="B", album="Second")
+    prompts: list[tuple[str, list[str]]] = []
+
+    def fake_prompt(label, values, default=""):
+        prompts.append((label, values))
+        return "second"
+
+    monkeypatch.setattr(search, "prompt_search_value", fake_prompt)
+    monkeypatch.setattr(modify, "prompt_song_selection", lambda count: [0])
+    monkeypatch.setattr(modify, "prompt_field_selection", lambda *a, **k: ["album"])
+    monkeypatch.setattr(
+        modify, "prompt_field_value", lambda label, default="": "Renamed"
+    )
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+
+    modify.cmd_modify(argparse.Namespace(specific="album"))
+
+    out = capsys.readouterr().out
+    assert prompts == [("Album", ["First", "Second"])]
+    assert "Showing 1 of 2 song(s) with album 'second'." in out
+    assert str(ID3(music / "Artist-Two.mp3")["TALB"]) == "Renamed"
+    assert str(ID3(music / "Artist-One.mp3")["TALB"]) == "First"
+
+
+def test_cmd_modify_blank_search_reports_error(monkeypatch, app_settings, capsys):
+    _make_two_songs(app_settings.music_folder)
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+
+    # A blank filter is a usage error (nothing was selected), so the command
+    # must exit non-zero instead of silently succeeding.
+    with pytest.raises(SystemExit) as excinfo:
+        modify.cmd_modify(argparse.Namespace(search="   "))
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "--search needs non-empty text" in captured.err
+    assert "Updated" not in captured.out
+
+
+def test_resolve_text_and_artists_accept_padded_clear_token():
+    assert modify._resolve_text("/clear ", "Old") == ""
+    assert modify._resolve_artists("  /clear", "A") == []
+
+
+def test_cmd_modify_reset_mb_without_field_changes(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-Song.mp3")
+    scan_library()
+    song_uuid = read_song_uuid(music / "Artist-Song.mp3")
+    assert song_uuid is not None
+    db.record_mb_status(
+        song_uuid,
+        db.MB_STATUS_TAGGED,
+        recording_id="rec-1",
+        release_group_id="rg-1",
+        tagged=True,
+    )
+
+    monkeypatch.setattr(modify, "prompt_song_selection", lambda count: [0])
+    monkeypatch.setattr(modify, "prompt_field_selection", lambda *a, **k: ["title"])
+    # Retyping the current title is "no change", so without a fix the reset
+    # below would be silently skipped.
+    monkeypatch.setattr(modify, "prompt_field_value", lambda label, default="": default)
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+
+    modify.cmd_modify(argparse.Namespace(reset_mb=True))
+
+    row = db.get_song_by_uuid(song_uuid)
+    assert row is not None
+    assert row["musicbrainz_status"] is None
+    assert row["musicbrainz_recording_id"] is None
+    assert row["tagged"] == 0

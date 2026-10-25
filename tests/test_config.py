@@ -64,6 +64,21 @@ def test_load_raw_config_backfills_missing_fields(tmp_path, monkeypatch):
     assert json.loads(cfg.read_text(encoding="utf-8")) == DEFAULT_CONFIG
 
 
+def test_load_raw_config_write_defaults_false_leaves_file_untouched(
+    tmp_path, monkeypatch
+):
+    partial = {"name": "smclipy", "path_to_music_folder": "./Music"}
+    cfg = tmp_path / "config.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps(partial), encoding="utf-8")
+    monkeypatch.setattr("smclipy.config.CONFIG_PATH", cfg)
+
+    raw = _load_raw_config(write_defaults=False)
+
+    assert raw == DEFAULT_CONFIG
+    assert json.loads(cfg.read_text(encoding="utf-8")) == partial
+
+
 def test_load_raw_config_backfill_keeps_custom_values(tmp_path, monkeypatch):
     custom = {
         "name": "custom",
@@ -154,6 +169,18 @@ def test_settings_rejects_bool_description_max_lines(tmp_path):
 def test_settings_default_tag_fields(tmp_path):
     s = Settings({"name": "smclipy", "path_to_music_folder": str(tmp_path)})
     assert s.tag_fields == DEFAULT_CONFIG["tag_fields"]
+    assert "genre" in s.tag_fields
+
+
+def test_settings_accepts_genre_tag_field(tmp_path):
+    s = Settings(
+        {
+            "name": "smclipy",
+            "path_to_music_folder": str(tmp_path),
+            "tag_fields": ["genre"],
+        }
+    )
+    assert s.tag_fields == ["genre"]
 
 
 def test_settings_filters_invalid_tag_fields(tmp_path):
@@ -403,3 +430,50 @@ def test_settings_cookie_file_wins_over_browser(tmp_path, capsys):
     assert s.cookies == str(cookies_file)
     assert s.cookies_from_browser == ""
     assert "cookies_from_browser" in capsys.readouterr().err
+
+
+def test_load_raw_config_read_only_file_still_uses_defaults(
+    tmp_path, monkeypatch, capsys
+):
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"name": "smclipy"}), encoding="utf-8")
+    monkeypatch.setattr("smclipy.config.CONFIG_PATH", cfg)
+    original_write_text = Path.write_text
+
+    def deny(self, *args, **kwargs):
+        if self == cfg:
+            raise PermissionError("read-only")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", deny)
+
+    # A config that cannot be rewritten must not crash every command; the
+    # missing keys are filled in for this run only.
+    assert _load_raw_config() == DEFAULT_CONFIG
+    assert "could not update" in capsys.readouterr().err
+
+
+def test_settings_expands_tilde_in_music_folder(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    s = Settings({"name": "smclipy", "path_to_music_folder": "~/Music"})
+
+    assert s.music_folder == tmp_path / "Music"
+    assert not s.music_folder.exists()
+
+
+def test_setup_folders_reports_unwritable_music_folder(tmp_path, monkeypatch, capsys):
+    import smclipy.config as config
+
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    s = Settings({"name": "smclipy", "path_to_music_folder": str(blocker)})
+    monkeypatch.setattr(config, "_settings", s)
+
+    with pytest.raises(SystemExit) as excinfo:
+        config.setup_folders()
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "could not create" in captured.err

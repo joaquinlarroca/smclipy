@@ -4,13 +4,20 @@ import json
 import re
 import sys
 from contextlib import nullcontext, redirect_stdout, suppress
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import smclipy.db as db
 from smclipy.config import COVER_FIELD, TAG_FIELDS, Settings, init, settings
-from smclipy.helpers import distinct_authors, resolve_known_authors, split_authors
+from smclipy.helpers import (
+    display_authors,
+    distinct_authors,
+    join_authors,
+    resolve_known_authors,
+    split_authors,
+)
 from smclipy.images import display_image
 from smclipy.metadata import (
     apply_tag_update,
@@ -22,11 +29,14 @@ from smclipy.metadata import (
     snapshot_song,
 )
 from smclipy.musicbrainz import (
+    CoverArtUnavailable,
     MusicBrainzMatch,
     MusicBrainzUnavailable,
     fetch_cover_art,
+    fetch_genre,
     search_recordings,
 )
+from smclipy.search import apply_filters
 from smclipy.ui import (
     collect_tag_changes,
     prompt_match_selection,
@@ -148,7 +158,7 @@ class LibrarySong:
     @property
     def display_name(self) -> str:
         title: str = self.current.get("title") or self.path.stem
-        artists: str = self.current.get("artists", "")
+        artists: str = display_authors(self.current.get("artists", ""))
         if artists:
             return f"{title} - {artists}"
         return title
@@ -201,6 +211,12 @@ def _intend_date(match: MusicBrainzMatch, current: dict[str, str]) -> str | None
     return match.date if match.date != current.get("date") else None
 
 
+def _intend_genre(match: MusicBrainzMatch, current: dict[str, str]) -> str | None:
+    if "genre" not in _enabled_fields() or not match.genre:
+        return None
+    return match.genre if match.genre != current.get("genre") else None
+
+
 def _intend_album_artist(
     match: MusicBrainzMatch, current: dict[str, str]
 ) -> str | None:
@@ -228,11 +244,12 @@ def _intended_profile(
 ) -> dict[str, str]:
     return {
         "title": _intend_title(match, current) or current.get("title", ""),
-        "artists": ", ".join(
+        "artists": join_authors(
             _intend_artists(match, current) or split_authors(current.get("artists", ""))
         ),
         "album": _intend_album(match, current) or current.get("album", ""),
         "date": _intend_date(match, current) or current.get("date", ""),
+        "genre": _intend_genre(match, current) or current.get("genre", ""),
         "album_artist": _intend_album_artist(match, current)
         or current.get("album_artist", ""),
         "track_number": _intend_track_number(match, current)
@@ -253,12 +270,15 @@ def _record_mb_outcome(song_uuid: str | None, status: str) -> None:
     db.log_event(song_uuid, "musicbrainz", {"status": status})
 
 
-def _record_already_matching(song: LibrarySong, match: MusicBrainzMatch) -> None:
+def _record_already_matching(
+    song: LibrarySong, match: MusicBrainzMatch, *, tagged: bool = True
+) -> None:
     """Record a successful match that needed no file changes.
 
     The enabled tag fields already match MusicBrainz, so the song is marked
     tagged (with its recording ids) instead of skipped, and won't be
-    re-offered on the next tag run.
+    re-offered on the next tag run. ``tagged=False`` is used when part of the
+    lookup failed (cover art or genre), so the song stays queued for a retry.
     """
     if song.uuid is None:
         return
@@ -267,7 +287,7 @@ def _record_already_matching(song: LibrarySong, match: MusicBrainzMatch) -> None
         db.MB_STATUS_TAGGED,
         recording_id=match.recording_id or None,
         release_group_id=match.release_group_id,
-        tagged=True,
+        tagged=tagged,
     )
     db.log_event(
         song.uuid,
@@ -302,6 +322,8 @@ def process_song(
     already_matching / error) is appended
     for machine-readable retagging reports.
     """
+    if not _enabled_fields():
+        return False
     s: Settings = settings()
     title, artists, album = _search_query(song)
     progress: str = f"[{position}/{total}] " if position is not None and total else ""
@@ -351,6 +373,21 @@ def process_song(
     match: MusicBrainzMatch = matches[selected]
     if mode != "interactive":
         print(f"Using top match: {', '.join(match.artists)} - '{match.title}'.")
+    # Genres and cover art are optional extras: a failure there must never
+    # discard the match's title/artists/album/date, and the song must stay
+    # queued (tagged=False) so the missing piece is retried next run.
+    incomplete = False
+    if "genre" in _enabled_fields():
+        genre: str | None = fetch_genre(match.release_group_id, match.recording_id)
+        if genre is None:
+            incomplete = True
+            print(
+                "Warning: could not fetch genres from MusicBrainz; tagging the "
+                "other fields and retrying the genre on the next run.",
+                file=sys.stderr,
+            )
+        else:
+            match = replace(match, genre=genre)
 
     cover_path: Path | None = None
     cover_pending = False
@@ -358,10 +395,20 @@ def process_song(
         if song.has_cover:
             print("This song already has a cover. Skipping cover fetch.")
         else:
-            cover_path = fetch_cover_art(
-                match.release_group_id,
-                s.temp_folder.joinpath(f"{TAG_COVER_PREFIX}{match.recording_id}.jpg"),
-            )
+            try:
+                cover_path = fetch_cover_art(
+                    match.release_group_id,
+                    s.temp_folder.joinpath(
+                        f"{TAG_COVER_PREFIX}{match.recording_id}.jpg"
+                    ),
+                )
+            except CoverArtUnavailable as exc:
+                incomplete = True
+                print(
+                    f"Warning: {exc} Tagging the other fields and retrying the "
+                    "cover on the next run.",
+                    file=sys.stderr,
+                )
             cover_pending = cover_path is not None
             if cover_path and mode != "auto":
                 display_image(cover_path)
@@ -369,10 +416,15 @@ def process_song(
     intended: dict[str, str] = _intended_profile(match, song.current)
     changes: list[tuple[str, str, str]] = collect_tag_changes(song.current, intended)
     if not changes and not cover_pending:
-        print("Tags already match MusicBrainz; marking song as tagged.")
-        _record_already_matching(song, match)
+        print("Tags already match MusicBrainz; nothing to write.")
+        _record_already_matching(song, match, tagged=not incomplete)
+        if incomplete:
+            print(
+                "Note: the MusicBrainz lookup was incomplete, so the song stays "
+                "queued and will be retried on the next run."
+            )
         append(
-            "already_matching",
+            "unavailable" if incomplete else "already_matching",
             recording_id=match.recording_id or None,
             release_group_id=match.release_group_id,
             fields=[],
@@ -398,13 +450,18 @@ def process_song(
         requested_fields = set(_enabled_fields()) if fields is None else fields
         if fields is None and cover_path is not None:
             requested_fields.add(COVER_FIELD)
-        if not _apply(song, match, cover_path, fields):
+        if not _apply(song, match, cover_path, fields, tagged=not incomplete):
             append("error")
             return False
     finally:
         if cover_path is not None:
             with suppress(OSError):
                 cover_path.unlink()
+    if incomplete:
+        print(
+            "Note: the MusicBrainz lookup was incomplete, so the song stays "
+            "queued and will be retried on the next run."
+        )
     # The report lists only what was really written: fields whose value changed
     # (``_apply`` skips fields the tags already match) plus the embedded cover.
     changed_fields: set[str] = {field for field, _, _ in changes}
@@ -425,8 +482,14 @@ def _apply(
     match: MusicBrainzMatch,
     cover_path: Path | None,
     fields: set[str] | None = None,
+    *,
+    tagged: bool = True,
 ) -> bool:
-    """Apply ``fields`` to ``song`` from ``match``; returns whether it applied."""
+    """Apply ``fields`` to ``song`` from ``match``; returns whether it applied.
+
+    ``tagged=False`` records the MusicBrainz ids without marking the song as
+    fully tagged, so a run whose cover/genre lookup failed re-offers it.
+    """
     if fields is None:
         fields = set(_enabled_fields())
         if cover_path is not None:
@@ -442,6 +505,7 @@ def _apply(
     title: str | None = _intend_title(match, current) if "title" in fields else None
     album: str | None = _intend_album(match, current) if "album" in fields else None
     date: str | None = _intend_date(match, current) if "date" in fields else None
+    genre: str | None = _intend_genre(match, current) if "genre" in fields else None
     album_artist: str | None = (
         _intend_album_artist(match, current) if "album_artist" in fields else None
     )
@@ -457,6 +521,7 @@ def _apply(
         artists=artists,
         album=album,
         date=date,
+        genre=genre,
         album_artist=album_artist,
         track_number=track_number,
         image=cover_path if "cover" in fields else None,
@@ -472,9 +537,10 @@ def _apply(
         db.update_song_metadata(
             song.uuid,
             title=title,
-            artists=", ".join(artists) if artists is not None else None,
+            artists=join_authors(artists) if artists is not None else None,
             album=album,
             date=date,
+            genre=genre,
             album_artist=album_artist,
             track_number=track_number,
             has_cover=has_cover(song.path) if COVER_FIELD in fields else None,
@@ -484,7 +550,7 @@ def _apply(
             db.MB_STATUS_TAGGED,
             recording_id=match.recording_id or None,
             release_group_id=match.release_group_id,
-            tagged=True,
+            tagged=tagged,
         )
         db.log_event(
             song.uuid,
@@ -548,8 +614,14 @@ def _run_tag(
             if not songs:
                 print(f"No songs added within the last {max_age_raw}.")
                 return 0, 0
+        songs, filtered = apply_filters(songs, args)
+        if not songs:
+            return 0, 0
         enabled: frozenset[str] = _enabled_fields()
-        print(f"Found {len(songs)} audio file(s) in the library.")
+        if filtered:
+            print(f"Found {len(songs)} matching audio file(s).")
+        else:
+            print(f"Found {len(songs)} audio file(s) in the library.")
         if enabled:
             print(f"Fields to auto-fill: {', '.join(sorted(enabled))}")
         else:
@@ -557,7 +629,7 @@ def _run_tag(
             print(
                 "Add fields such as 'title', 'artists', 'album' to tag song metadata."
             )
-        print("\nSongs in your library:")
+        print("\nMatching songs:" if filtered else "\nSongs in your library:")
         for index, song in enumerate(songs, start=1):
             print(f"{index:3}. {song.display_name}")
 
@@ -668,6 +740,10 @@ def cmd_tag(args: object) -> None:
                 indent=2,
             )
         )
+        if any(entry.get("outcome") == "error" for entry in report or []):
+            # A per-song crash is a run failure even though the report was
+            # emitted successfully, so scripts don't treat it as a clean run.
+            raise SystemExit(1)
     else:
         message: str = f"\nDone. Updated {updated} song(s)."
         if skipped:

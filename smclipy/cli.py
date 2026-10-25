@@ -7,6 +7,7 @@ from pathlib import Path
 import smclipy.db as db
 from smclipy import __version__
 from smclipy.config import CONFIG_PATH, Settings, _load_raw_config, init, settings
+from smclipy.dedupe import cmd_dedupe
 from smclipy.downloader import (
     TEMP_STEM_PREFIXES,
     VideoDownloadError,
@@ -19,6 +20,7 @@ from smclipy.downloader import (
 from smclipy.formats import SUPPORTED_EXTENSIONS, audio_ext
 from smclipy.helpers import (
     distinct_authors,
+    join_authors,
     resolve_known_authors,
     sanitize_filename,
     split_authors,
@@ -48,6 +50,7 @@ from smclipy.metadata import (
 from smclipy.modify import cmd_modify
 from smclipy.playlists import cmd_playlist
 from smclipy.restore import cmd_restore
+from smclipy.search import SPECIFIC_FIELDS
 from smclipy.stats import DEFAULT_TOP, cmd_stats
 from smclipy.tag import TAG_COVER_PREFIX, cmd_tag
 from smclipy.ui import (
@@ -146,7 +149,9 @@ def process_video(
             print(f"Warning: no title in video info, using '{stem}'.")
         album = get_album(info_dictionary)
         artists = get_author(info_dictionary)
-        authors = "\\".join(resolve_known_authors(artists, authors_list))
+        authors = join_authors(
+            resolve_known_authors(artists, authors_list), separator="\\"
+        )
     else:
         title = prompt_title(default=default_title)
         while not title.strip():
@@ -157,7 +162,9 @@ def process_video(
         album = prompt_album(default=get_album(info_dictionary))
 
         artists = get_author(info_dictionary)
-        authors_default: str = "\\".join(resolve_known_authors(artists, authors_list))
+        authors_default: str = join_authors(
+            resolve_known_authors(artists, authors_list), separator="\\"
+        )
         authors = prompt_authors(authors_list, default=authors_default)
         while not split_authors(authors):
             print("At least one artist is required.")
@@ -198,7 +205,7 @@ def process_video(
                     song_uuid=song_uuid,
                     current_path=rel_path,
                     title=title,
-                    artists=", ".join(current_authors_list),
+                    artists=join_authors(current_authors_list),
                     album=album,
                     has_cover=has_cover(target),
                     duration=duration,
@@ -208,7 +215,7 @@ def process_video(
                 db.update_song_metadata(
                     song_uuid,
                     title=title,
-                    artists=", ".join(current_authors_list),
+                    artists=join_authors(current_authors_list),
                     album=album,
                     has_cover=has_cover(target),
                     duration=duration,
@@ -293,21 +300,37 @@ def cmd_download(args: argparse.Namespace) -> None:
             try:
                 db.mark_processed(video_id)
             except Exception as exc:
-                print(f"Warning: could not record '{video_id}' as processed: {exc!r}")
-                skipped_ids.append(video_id)
+                # The file was saved successfully, so it must not be retried
+                # (that would download it twice); surface the tracking gap.
+                print(
+                    f"Warning: '{video_id}' was downloaded but could not be "
+                    f"recorded as processed: {exc!r}"
+                )
     finally:
         _cleanup_temp_files(s)
 
     if skipped_ids:
+        retryable: list[str] = list(skipped_ids)
+        dropped: list[str] = []
         try:
             db.requeue(skipped_ids)
+            pending_now: set[str] = set(db.get_pending_urls())
+            retryable = [url for url in skipped_ids if url in pending_now]
+            dropped = [url for url in skipped_ids if url not in pending_now]
         except Exception as exc:
             print(f"Warning: could not persist skipped videos for retry: {exc!r}")
-        print(
+        message: str = (
             f"{'Interrupted' if interrupted else 'Finished'} with "
-            f"{len(skipped_ids)} skipped vid/s "
-            f"(still pending for a retry): {skipped_ids}"
+            f"{len(skipped_ids)} skipped vid/s"
         )
+        if retryable:
+            message += f" (still pending for a retry): {retryable}"
+        if dropped:
+            message += (
+                f" (permanently dropped after the maximum number of "
+                f"attempts): {dropped}"
+            )
+        print(message)
 
     if interrupted:
         raise SystemExit(130) from None
@@ -453,12 +476,24 @@ def cmd_crop(_args: argparse.Namespace) -> None:
             filename: str = cover.stem
             try:
                 display_image(cover)
-                if prompt_crop(default=True):
-                    backup_cover(cover)
+                if not prompt_crop(default=True):
+                    false_positives.add(filename)
+                    db.add_false_positive(filename)
+                    _record_cover_status(
+                        filename, db.COVER_STATUS_FALSE_POSITIVE, index=cover_uuids
+                    )
+                elif not backup_cover(cover):
+                    # Cropping is in place; without a backup a bad crop would
+                    # destroy the only copy of the artwork.
+                    print(
+                        f"Warning: could not back up '{cover.name}', not cropping it."
+                    )
+                else:
                     crop_image_1_to_1(cover)
                     targets: list[Path] = _crop_target_tracks(
                         s, filename, index=cover_uuids
                     )
+                    reembed_failed: bool = False
                     if _cover_overlaps_many_songs(filename, index=cover_uuids):
                         print(
                             f"{filename}: cover matches multiple different songs, "
@@ -469,18 +504,20 @@ def cmd_crop(_args: argparse.Namespace) -> None:
                             snapshot_song(
                                 track_file, read_song_uuid(track_file), "crop"
                             )
-                            change_cover(cover, track_file)
+                            if not change_cover(cover, track_file):
+                                reembed_failed = True
+                                print(
+                                    "Warning: could not re-embed the cropped cover "
+                                    f"into '{track_file.name}'."
+                                )
                     else:
                         print(f"{filename}: track not found, skipping cover re-embed")
-                    _record_cover_status(
-                        filename, db.COVER_STATUS_CROPPED, index=cover_uuids
-                    )
-                else:
-                    false_positives.add(filename)
-                    db.add_false_positive(filename)
-                    _record_cover_status(
-                        filename, db.COVER_STATUS_FALSE_POSITIVE, index=cover_uuids
-                    )
+                    if not reembed_failed:
+                        # The songs don't have the cropped art when the embed
+                        # failed, so recording "cropped" would be misleading.
+                        _record_cover_status(
+                            filename, db.COVER_STATUS_CROPPED, index=cover_uuids
+                        )
             except Exception as exc:
                 print(f"Warning: could not process '{filename}': {exc!r}")
             print("\n\n")
@@ -488,7 +525,7 @@ def cmd_crop(_args: argparse.Namespace) -> None:
 
 def cmd_directories(args: argparse.Namespace) -> None:
     config_exists: bool = CONFIG_PATH.exists()
-    s = Settings(_load_raw_config(create_if_missing=False))
+    s = Settings(_load_raw_config(create_if_missing=False, write_defaults=False))
     if not config_exists:
         print(f"Using default configuration (no config file at {CONFIG_PATH}).")
         print("Run `smclipy download` to generate one.")
@@ -507,23 +544,8 @@ def cmd_directories(args: argparse.Namespace) -> None:
 
 
 def cmd_update(args: argparse.Namespace) -> None:
-    s: Settings = init()
+    init()
     as_json: bool = bool(getattr(args, "json", False))
-
-    if not s.music_folder.is_dir():
-        if as_json:
-            print(
-                json.dumps(
-                    {
-                        "error": "music_folder_not_found",
-                        "path": str(s.music_folder),
-                    }
-                )
-            )
-        else:
-            print(f"Music folder not found at '{s.music_folder}'.")
-            print("Create it or fix 'path_to_music_folder' in the config.")
-        raise SystemExit(1)
 
     msg("Scanning music files...")
     summary: ScanSummary = scan_library(collect_details=as_json)
@@ -567,7 +589,7 @@ def cmd_update(args: argparse.Namespace) -> None:
 
 
 _TTY_REQUIRED_COMMANDS: frozenset[str] = frozenset(
-    {"download", "crop", "tag", "modify", "restore"}
+    {"download", "crop", "tag", "modify", "dedupe", "restore"}
 )
 _TTY_REQUIRED_PLAYLIST_ACTIONS: frozenset[str] = frozenset({"add", "remove", "move"})
 
@@ -579,6 +601,10 @@ def _requires_tty(args: argparse.Namespace) -> bool:
     if args.command == "download":
         return not (getattr(args, "batch", None) and getattr(args, "no_prompt", False))
     if args.command == "tag":
+        if getattr(args, "specific", None):
+            # The autocomplete prompt always needs a terminal, even alongside
+            # --auto --all.
+            return True
         return not (
             bool(getattr(args, "auto", False)) and bool(getattr(args, "all", False))
         )
@@ -603,7 +629,14 @@ def main(argv: list[str] | None = None) -> None:
             "  smclipy tag --semi Auto-pick the top match, confirm each change\n"
             "  smclipy tag --auto --all  Headless retag of every untagged song\n"
             "  smclipy tag --auto --all --json  Same, with a JSON report on stdout\n"
+            "  smclipy tag --search TEXT  Only retag songs matching TEXT\n"
+            "  smclipy tag --specific album  Autocomplete an album, then retag it\n"
             "  smclipy modify     Manually edit the tags of one or more songs\n"
+            "  smclipy modify --search TEXT  Find songs by text, then edit them\n"
+            "  smclipy modify --specific artists  Autocomplete an artist, then edit\n"
+            "  smclipy dedupe     Merge differently styled artist/album names\n"
+            "  smclipy dedupe --albums  Only merge album spellings\n"
+            "  smclipy dedupe --dry-run  Preview a merge without writing\n"
             "  smclipy restore    Roll back a song to an earlier tag backup\n"
             "  smclipy crop       Crop pillarboxed cover images and re-embed them\n"
             "  smclipy update     Rescan the library and sync the tracking database\n"
@@ -674,7 +707,7 @@ def main(argv: list[str] | None = None) -> None:
         description=(
             "List every song in the library, fetch matching metadata from "
             "MusicBrainz, and interactively review and apply title, artist, album, "
-            "release date, track number, album artist, and cover art changes."
+            "release date, genre, track number, album artist, and cover art changes."
         ),
         epilog=(
             "Metadata is provided by MusicBrainz (core data is CC0, supplementary "
@@ -718,7 +751,8 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help=(
             "Print a machine-readable JSON report to stdout while human messages "
-            "go to stderr. Requires --auto --all (headless retag)."
+            "go to stderr. Requires --auto --all (headless retag). Exits with "
+            "status 1 when any song crashed."
         ),
     )
     tag_parser.add_argument(
@@ -739,6 +773,26 @@ def main(argv: list[str] | None = None) -> None:
             "only recent downloads."
         ),
     )
+    tag_filter = tag_parser.add_mutually_exclusive_group()
+    tag_filter.add_argument(
+        "--search",
+        metavar="TEXT",
+        help=(
+            "Only process songs whose title, album, or any artist contains "
+            "TEXT (case-insensitive). Combine with --auto --all for a "
+            "headless retag of the matches."
+        ),
+    )
+    tag_filter.add_argument(
+        "--specific",
+        choices=SPECIFIC_FIELDS,
+        metavar="FIELD",
+        help=(
+            "Autocomplete the library's existing FIELD values (title, album, "
+            "or artists) and only process songs that match the chosen value. "
+            "Needs an interactive terminal."
+        ),
+    )
 
     modify_parser: argparse.ArgumentParser = subparsers.add_parser(
         "modify",
@@ -752,6 +806,25 @@ def main(argv: list[str] | None = None) -> None:
             "empties it."
         ),
     )
+    modify_filter = modify_parser.add_mutually_exclusive_group()
+    modify_filter.add_argument(
+        "-s",
+        "--search",
+        metavar="TEXT",
+        help=(
+            "Only consider songs whose title, album, or any artist contains "
+            "TEXT (case-insensitive) before asking which ones to edit."
+        ),
+    )
+    modify_filter.add_argument(
+        "--specific",
+        choices=SPECIFIC_FIELDS,
+        metavar="FIELD",
+        help=(
+            "Autocomplete the library's existing FIELD values (title, album, "
+            "or artists) and only consider songs that match the chosen value."
+        ),
+    )
     modify_parser.add_argument(
         "--reset-mb",
         action="store_true",
@@ -761,13 +834,44 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
 
+    dedupe_parser: argparse.ArgumentParser = subparsers.add_parser(
+        "dedupe",
+        help="Merge differently formatted artist and album names.",
+        description=(
+            "Find artist and album names that differ only by case or spacing "
+            "(for example 'Artist', 'artist', and 'a r t i s t'), pick the "
+            "spelling to keep for each group, then rewrite the tags, the "
+            "artist-title filenames, matching cover images, and the tracking "
+            "database. Nothing is written until every group has been reviewed."
+        ),
+    )
+    dedupe_parser.add_argument(
+        "--artists",
+        action="store_true",
+        help="Only look for artist names (default: artists and albums).",
+    )
+    dedupe_parser.add_argument(
+        "--albums",
+        action="store_true",
+        help="Only look for album names (default: artists and albums).",
+    )
+    dedupe_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Show the planned tag, filename, cover, and database changes "
+            "without writing anything."
+        ),
+    )
+
     subparsers.add_parser(
         "restore",
         help="Undo tag changes from recorded backups.",
         description=(
             "Pick songs from your library and roll back to an earlier backup. "
             "A backup of each song's tags (and cover art) is recorded "
-            "automatically before every `tag`, `modify`, and `crop` change, so a "
+            "automatically before every `tag`, `modify`, `crop`, and `dedupe` "
+            "change, so a "
             "mistaken MusicBrainz match or manual edit can be undone here. The "
             "restore itself is also backed up, so undoing an undo is possible."
         ),
@@ -970,17 +1074,22 @@ def main(argv: list[str] | None = None) -> None:
         "-d",
         "--directories",
         action="store_true",
-        help="Print the directories smclipy uses and exit.",
+        help=(
+            "Print the directories smclipy uses and exit "
+            "(cannot be combined with a command)."
+        ),
     )
 
     args: argparse.Namespace = parser.parse_args(argv)
 
-    if args.command is None:
-        if args.directories:
-            cmd_directories(args)
-        else:
-            parser.error("the following arguments are required: command")
+    if args.directories and args.command is not None:
+        parser.error("--directories cannot be combined with a command")
+    if args.directories:
+        cmd_directories(args)
         return
+
+    if args.command is None:
+        parser.error("the following arguments are required: command")
 
     if (
         args.command == "tag"
@@ -1007,6 +1116,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_tag(args)
     elif args.command == "modify":
         cmd_modify(args)
+    elif args.command == "dedupe":
+        cmd_dedupe(args)
     elif args.command == "restore":
         cmd_restore(args)
     elif args.command == "playlist":

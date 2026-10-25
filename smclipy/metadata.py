@@ -22,6 +22,7 @@ from smclipy.formats import (
 )
 from smclipy.helpers import (
     distinct_authors,
+    join_authors,
     normalize_author,
     sanitize_filename,
     split_authors,
@@ -191,6 +192,16 @@ def _iter_tagged_files() -> Iterator[tuple[Track, str, list[str]]]:
         yield track, profile["title"], track.read_artists()
 
 
+_LEGACY_UNKNOWN_TITLE: str = "Unknown"
+
+
+def _recorded_title(title: str | None) -> str:
+    """Return a stored title, treating the old ``"Unknown"`` placeholder as empty."""
+    if not title or title == _LEGACY_UNKNOWN_TITLE:
+        return ""
+    return title
+
+
 def _matches_tags(title: str, artists: list[str], row: Any) -> bool:
     """Whether a brand-new file at a tracked path plausibly is the tracked song.
 
@@ -198,7 +209,8 @@ def _matches_tags(title: str, artists: list[str], row: Any) -> bool:
     path after a rename: only backfill when title and artists agree with the
     recorded row (file artists may be a subset of the recorded ones).
     """
-    if row["title"] and title.casefold().strip() != row["title"].casefold().strip():
+    known_title: str = _recorded_title(row["title"])
+    if known_title and title.casefold().strip() != known_title.casefold().strip():
         return False
     if row["artists"]:
         known_set = {normalize_author(a) for a in split_authors(row["artists"])}
@@ -252,6 +264,7 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
     s: Settings = settings()
     _cleanup_orphan_temp_files()
     seen: set[str] = set()
+    claimed: set[str] = set()
     authors_seen: set[str] = set()
     added = renamed = missing = changed = 0
     changes: list[ScanChange] = []
@@ -267,7 +280,22 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
                 # location reclaims its old UUID; an owned path never hands
                 # its UUID to a different file placed there later.
                 by_path.setdefault(row["first_seen_path"], row["uuid"])
-        for file in iter_audio_files():
+        preferred_paths: set[str] = {
+            path
+            for row in known.values()
+            for path in (row["current_path"], row["first_seen_path"])
+            if path
+        }
+
+        def _scan_order(file: Path) -> tuple[int, str]:
+            rel: str = file.relative_to(s.music_folder).as_posix()
+            return (0 if rel in preferred_paths else 1, rel)
+
+        # Process the files already recorded in the database before any
+        # copies: when two files share a UUID (e.g. after a plain file copy),
+        # the copy must yield and get a fresh UUID instead of stealing the
+        # tracked song's history.
+        for file in sorted(iter_audio_files(), key=_scan_order):
             rel: str = file.relative_to(s.music_folder).as_posix()
             seen.add(rel)
             track: Track | None = open_for_tagging(file)
@@ -278,7 +306,7 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
             profile, has_cover = track.read_profile()
             title: str = profile["title"]
             artists_list: list[str] = track.read_artists()
-            artists_str: str = ", ".join(artists_list)
+            artists_str: str = join_authors(artists_list)
             duration: float | None = track.duration
             authors_seen.update(artists_list)
             song_uuid: str | None = track.read_uuid()
@@ -291,6 +319,16 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
                 song_uuid = write_song_uuid(file, candidate)
                 if song_uuid is None:
                     continue
+            if song_uuid in claimed:
+                print(
+                    f"Warning: duplicate tracking UUID {song_uuid} in '{rel}'; "
+                    "assigning a new UUID.",
+                    file=sys.stderr,
+                )
+                song_uuid = write_song_uuid(file)
+                if song_uuid is None:
+                    continue
+            claimed.add(song_uuid)
             existing: Any = known.get(song_uuid)
             if existing is None:
                 db.insert_song(
@@ -338,6 +376,13 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
                 if collect_details:
                     changes.append(ScanChange("renamed", song_uuid, rel, current))
             else:
+                song_changed: bool = False
+                if current is None:
+                    db.set_song_path(song_uuid, rel, conn=conn)
+                    db.log_event(song_uuid, "restored", {"path": rel}, conn=conn)
+                    song_changed = True
+                    if collect_details:
+                        changes.append(ScanChange("restored", song_uuid, rel))
                 db.touch_song(song_uuid, conn=conn)
                 if (
                     existing["title"] != title
@@ -365,9 +410,11 @@ def scan_library(collect_details: bool = False) -> ScanSummary:
                         duration=duration,
                         conn=conn,
                     )
-                    changed += 1
-                    if collect_details:
+                    song_changed = True
+                    if collect_details and current is not None:
                         changes.append(ScanChange("changed", song_uuid, rel))
+                if song_changed:
+                    changed += 1
         for row in db.list_songs(conn):
             current = row["current_path"]
             if current is not None and current not in seen:
@@ -387,7 +434,15 @@ def save_all_covers() -> None:
     for track, title, artists in _iter_tagged_files():
         if not artists or not track.has_cover():
             continue
-        save_image(sanitize_filename(f"{artists[0]}-{title}"), track, s.covers_folder)
+        # Cover stems are ``artist-title``; for untitled songs fall back to
+        # the bare filename stem, which is the key the crop command derives
+        # from the tracked path (prepending the artist would never match).
+        stem: str = (
+            sanitize_filename(f"{artists[0]}-{title}")
+            if title
+            else sanitize_filename(Path(track.name).stem)
+        )
+        save_image(stem, track, s.covers_folder)
 
 
 def get_image_from_file(file: Path, save_to_path: Path, save_as: str) -> Path | None:
@@ -405,13 +460,62 @@ def _open_audio(file: Path) -> Track | None:
 
 
 def library_target_path(file: Path, title: str, authors_list: list[str]) -> Path | None:
-    """The ``artist-title<ext>`` library path a tagged track lands on, or None
-    when the artist/title cannot form a valid filename."""
+    """The ``artist-title<ext>`` library path a tagged track lands on.
+
+    The name is capped (see ``sanitize_filename``) so a very long title cannot
+    exceed the filesystem's per-component limit, and a name made only of
+    invalid characters falls back to "Unknown" instead of a bare ``-.mp3``.
+    """
     extension: str = audio_ext(format_of(file) or settings().audio_format)
-    target_name: str = sanitize_filename(f"{authors_list[0]}-{title}{extension}")
-    if not target_name:
-        return None
-    return settings().music_folder.joinpath(target_name)
+    stem: str = sanitize_filename(f"{authors_list[0]}-{title}")
+    if not any(char.isalnum() for char in stem):
+        stem = "Unknown"
+    return settings().music_folder.joinpath(f"{stem}{extension}")
+
+
+def same_file(first: Path, second: Path) -> bool:
+    """Whether two paths refer to the same file on disk."""
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def _case_preserving_replace(source: Path, target: Path) -> None:
+    """Rename ``source`` to ``target``, allowing case-only renames.
+
+    On case-insensitive filesystems ``target.exists()`` is true for a
+    case-only rename, so move through a temporary name first.
+    """
+    if same_file(source, target):
+        temp: Path = source.with_name(f"{source.name}.case-{uuid.uuid4().hex}")
+        os.replace(source, temp)
+        try:
+            os.replace(temp, target)
+        except OSError:
+            with suppress(OSError):
+                os.replace(temp, source)
+            raise
+        return
+    os.replace(source, target)
+
+
+def rename_song_file(file: Path, target: Path) -> bool:
+    """Move ``file`` to ``target`` without ever overwriting another file."""
+    if target == file:
+        return True
+    if target.exists() and not same_file(target, file):
+        print(
+            f"Warning: '{target.name}' already exists, keeping '{file.name}'",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        _case_preserving_replace(file, target)
+    except OSError as exc:
+        print(f"Warning: could not rename '{file.name}': {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def save_song_temp_to_main(
@@ -534,6 +638,13 @@ def apply_tag_update(
 ) -> bool:
     """Apply a partial tag update, only overwriting fields that are not None."""
 
+    if image is not None and not image.is_file():
+        print(
+            f"Warning: cover image '{image}' does not exist, skipping update",
+            file=sys.stderr,
+        )
+        return False
+
     def edit(track: Track) -> None:
         if title is not None:
             track.set_field("title", title)
@@ -555,11 +666,19 @@ def apply_tag_update(
     return _edit_track_atomically(file, edit)
 
 
-def change_cover(image: Path, file: Path) -> None:
+def change_cover(image: Path, file: Path) -> bool:
+    """Embed ``image`` into ``file``; returns False when it could not be written."""
+    if not image.is_file():
+        print(
+            f"Warning: cover image '{image}' does not exist, skipping '{file.name}'",
+            file=sys.stderr,
+        )
+        return False
+
     def edit(track: Track) -> None:
         track.set_cover(image)
 
-    _edit_track_atomically(file, edit)
+    return _edit_track_atomically(file, edit)
 
 
 def remove_cover(file: Path) -> bool:
@@ -576,7 +695,8 @@ def snapshot_song(file: Path, song_uuid: str | None, source: str) -> Path | None
 
     Snapshots live in ``<backups_folder>/<uuid>/`` as one JSON file (plus a
     ``.cover`` file when art is present) per change, so a mistaken ``tag``,
-    ``modify``, or ``crop`` run can be undone with the ``restore`` command.
+    ``modify``, ``crop``, or ``dedupe`` run can be undone with the ``restore``
+    command.
     Returns the snapshot path, or None when nothing could be recorded.
     """
     if song_uuid is None:
@@ -803,3 +923,36 @@ def save_image(name: str, song_file: Any, path: Path) -> Path | None:
     print(f"Saving '{target.name}'")
     target.write_bytes(data)
     return target
+
+
+def rename_cover_stem(covers_folder: Path, old_stem: str, new_stem: str) -> int:
+    """Rename every cover image for ``old_stem`` to ``new_stem``.
+
+    Existing destination files are never overwritten. Returns the number of
+    files renamed.
+    """
+    if old_stem == new_stem:
+        return 0
+    renamed: int = 0
+    for extension in COVER_EXTENSIONS:
+        source: Path = covers_folder.joinpath(f"{old_stem}{extension}")
+        if not source.is_file():
+            continue
+        target: Path = covers_folder.joinpath(f"{new_stem}{extension}")
+        if target.exists() and not same_file(target, source):
+            print(
+                f"Warning: cover '{target.name}' already exists, "
+                f"keeping '{source.name}'",
+                file=sys.stderr,
+            )
+            continue
+        try:
+            _case_preserving_replace(source, target)
+        except OSError as exc:
+            print(
+                f"Warning: could not rename cover '{source.name}': {exc}",
+                file=sys.stderr,
+            )
+            continue
+        renamed += 1
+    return renamed

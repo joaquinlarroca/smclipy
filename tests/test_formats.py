@@ -136,7 +136,7 @@ def test_track_round_trip(tmp_path, audio_format):
     assert track.audio_format == audio_format
     assert track.read_uuid() is None
     profile, has_cover = track.read_profile()
-    assert profile["title"] == "Unknown"
+    assert profile["title"] == ""
     assert profile["artists"] == ""
     assert has_cover is False
 

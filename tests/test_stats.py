@@ -134,3 +134,14 @@ def test_stats_top_zero_clamps_to_one(app_settings, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["top_albums"] == [{"album": "Album X", "count": 2}]
     assert payload["top_artists"] == [{"artist": "Artist One", "count": 2}]
+
+
+def test_stats_counts_artist_spellings_once(app_settings, capsys):
+    db.insert_song(current_path="a.mp3", title="A", artists="The Beatles")
+    db.insert_song(current_path="b.mp3", title="B", artists="the  beatles")
+
+    cmd_stats(_args(json=True, top=10, no_scan=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total_artists"] == 1
+    assert payload["top_artists"] == [{"artist": "The Beatles", "count": 2}]

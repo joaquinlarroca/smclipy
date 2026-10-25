@@ -7,11 +7,28 @@ from typing import Any
 
 import smclipy.db as db
 from smclipy.config import Settings, init
-from smclipy.helpers import split_authors
+from smclipy.helpers import normalize_author, split_authors
 from smclipy.metadata import scan_library
 from smclipy.ui import msg
 
 DEFAULT_TOP = 10
+
+
+def _count(values: list[str]) -> tuple[Counter[str], dict[str, str]]:
+    """Count values case/whitespace-insensitively, keeping a display spelling.
+
+    Counting "The Beatles" and "the beatles" as two artists would split the
+    rankings exactly where `dedupe` merges spellings.
+    """
+    counts: Counter[str] = Counter()
+    labels: dict[str, str] = {}
+    for value in values:
+        key: str = normalize_author(value)
+        if not key:
+            continue
+        counts[key] += 1
+        labels.setdefault(key, value.strip())
+    return counts, labels
 
 
 def _format_duration(seconds: float) -> str:
@@ -39,8 +56,8 @@ def _library_stats(top_n: int) -> dict[str, Any]:
     total_songs = 0
     total_duration = 0.0
     unknown_duration = 0
-    albums: Counter[str] = Counter()
-    artists: Counter[str] = Counter()
+    album_values: list[str] = []
+    artist_values: list[str] = []
     for row in db.list_songs():
         if not row["current_path"]:
             continue
@@ -52,9 +69,10 @@ def _library_stats(top_n: int) -> dict[str, Any]:
             total_duration += float(duration)
         album: str = (row["album"] or "").strip()
         if album:
-            albums[album] += 1
-        for artist in split_authors(row["artists"] or ""):
-            artists[artist] += 1
+            album_values.append(album)
+        artist_values.extend(split_authors(row["artists"] or ""))
+    albums, album_labels = _count(album_values)
+    artists, artist_labels = _count(artist_values)
     return {
         "total_songs": total_songs,
         "total_albums": len(albums),
@@ -63,10 +81,12 @@ def _library_stats(top_n: int) -> dict[str, Any]:
         "total_duration_human": _format_duration(total_duration),
         "unknown_duration": unknown_duration,
         "top_albums": [
-            {"album": name, "count": count} for name, count in _rank(albums, top_n)
+            {"album": album_labels[name], "count": count}
+            for name, count in _rank(albums, top_n)
         ],
         "top_artists": [
-            {"artist": name, "count": count} for name, count in _rank(artists, top_n)
+            {"artist": artist_labels[name], "count": count}
+            for name, count in _rank(artists, top_n)
         ],
     }
 

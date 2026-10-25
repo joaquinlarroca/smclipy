@@ -10,7 +10,7 @@ from prompt_toolkit.key_binding.bindings.focus import focus_next, focus_previous
 from prompt_toolkit.key_binding.defaults import load_key_bindings
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit
-from prompt_toolkit.shortcuts import choice
+from prompt_toolkit.shortcuts import choice, radiolist_dialog
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Button, CheckboxList, Dialog, Label
 
@@ -98,6 +98,49 @@ def prompt_authors(authors_list: list[str], default: str = "") -> str:
         default=default,
         mouse_support=True,
     )
+
+
+def prompt_search_value(label: str, values: list[str], default: str = "") -> str:
+    """Pick one of the library's existing values with autocomplete.
+
+    Uses sentence completion so multi-word titles and albums complete as a
+    whole instead of only their last word; the interaction mirrors the
+    download artist prompt.
+    """
+    completer = WordCompleter(values, ignore_case=True, sentence=True)
+    return prompt(
+        f"{label} (type to search): ",
+        completer=completer,
+        complete_while_typing=True,
+        default=default,
+        mouse_support=True,
+    )
+
+
+def prompt_canonical_spelling(
+    label: str, variants: list[tuple[str, int]], default: str
+) -> str | None:
+    """Pick one spelling to keep for a group of equivalent names.
+
+    ``variants`` holds ``(spelling, song_count)`` pairs and ``default`` is the
+    preselected spelling (the most used one). Cancelling skips the group.
+    """
+    values: list[tuple[str, str]] = [
+        (
+            spelling,
+            f"{spelling}  ({count} song{'s' if count != 1 else ''})",
+        )
+        for spelling, count in variants
+    ]
+    return radiolist_dialog(
+        title=f"Choose one spelling to keep for the {label}",
+        text="Every other spelling is merged into the selected one.",
+        values=values,
+        default=default,
+        ok_text="Merge",
+        cancel_text="Skip",
+        style=_DARK_DIALOG_STYLE,
+    ).run()
 
 
 def _expand_song_token(token: str) -> list[int]:
@@ -225,6 +268,7 @@ _TAG_FIELD_ORDER: list[str] = [
     "artists",
     "album",
     "date",
+    "genre",
     "album_artist",
     "track_number",
 ]

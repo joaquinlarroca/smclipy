@@ -1,4 +1,5 @@
 import io
+import urllib.error
 from unittest.mock import Mock
 
 import pytest
@@ -132,6 +133,7 @@ def test_search_recordings_parses_and_ranks(monkeypatch):
     assert first.track_number == "4"
     assert first.recording_id == "rec-1"
     assert first.release_group_id == "rg-1"
+    assert first.genre == ""
 
 
 def test_match_missing_release_has_empty_fields(monkeypatch):
@@ -199,12 +201,27 @@ def test_fetch_cover_art_writes_image(monkeypatch, tmp_path):
     assert dest.read_bytes() == buf.getvalue()
 
 
-def test_fetch_cover_art_returns_none_on_error(monkeypatch, tmp_path):
+def test_fetch_cover_art_raises_on_transient_error(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "smclipy.musicbrainz.musicbrainzngs.get_release_group_image_front",
         Mock(side_effect=mb.musicbrainzngs.ResponseError("Not found")),
     )
     dest = tmp_path / "cover.jpg"
+    with pytest.raises(mb.CoverArtUnavailable):
+        mb.fetch_cover_art("rg-1", dest)
+    assert not dest.exists()
+
+
+def test_fetch_cover_art_returns_none_on_404(monkeypatch, tmp_path):
+    cause = urllib.error.HTTPError(
+        "https://coverartarchive.org", 404, "Not Found", {}, None
+    )
+    monkeypatch.setattr(
+        "smclipy.musicbrainz.musicbrainzngs.get_release_group_image_front",
+        Mock(side_effect=mb.musicbrainzngs.ResponseError(cause=cause)),
+    )
+    dest = tmp_path / "cover.jpg"
+    # A 404 is the definitive "this release has no cover" answer.
     assert mb.fetch_cover_art("rg-1", dest) is None
     assert not dest.exists()
 
@@ -224,7 +241,8 @@ def test_cover_art_error_type_is_webservice(monkeypatch, tmp_path):
         "smclipy.musicbrainz.musicbrainzngs.get_release_group_image_front",
         Mock(side_effect=mb.musicbrainzngs.WebServiceError("boom")),
     )
-    assert mb.fetch_cover_art("rg-1", tmp_path / "cover.jpg") is None
+    with pytest.raises(mb.CoverArtUnavailable):
+        mb.fetch_cover_art("rg-1", tmp_path / "cover.jpg")
 
 
 def test_fetch_cover_art_sniffs_real_extension(monkeypatch, tmp_path):
@@ -246,7 +264,9 @@ def test_fetch_cover_art_skips_invalid_image_data(monkeypatch, tmp_path):
         Mock(return_value=b"not-an-image"),
     )
     dest = tmp_path / "cover.jpg"
-    assert mb.fetch_cover_art("rg-1", dest) is None
+    # Invalid bytes are a failure worth retrying, not a definitive "no cover".
+    with pytest.raises(mb.CoverArtUnavailable):
+        mb.fetch_cover_art("rg-1", dest)
     assert not dest.exists()
 
 
@@ -282,6 +302,139 @@ def test_release_details_does_not_guess_track_number():
     assert details[3] == ""
 
 
+def _clear_genre_state(monkeypatch):
+    monkeypatch.setattr(mb, "_GENRE_CACHE", {})
+    monkeypatch.setattr(mb, "_genre_failure_warned", False)
+
+
+def test_genres_include_is_allowed_for_queried_entities():
+    for entity in ("release-group", "recording"):
+        assert "genres" in mb.musicbrainzngs.musicbrainz.VALID_INCLUDES[entity]
+
+
+def test_fetch_genre_joins_release_group_genres_by_votes(monkeypatch):
+    _clear_genre_state(monkeypatch)
+    seen = {}
+
+    def fake_release_group(release_group_id, includes):
+        seen["id"] = release_group_id
+        seen["includes"] = includes
+        return {
+            "release-group": {
+                "genres": [
+                    {"name": "rock", "count": 20},
+                    {"name": "art rock", "count": 15},
+                    {"name": "progressive rock", "count": 22},
+                ]
+            }
+        }
+
+    monkeypatch.setattr(
+        mb.musicbrainzngs, "get_release_group_by_id", fake_release_group
+    )
+
+    assert mb.fetch_genre("rg-1", "rec-1") == "progressive rock; rock; art rock"
+    assert seen == {"id": "rg-1", "includes": ["genres"]}
+
+
+def test_fetch_genre_dedupes_case_insensitively(monkeypatch):
+    _clear_genre_state(monkeypatch)
+    monkeypatch.setattr(
+        mb.musicbrainzngs,
+        "get_release_group_by_id",
+        lambda *a, **k: {
+            "release-group": {
+                "genres": [
+                    {"name": "Rock", "count": 3},
+                    {"name": "rock", "count": 9},
+                    {"name": "  ", "count": 50},
+                ]
+            }
+        },
+    )
+
+    assert mb.fetch_genre("rg-1", None) == "Rock"
+
+
+def test_fetch_genre_falls_back_to_recording(monkeypatch):
+    _clear_genre_state(monkeypatch)
+    monkeypatch.setattr(
+        mb.musicbrainzngs,
+        "get_release_group_by_id",
+        lambda *a, **k: {"release-group": {"genres": []}},
+    )
+    seen = []
+
+    def fake_recording(recording_id, includes):
+        seen.append((recording_id, includes))
+        return {"recording": {"genres": [{"name": "ambient", "count": 2}]}}
+
+    monkeypatch.setattr(mb.musicbrainzngs, "get_recording_by_id", fake_recording)
+
+    assert mb.fetch_genre("rg-1", "rec-1") == "ambient"
+    assert seen == [("rec-1", ["genres"])]
+
+
+def test_fetch_genre_caches_per_release_group(monkeypatch):
+    _clear_genre_state(monkeypatch)
+    calls = []
+
+    def fake_release_group(release_group_id, includes):
+        calls.append(release_group_id)
+        return {"release-group": {"genres": [{"name": "rock", "count": 1}]}}
+
+    monkeypatch.setattr(
+        mb.musicbrainzngs, "get_release_group_by_id", fake_release_group
+    )
+
+    assert mb.fetch_genre("rg-1", "rec-1") == "rock"
+    assert mb.fetch_genre("rg-1", "rec-2") == "rock"
+    assert calls == ["rg-1"]
+
+
+def test_fetch_genre_caches_a_genuinely_empty_result(monkeypatch):
+    _clear_genre_state(monkeypatch)
+    calls = []
+
+    def empty(release_group_id, includes):
+        calls.append(release_group_id)
+        return {"release-group": {"genres": []}}
+
+    monkeypatch.setattr(mb.musicbrainzngs, "get_release_group_by_id", empty)
+
+    assert mb.fetch_genre("rg-1", None) == ""
+    assert mb.fetch_genre("rg-1", None) == ""
+    assert calls == ["rg-1"]
+
+
+def test_fetch_genre_returns_none_and_does_not_cache_on_error(monkeypatch, capsys):
+    _clear_genre_state(monkeypatch)
+    calls = []
+
+    def boom(release_group_id, includes):
+        calls.append(release_group_id)
+        raise mb.musicbrainzngs.WebServiceError("boom")
+
+    monkeypatch.setattr(mb.musicbrainzngs, "get_release_group_by_id", boom)
+
+    assert mb.fetch_genre("rg-1", None) is None
+    assert mb.fetch_genre("rg-1", None) is None
+    assert calls == ["rg-1", "rg-1"]
+    assert "could not fetch genres" in capsys.readouterr().err
+
+
+def test_fetch_genre_survives_invalid_include_error(monkeypatch, capsys):
+    _clear_genre_state(monkeypatch)
+
+    def boom(release_group_id, includes):
+        raise mb.musicbrainzngs.InvalidIncludeError("genres")
+
+    monkeypatch.setattr(mb.musicbrainzngs, "get_release_group_by_id", boom)
+
+    assert mb.fetch_genre("rg-invalid", None) is None
+    assert "could not fetch genres" in capsys.readouterr().err
+
+
 def test_throttle_enforces_minimum_interval(monkeypatch):
     import time
 
@@ -306,3 +459,41 @@ def test_throttle_skips_sleep_when_disabled(monkeypatch):
     mb._throttle()
     mb._throttle()
     assert sleeps == []
+
+
+def test_rank_recording_does_not_penalize_real_titles_with_version_words():
+    plain = sample_recording(title="Other Song")
+    live_forever = sample_recording(title="Live Forever")
+    cover_me = sample_recording(title="Cover Me")
+
+    # "Live Forever" and "Cover Me" are song names, not a live/cover version,
+    # so they must rank exactly like any other title.
+    assert mb._rank_recording(live_forever) == mb._rank_recording(plain)
+    assert mb._rank_recording(cover_me) == mb._rank_recording(plain)
+
+
+def test_rank_recording_penalizes_version_qualifiers_in_the_title():
+    studio = sample_recording(title="Comfortably Numb")
+    live = sample_recording(title="Comfortably Numb (Live at Wembley)")
+
+    assert mb._rank_recording(studio) > mb._rank_recording(live)
+
+
+def test_search_recordings_prefers_release_matching_the_searched_album(monkeypatch):
+    compilation = sample_recording(album="Greatest Hits", date="2001-01-01")
+    release = dict(compilation["release-list"][0])
+    release["title"] = "The Wall"
+    release["date"] = "1979-11-30"
+    release["release-group"] = {"id": "rg-2", "title": "The Wall"}
+    compilation["release-list"].append(release)
+    monkeypatch.setattr(
+        "smclipy.musicbrainz.musicbrainzngs.search_recordings",
+        lambda **kwargs: {"recording-list": [compilation]},
+    )
+
+    matches = mb.search_recordings("Comfortably Numb", ["Pink Floyd"], album="The Wall")
+
+    # Album/date/track number must come from the searched album, not from
+    # whichever release happens to be listed first.
+    assert matches[0].album == "The Wall"
+    assert matches[0].date == "1979-11-30"

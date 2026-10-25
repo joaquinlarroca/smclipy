@@ -69,29 +69,6 @@ def _split_stem(stem: str, known: list[str]) -> tuple[list[str], str] | None:
     return artists, title
 
 
-def _restore_song(file: Path, known: list[str]) -> tuple[bool, str | None]:
-    profile, _ = read_song_profile(file)
-    if not _is_junk(profile):
-        return False, None
-    parsed = _split_stem(file.stem, known)
-    if parsed is None:
-        return False, f"could not parse {file.name!r}"
-    artists, title = parsed
-    if not apply_tag_update(
-        file,
-        title=title,
-        artists=artists,
-        album="",
-        date="",
-    ):
-        return False, f"write failed for {file.name!r}"
-    song_uuid: str | None = read_song_uuid(file)
-    if song_uuid is not None:
-        db.reset_mb_status(song_uuid)
-        db.log_event(song_uuid, "musicbrainz", {"status": "reset"})
-    return True, None
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -160,7 +137,10 @@ def main(argv: list[str] | None = None) -> int:
             continue
         # Files never junk-tagged on disk but the DB row still carries the
         # fake match; forget it so the tag command re-offers these too.
-        if Path(music, row["current_path"] or row["first_seen_path"] or "").exists():
+        # A row without any recorded path must not count as an existing file
+        # (``Path(music, "")`` is the music folder itself).
+        rel: str = row["current_path"] or row["first_seen_path"] or ""
+        if rel and Path(music, rel).exists():
             db.reset_mb_status(row["uuid"])
             db.log_event(row["uuid"], "musicbrainz", {"status": "reset"})
             stale += 1

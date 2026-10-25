@@ -1,5 +1,7 @@
 """MusicBrainz metadata lookup via the musicbrainzngs client."""
 
+import re
+import sys
 import time
 from dataclasses import dataclass
 from io import BytesIO
@@ -23,6 +25,12 @@ _SEARCH_LIMIT = 5
 _MIN_REQUEST_INTERVAL = 1.0
 _last_request_at = 0.0
 
+# Entities whose genres smclipy can look up. Release groups are album-level and
+# much better populated than recordings, so they are tried first.
+_GENRE_INCLUDE_ENTITIES = ("release-group", "recording")
+_GENRE_CACHE: dict[str, str] = {}
+_genre_failure_warned = False
+
 _SNIFFED_EXT_BY_FORMAT: dict[str, str] = {
     "JPEG": ".jpg",
     "PNG": ".png",
@@ -33,6 +41,10 @@ _SNIFFED_EXT_BY_FORMAT: dict[str, str] = {
 
 class MusicBrainzUnavailable(Exception):
     """MusicBrainz could not be reached or returned an unusable response."""
+
+
+class CoverArtUnavailable(Exception):
+    """Cover art could not be fetched because of a transient failure."""
 
 
 def _throttle() -> None:
@@ -56,6 +68,35 @@ class MusicBrainzMatch:
     track_number: str
     recording_id: str
     release_group_id: str | None
+    genre: str = ""
+
+
+# Disambiguations and bracketed/suffixed title qualifiers mark alternate
+# versions ("live", "cover"); matching the bare words would also punish real
+# song titles such as "Live Forever" or "Cover Me".
+_ALT_VERSION_TAG = re.compile(r"[\(\[]([^\)\]]*)[\)\]]")
+_ALT_VERSION_WORDS = re.compile(r"\b(?:live|cover)\b", re.IGNORECASE)
+
+
+def _enable_genre_include() -> None:
+    """Allow the API's ``genres`` include in the bundled musicbrainzngs.
+
+    The client's include allow-list predates MusicBrainz's genre support, so
+    the entity types smclipy queries need the include added once. Without it
+    the client rejects the request before it reaches the API. The attribute is
+    private, so a client upgrade that moves it must not break the import;
+    ``fetch_genre`` then just reports genres as unavailable at runtime.
+    """
+    try:
+        for entity in _GENRE_INCLUDE_ENTITIES:
+            includes = musicbrainzngs.musicbrainz.VALID_INCLUDES.get(entity)
+            if isinstance(includes, list) and "genres" not in includes:
+                includes.append("genres")
+    except Exception:
+        pass
+
+
+_enable_genre_include()
 
 
 def _configure_agent() -> None:
@@ -81,16 +122,41 @@ def _artist_credit(recording: dict[str, Any]) -> list[str]:
     return artists
 
 
-def _first_official_release(recording: dict[str, Any]) -> dict[str, Any] | None:
-    releases = list(recording.get("release-list", []))
-    for release in releases:
-        if str(release.get("status", "")).casefold() == "official":
-            official: dict[str, Any] = release
-            return official
+def _release_matches_album(release: dict[str, Any], wanted: str) -> bool:
+    release_group: dict[str, Any] = release.get("release-group") or {}
+    title: str = str(release.get("title") or release_group.get("title") or "")
+    return title.strip().casefold() == wanted
+
+
+def _first_official_release(
+    recording: dict[str, Any], album: str | None = None
+) -> dict[str, Any] | None:
+    """Pick the release to read album/date/track number from.
+
+    When the search carried an album, prefer the official release whose title
+    matches it so a compilation or live album listed on the recording cannot
+    supply the album, date, and track number for an unrelated release.
+    """
+    releases: list[dict[str, Any]] = list(recording.get("release-list", []))
     if not releases:
         return None
-    first: dict[str, Any] = releases[0]
-    return first
+    wanted: str = album.strip().casefold() if album else ""
+
+    def official(release: dict[str, Any]) -> bool:
+        return str(release.get("status", "")).casefold() == "official"
+
+    if wanted:
+        for release in releases:
+            if official(release) and _release_matches_album(release, wanted):
+                return release
+    for release in releases:
+        if official(release):
+            return release
+    if wanted:
+        for release in releases:
+            if _release_matches_album(release, wanted):
+                return release
+    return releases[0]
 
 
 def _has_official_release(recording: dict[str, Any]) -> bool:
@@ -131,10 +197,12 @@ def _release_details(
     return album, date, album_artist, track_number, release_group_id
 
 
-def _match_from_recording(recording: dict[str, Any]) -> MusicBrainzMatch:
+def _match_from_recording(
+    recording: dict[str, Any], album: str | None = None
+) -> MusicBrainzMatch:
     title: str = str(recording.get("title", "")).strip()
     artists: list[str] = _artist_credit(recording)
-    release: dict[str, Any] | None = _first_official_release(recording)
+    release: dict[str, Any] | None = _first_official_release(recording, album)
     album, date, album_artist, track_number, release_group_id = _release_details(
         release, title
     )
@@ -159,13 +227,13 @@ def _rank_recording(recording: dict[str, Any]) -> tuple[int, int, int]:
         score = 0
     official: Literal[0, 1] = 1 if _has_official_release(recording) else 0
     score_part: int = score if official else max(0, score - 20)
-    haystack: str = " ".join(
-        {
-            str(recording.get("title", "")),
-            str(recording.get("disambiguation", "")),
-        }
-    ).casefold()
-    if "cover" in haystack or "live" in haystack:
+    title: str = str(recording.get("title", ""))
+    disambiguation: str = str(recording.get("disambiguation", ""))
+    alternate_version: bool = bool(_ALT_VERSION_WORDS.search(disambiguation)) or any(
+        _ALT_VERSION_WORDS.search(qualifier)
+        for qualifier in _ALT_VERSION_TAG.findall(title)
+    )
+    if alternate_version:
         score_part -= 20
     return (score_part, official, score)
 
@@ -203,7 +271,90 @@ def search_recordings(
         ) from None
     recordings = result.get("recording-list", [])
     recordings.sort(key=_rank_recording, reverse=True)
-    return [_match_from_recording(recording) for recording in recordings]
+    return [_match_from_recording(recording, album) for recording in recordings]
+
+
+def _cache_key(release_group_id: str | None, recording_id: str | None) -> str:
+    if release_group_id:
+        return f"rg:{release_group_id}"
+    if recording_id:
+        return f"rec:{recording_id}"
+    return ""
+
+
+def _join_genres(genres: list[dict[str, Any]]) -> str:
+    """Join genre names as ``"most voted; ...; least voted"``.
+
+    MusicBrainz returns genres alphabetically; listeners expect the tag to
+    start with the defining genre, so rank by vote count first. Names are
+    deduplicated case-insensitively and empty entries are ignored.
+    """
+    ranked: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for genre in genres:
+        name: str = str(genre.get("name", "")).strip()
+        key: str = name.casefold()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        try:
+            count: int = int(genre.get("count", 0))
+        except (TypeError, ValueError):
+            count = 0
+        ranked.append((count, name))
+    ranked.sort(key=lambda item: (-item[0], item[1].casefold()))
+    return "; ".join(name for _, name in ranked)
+
+
+def _warn_genre_failure(exc: Exception) -> None:
+    global _genre_failure_warned
+    if _genre_failure_warned:
+        return
+    _genre_failure_warned = True
+    print(
+        f"Warning: could not fetch genres from MusicBrainz ({exc}); "
+        "the song will be retried on the next run.",
+        file=sys.stderr,
+    )
+
+
+def fetch_genre(release_group_id: str | None, recording_id: str | None) -> str | None:
+    """Return the match's genres joined by ``"; "``.
+
+    Returns "" when MusicBrainz has no genres for the entity, and None when
+    the request itself failed (so callers can leave the song untagged and
+    retry it later instead of caching a bogus empty result).
+
+    Release-group genres are album-level and preferred; recording genres are
+    only consulted when the release group has none. Successful results are
+    cached per release group so tagging a whole album costs a single request.
+    """
+    _configure_agent()
+    key: str = _cache_key(release_group_id, recording_id)
+    if key and key in _GENRE_CACHE:
+        return _GENRE_CACHE[key]
+    genres = ""
+    try:
+        if release_group_id:
+            _throttle()
+            release_group = musicbrainzngs.get_release_group_by_id(
+                release_group_id, includes=["genres"]
+            )
+            genres = _join_genres(
+                release_group.get("release-group", {}).get("genres", [])
+            )
+        if not genres and recording_id:
+            _throttle()
+            recording = musicbrainzngs.get_recording_by_id(
+                recording_id, includes=["genres"]
+            )
+            genres = _join_genres(recording.get("recording", {}).get("genres", []))
+    except (musicbrainzngs.MusicBrainzError, OSError, ValueError) as exc:
+        _warn_genre_failure(exc)
+        return None
+    if key:
+        _GENRE_CACHE[key] = genres
+    return genres
 
 
 def _sniff_cover_extension(data: bytes) -> str | None:
@@ -223,24 +374,33 @@ def fetch_cover_art(release_group_id: str, dest: Path) -> Path | None:
 
     The returned file path has an extension matching the actual image
     format (PNG/WebP/GIF may be served despite a ``.jpg`` request).
-    Returns None if the release serves no cover or the bytes are not a
-    valid image, without writing anything to disk.
+    Returns None when the release genuinely has no cover, and raises
+    :class:`CoverArtUnavailable` for transient failures (network, rate limit,
+    invalid bytes) so callers can retry the song later instead of burying it
+    as permanently coverless. Nothing is written to disk on failure.
     """
     _configure_agent()
     _throttle()
     try:
         data = musicbrainzngs.get_release_group_image_front(release_group_id)
-    except (musicbrainzngs.WebServiceError, OSError, ValueError):
-        return None
+    except musicbrainzngs.ResponseError as exc:
+        cause: Any = getattr(exc, "cause", None)
+        if getattr(cause, "code", None) == 404:
+            return None
+        raise CoverArtUnavailable(
+            f"Cover Art Archive returned an error for {release_group_id}."
+        ) from None
+    except (musicbrainzngs.MusicBrainzError, OSError, ValueError) as exc:
+        raise CoverArtUnavailable(
+            f"Cover Art Archive could not be reached ({exc})."
+        ) from None
     if not data:
         return None
     extension: str | None = _sniff_cover_extension(data)
     if extension is None:
-        print(
-            f"Warning: cover art for release group {release_group_id} "
-            "is not a valid image, skipping."
+        raise CoverArtUnavailable(
+            f"Cover art for release group {release_group_id} is not a valid image."
         )
-        return None
     actual_dest: Path = dest.with_suffix(extension) if extension else dest
     actual_dest.parent.mkdir(parents=True, exist_ok=True)
     actual_dest.write_bytes(data)

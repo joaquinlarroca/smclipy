@@ -1,6 +1,5 @@
 """The ``restore`` command: undo tag changes from recorded backups."""
 
-import sys
 from typing import Any
 
 from smclipy.config import init
@@ -22,9 +21,10 @@ from smclipy.ui import (
 def cmd_restore(args: Any) -> None:
     """Pick song(s) and one of their recorded backups, then re-apply it.
 
-    Snapshots are written automatically before every ``tag``, ``modify``, and
-    ``crop`` change, so a mistaken match or edit can be rolled back. The
-    chosen snapshot is applied straight to the file and database; tracking
+    Snapshots are written automatically before every ``tag``, ``modify``,
+    ``crop``, and ``dedupe`` tag change, so a mistaken match, edit, or merge
+    can be rolled back. Filename renames made by ``dedupe`` are not undone.
+    The chosen snapshot is applied straight to the file and database; tracking
     UUID, download history, and MusicBrainz status are left untouched.
     """
     init()
@@ -37,43 +37,35 @@ def cmd_restore(args: Any) -> None:
         return
 
     restorable: list[int] = []
-    for index, song in enumerate(songs):
+    for position, song in enumerate(songs):
         if song.uuid and list_snapshots(song.uuid):
-            restorable.append(index)
+            restorable.append(position)
     if not restorable:
         print(
             "No backups found. Backups are recorded automatically before every "
-            "`tag`, `modify`, or `crop` change."
+            "`tag`, `modify`, `crop`, or `dedupe` change."
         )
         return
 
+    # Only songs with backups are listed, so the picker must be numbered
+    # against that list — numbering them by library position made the number
+    # you typed point at a different (often backup-less) song.
     print("Songs with recorded backups:")
-    for index, song in enumerate(songs, start=1):
-        if index - 1 in restorable:
-            print(f"{index}. {song.display_name}")
-    selected: list[int] = prompt_song_selection(len(songs))
-
-    without_backups: list[int] = [
-        index for index in selected if index not in restorable
-    ]
-    if without_backups:
-        print(
-            "Skipping "
-            + ", ".join(str(index + 1) for index in without_backups)
-            + ": no backups recorded for those songs."
-        )
-    selected = [index for index in selected if index in restorable]
-    if not selected:
+    for number, restorable_index in enumerate(restorable, start=1):
+        print(f"{number}. {songs[restorable_index].display_name}")
+    picks: list[int] = prompt_song_selection(len(restorable))
+    if not picks:
         print("Nothing to restore.")
         return
 
     restored: int = 0
     failed: int = 0
-    for index in selected:
-        current_song: LibrarySong = songs[index]
+    for pick in picks:
+        song_index: int = restorable[pick]
+        current_song: LibrarySong = songs[song_index]
         assert current_song.uuid is not None
         snapshots: list[Snapshot] = list_snapshots(current_song.uuid)
-        print(f"\n[{index + 1}] {current_song.display_name}")
+        print(f"\n[{pick + 1}] {current_song.display_name}")
         current, _ = read_song_profile(current_song.path)
         for number, snapshot in enumerate(snapshots, start=1):
             changed: list[str] = [
@@ -110,7 +102,4 @@ def cmd_restore(args: Any) -> None:
             print(f"Failed to restore '{current_song.display_name}'.")
             failed += 1
 
-    print(
-        f"\nRestore complete: {restored} restored, {failed} failed.",
-        file=sys.stderr,
-    )
+    print(f"\nRestore complete: {restored} restored, {failed} failed.")

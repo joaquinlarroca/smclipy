@@ -24,6 +24,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "artists",
         "album",
         "date",
+        "genre",
         "album_artist",
         "track_number",
         "cover",
@@ -32,7 +33,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 COVER_FIELD = "cover"
 TAG_FIELDS: frozenset[str] = frozenset(
-    {"title", "artists", "album", "date", "album_artist", "track_number", COVER_FIELD}
+    {
+        "title",
+        "artists",
+        "album",
+        "date",
+        "genre",
+        "album_artist",
+        "track_number",
+        COVER_FIELD,
+    }
 )
 CONFIG_PATH = Path(
     os.environ.get(
@@ -56,7 +66,7 @@ class Settings:
                 "path, defaulting to '.'",
                 file=sys.stderr,
             )
-        self.music_folder = Path(raw_path)
+        self.music_folder = Path(raw_path).expanduser()
         raw_name = raw.get("name", "smclipy")
         if not isinstance(raw_name, str) or not raw_name.strip():
             raw_name = "smclipy"
@@ -221,7 +231,9 @@ class Settings:
 _settings: Settings | None = None
 
 
-def _load_raw_config(create_if_missing: bool = True) -> dict[str, Any]:
+def _load_raw_config(
+    create_if_missing: bool = True, *, write_defaults: bool = True
+) -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         if not create_if_missing:
             return dict(DEFAULT_CONFIG)
@@ -248,8 +260,17 @@ def _load_raw_config(create_if_missing: bool = True) -> dict[str, Any]:
         print("Fix or delete the config file, then run smclipy again.", file=sys.stderr)
         raise SystemExit(1)
     merged = {**DEFAULT_CONFIG, **raw}
-    if merged != raw:
-        CONFIG_PATH.write_text(json.dumps(merged, indent=4), encoding="utf-8")
+    if merged != raw and write_defaults:
+        # Filling in new default keys is a convenience, not a requirement:
+        # a read-only config must not turn every command into a crash.
+        try:
+            CONFIG_PATH.write_text(json.dumps(merged, indent=4), encoding="utf-8")
+        except OSError as exc:
+            print(
+                f"Warning: could not update {CONFIG_PATH} with the missing "
+                f"default keys ({exc}); using them for this run only.",
+                file=sys.stderr,
+            )
     return merged
 
 
@@ -266,9 +287,13 @@ def setup_folders() -> None:
     except OSError as exc:
         print(
             f"Error: could not create the smclipy folder structure at "
-            f"'{s.script_folder}': {exc}"
+            f"'{s.script_folder}': {exc}",
+            file=sys.stderr,
         )
-        print("Check that 'path_to_music_folder' points to a writable directory.")
+        print(
+            "Check that 'path_to_music_folder' points to a writable directory.",
+            file=sys.stderr,
+        )
         raise SystemExit(1) from exc
 
 

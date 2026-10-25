@@ -8,5 +8,5 @@
     "max_download_attempts": 3,
     "cookies": "",
     "cookies_from_browser": "",
-    "tag_fields": ["title", "artists", "album", "date", "album_artist", "track_number", "cover"]
+    "tag_fields": ["title", "artists", "album", "date", "genre", "album_artist", "track_number", "cover"]
 }

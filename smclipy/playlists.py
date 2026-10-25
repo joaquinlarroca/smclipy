@@ -61,6 +61,11 @@ def _export_path(
     return os.path.relpath(str(resolved), str(export_dir.resolve()))
 
 
+def _m3u_label(row: sqlite3.Row) -> str:
+    """The EXTINF label, flattened to one line (newlines would break the tag)."""
+    return " ".join(_song_label(row, extinf=True).splitlines())
+
+
 def serialize_m3u(
     name: str,
     rows: list[sqlite3.Row],
@@ -77,7 +82,7 @@ def serialize_m3u(
         )
         if path is None:
             continue
-        lines.append(f"#EXTINF:-1,{_song_label(row, extinf=True)}")
+        lines.append(f"#EXTINF:-1,{_m3u_label(row)}")
         lines.append(path)
     return "\n".join(lines) + "\n"
 
@@ -87,22 +92,29 @@ def serialize_json(
     rows: list[sqlite3.Row],
     music_folder: Path,
     *,
+    export_dir: Path | None = None,
     absolute: bool = False,
 ) -> str:
     """Render rows as the smclipy playlist JSON format; missing songs are
-    skipped like they are in the m3u export."""
+    skipped like they are in the m3u export.
+
+    Relative paths are written relative to ``export_dir`` (the directory of
+    the exported file), matching the m3u format and the CLI docs, so import
+    resolves them the same way.
+    """
     songs: list[dict[str, str]] = []
     for row in rows:
-        rel: Any = row["current_path"]
-        if not rel:
+        path: str | None = _export_path(
+            row, music_folder, export_dir or music_folder, absolute=absolute
+        )
+        if path is None:
             continue
-        path: Path = music_folder.joinpath(str(rel))
         songs.append(
             {
                 "uuid": str(row["uuid"]),
                 "title": str(row["title"] or ""),
                 "artists": str(row["artists"] or ""),
-                "path": str(path.resolve()) if absolute else str(rel),
+                "path": path,
             }
         )
     payload: dict[str, Any] = {
@@ -460,7 +472,11 @@ def cmd_playlist_export(args: Any) -> None:
         )
     else:
         content = serialize_json(
-            name, rows, s.music_folder, absolute=bool(args.absolute)
+            name,
+            rows,
+            s.music_folder,
+            export_dir=out_path.parent,
+            absolute=bool(args.absolute),
         )
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -544,6 +560,18 @@ def cmd_playlist_import(args: Any) -> None:
             continue
         if uuid not in uuids:
             uuids.append(uuid)
+
+    if playlist is not None and args.replace and not uuids:
+        # `--replace` clears the existing contents first; when the file resolved
+        # to nothing (wrong folder, renamed library) that would silently wipe
+        # the playlist, so refuse instead.
+        print(
+            f"Error: none of the {len(entries)} entr"
+            f"{'y' if len(entries) == 1 else 'ies'} in '{path.name}' matched a "
+            f"library song; refusing to replace playlist '{name}'.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     if playlist is None:
         db.create_playlist(name)

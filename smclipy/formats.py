@@ -26,6 +26,8 @@ from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 from PIL import Image as PILImage
 
+from smclipy.helpers import join_authors
+
 UFID_OWNER = "smclipy"
 MP4_UUID_ATOM = "----:com.apple.iTunes:smclipy-uuid"
 VORBIS_UUID_FIELD = "SMCLIPY_UUID"
@@ -212,8 +214,7 @@ class Track:
             "track_number",
         ):
             profile[field] = self.read_text(field)
-        profile["title"] = profile["title"] or "Unknown"
-        profile["artists"] = ", ".join(self.read_artists())
+        profile["artists"] = join_authors(self.read_artists())
         return profile, self.has_cover()
 
     def read_text(self, field: str) -> str:

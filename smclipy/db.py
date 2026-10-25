@@ -643,14 +643,17 @@ def get_events(
 def reset_queue(urls: list[str]) -> None:
     """Make `urls` the pending queue without losing history.
 
-    Processed rows are kept as history, existing rows keep their attempt
-    counts, and only pending rows absent from `urls` are removed. New URLs
-    are inserted as pending.
+    Processed rows are kept as history and existing rows keep their attempt
+    counts, except permanently-failed rows: re-pending one of those grants a
+    fresh retry budget, since the caller deliberately asked for it again.
+    Only pending rows absent from `urls` are removed. New URLs are inserted
+    as pending.
     """
     now: str = _now()
     with transaction() as conn:
-        existing: set[str] = {
-            row["url"] for row in conn.execute("SELECT url FROM queue").fetchall()
+        existing: dict[str, str] = {
+            row["url"]: row["status"]
+            for row in conn.execute("SELECT url, status FROM queue").fetchall()
         }
         if urls:
             placeholders: str = ",".join("?" for _ in urls)
@@ -661,16 +664,22 @@ def reset_queue(urls: list[str]) -> None:
         else:
             conn.execute("DELETE FROM queue WHERE status = ?", (QUEUE_PENDING,))
         for url in urls:
-            if url in existing:
-                conn.execute(
-                    "UPDATE queue SET status = ?, updated_at = ? WHERE url = ?",
-                    (QUEUE_PENDING, now, url),
-                )
-            else:
+            if url not in existing:
                 conn.execute(
                     "INSERT INTO queue (url, status, attempts, created_at, updated_at)"
                     " VALUES (?, ?, 0, ?, ?)",
                     (url, QUEUE_PENDING, now, now),
+                )
+            elif existing[url] == QUEUE_FAILED:
+                conn.execute(
+                    "UPDATE queue SET status = ?, attempts = 0, last_error = NULL,"
+                    " updated_at = ? WHERE url = ?",
+                    (QUEUE_PENDING, now, url),
+                )
+            else:
+                conn.execute(
+                    "UPDATE queue SET status = ?, updated_at = ? WHERE url = ?",
+                    (QUEUE_PENDING, now, url),
                 )
 
 
@@ -717,10 +726,11 @@ def mark_processed(
 def requeue(urls: list[str], error: str | None = None) -> None:
     """Re-pend URLs in place, incrementing their attempt count.
 
-    Once a URL's attempts exceed ``max_download_attempts`` it is not re-queued:
-    it is permanently marked ``failed`` so a dead link stops being re-offered
-    on every resume. Uses UPDATE (not INSERT OR REPLACE) so rowids,
-    timestamps, and any recorded title/artists/album metadata survive.
+    ``max_download_attempts`` is the total number of tries: a URL is re-pended
+    while its attempt count is still below the limit, and is permanently
+    marked ``failed`` once the limit is reached. Uses UPDATE (not INSERT OR
+    REPLACE) so rowids, timestamps, and any recorded title/artists/album
+    metadata survive.
     """
     now: str = _now()
     max_attempts: int = settings().max_download_attempts
@@ -730,7 +740,7 @@ def requeue(urls: list[str], error: str | None = None) -> None:
                 "SELECT attempts, created_at FROM queue WHERE url = ?", (url,)
             ).fetchone()
             attempts: int = 1 if existing is None else int(existing["attempts"]) + 1
-            status: str = QUEUE_PENDING if attempts <= max_attempts else QUEUE_FAILED
+            status: str = QUEUE_PENDING if attempts < max_attempts else QUEUE_FAILED
             if existing is None:
                 conn.execute(
                     "INSERT INTO queue (url, status, attempts, last_error,"
@@ -746,7 +756,7 @@ def requeue(urls: list[str], error: str | None = None) -> None:
 
 
 def get_failed_urls(conn: sqlite3.Connection | None = None) -> list[str]:
-    """URLs permanently dropped after exceeding the download retry limit."""
+    """URLs permanently dropped after reaching the download retry limit."""
     c, owner = _rw(conn)
     try:
         return [
@@ -794,6 +804,29 @@ def add_authors(names: list[str], conn: sqlite3.Connection | None = None) -> lis
     return added
 
 
+def rename_author(
+    normalized: str, name: str, conn: sqlite3.Connection | None = None
+) -> bool:
+    """Rewrite an author's stored spelling under the same normalized key.
+
+    The ``authors`` table keeps only one row per case/whitespace-insensitive
+    name, so merging spellings only needs to update that row's display name.
+    Returns whether a row was updated.
+    """
+    key: str = normalize_author(normalized)
+    if not key or not name.strip():
+        return False
+    c, owner = _rw(conn)
+    try:
+        cur = c.execute("UPDATE authors SET name = ? WHERE normalized = ?", (name, key))
+        if owner:
+            c.commit()
+        return bool(cur.rowcount)
+    finally:
+        if owner:
+            c.close()
+
+
 def get_false_positives(
     conn: sqlite3.Connection | None = None,
 ) -> set[str]:
@@ -809,6 +842,30 @@ def add_false_positive(stem: str, conn: sqlite3.Connection | None = None) -> Non
     c, owner = _rw(conn)
     try:
         c.execute("INSERT OR REPLACE INTO false_positives (stem) VALUES (?)", (stem,))
+        if owner:
+            c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
+def rename_false_positive(
+    old_stem: str, new_stem: str, conn: sqlite3.Connection | None = None
+) -> None:
+    """Move a cover false-positive entry when its image stem changes."""
+    if old_stem == new_stem:
+        return
+    c, owner = _rw(conn)
+    try:
+        existing = c.execute(
+            "SELECT 1 FROM false_positives WHERE stem = ?", (old_stem,)
+        ).fetchone()
+        if existing is None:
+            return
+        c.execute(
+            "INSERT OR REPLACE INTO false_positives (stem) VALUES (?)", (new_stem,)
+        )
+        c.execute("DELETE FROM false_positives WHERE stem = ?", (old_stem,))
         if owner:
             c.commit()
     finally:

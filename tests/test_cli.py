@@ -1041,11 +1041,16 @@ def test_cmd_download_survives_processed_recording_error(
         raise OSError("disk full")
 
     monkeypatch.setattr(cli.db, "mark_processed", raisy)
+    requeued: list[list[str]] = []
+    monkeypatch.setattr(cli.db, "requeue", lambda urls, **kw: requeued.append(urls))
 
     cli.cmd_download(argparse.Namespace())
 
     out = capsys.readouterr().out
-    assert "could not record" in out
+    assert "downloaded but could not be recorded as processed" in out
+    # The file was saved, so a tracking failure must NOT queue it for a
+    # second download on the next run.
+    assert requeued == []
 
 
 def test_cmd_download_repends_unsaved_videos(monkeypatch, app_settings):
@@ -1371,13 +1376,19 @@ def test_main_playlist_import_runs_without_tty(monkeypatch, app_settings, capsys
     assert calls[0].playlist_action == "import"
 
 
-def test_main_directories_flag_does_not_shadow_command(monkeypatch, app_settings):
+def test_main_directories_flag_rejects_command(monkeypatch, app_settings, capsys):
     import smclipy.cli as cli
 
     calls = []
     monkeypatch.setattr(cli, "cmd_update", lambda args: calls.append(args))
-    cli.main(["-d", "update"])
-    assert len(calls) == 1
+    # Combining the two used to silently ignore one of them, so `smclipy -d
+    # update` looked like it worked while either printing directories or
+    # updating. Refuse the ambiguous invocation instead.
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["-d", "update"])
+    assert excinfo.value.code == 2
+    assert calls == []
+    assert "--directories cannot be combined with a command" in capsys.readouterr().err
 
 
 def test_main_tag_all_auto_runs_without_tty(monkeypatch, app_settings, capsys):
@@ -1481,25 +1492,29 @@ def test_cmd_update_json_reports_changes(monkeypatch, app_settings, capsys):
     assert song["uuid"]
 
 
-def test_cmd_update_missing_music_folder_exits(monkeypatch, app_settings, capsys):
+def test_cmd_update_tolerates_missing_music_folder(monkeypatch, app_settings, capsys):
     import smclipy.cli as cli
 
     monkeypatch.setattr(cli, "init", lambda: app_settings)
-    with pytest.raises(SystemExit) as exc:
-        cli.cmd_update(argparse.Namespace(json=False))
-    assert exc.value.code == 1
-    assert "Music folder not found" in capsys.readouterr().out
+    cli.cmd_update(argparse.Namespace(json=False))
+    assert "Already up to date." in capsys.readouterr().out
 
 
-def test_cmd_update_json_missing_music_folder_exits(monkeypatch, app_settings, capsys):
+def test_cmd_update_json_missing_music_folder_is_empty(
+    monkeypatch, app_settings, capsys
+):
     import smclipy.cli as cli
 
     monkeypatch.setattr(cli, "init", lambda: app_settings)
-    with pytest.raises(SystemExit) as exc:
-        cli.cmd_update(argparse.Namespace(json=True))
-    assert exc.value.code == 1
+    cli.cmd_update(argparse.Namespace(json=True))
     payload = json.loads(capsys.readouterr().out)
-    assert payload["error"] == "music_folder_not_found"
+    assert payload == {
+        "added": 0,
+        "renamed": 0,
+        "missing": 0,
+        "changed": 0,
+        "songs": [],
+    }
 
 
 def test_collect_urls_interrupt_preserves_prior_pending(
@@ -1549,3 +1564,206 @@ def test_collect_batch_missing_file_exits(monkeypatch, app_settings, tmp_path, c
         cli._collect_batch(tmp_path / "nope.txt")
     assert exc.value.code == 1
     assert "could not read batch file" in capsys.readouterr().err
+
+
+def test_main_modify_search_flag_parses(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_modify", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["modify", "-s", "abbey"])
+
+    assert calls[0].search == "abbey"
+    assert calls[0].specific is None
+
+
+def test_main_modify_specific_flag_parses(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_modify", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["modify", "--specific", "artists"])
+
+    assert calls[0].specific == "artists"
+    assert calls[0].search is None
+
+
+def test_main_rejects_modify_search_with_specific(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["modify", "--search", "x", "--specific", "album"])
+
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_main_tag_short_s_stays_semi(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_tag", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["tag", "-s", "--all"])
+
+    assert calls[0].semi is True
+    assert calls[0].search is None
+
+
+def test_main_tag_search_long_flag_parses(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_tag", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["tag", "--auto", "--all", "--search", "live"])
+
+    assert calls[0].search == "live"
+    assert calls[0].specific is None
+
+
+def test_main_rejects_tag_search_with_specific(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["tag", "--search", "x", "--specific", "album"])
+
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_main_tag_specific_requires_tty_even_with_auto_all(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["tag", "--auto", "--all", "--specific", "album"])
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_tag_search_auto_all_runs_without_tty(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_tag", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["tag", "--auto", "--all", "--search", "live"])
+
+    assert len(calls) == 1
+    assert calls[0].search == "live"
+
+
+def test_main_modify_search_still_requires_tty(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["modify", "--search", "x"])
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_cli_parses_dedupe_flags(monkeypatch):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_dedupe", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["dedupe", "--dry-run", "--artists"])
+
+    assert calls[0].dry_run is True
+    assert calls[0].artists is True
+    assert calls[0].albums is False
+
+
+def test_cli_dedupe_requires_tty(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["dedupe"])
+
+    assert exc.value.code == 1
+    assert "interactive terminal" in capsys.readouterr().err
+
+
+def test_cmd_download_reports_permanently_dropped_videos(
+    monkeypatch, app_settings, capsys
+):
+    import smclipy.cli as cli
+
+    app_settings.max_download_attempts = 1
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    monkeypatch.setattr(cli, "scan_library", lambda: None)
+    monkeypatch.setattr(cli, "prompt_resume", lambda: False)
+    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a"])
+    monkeypatch.setattr(
+        cli, "process_video", lambda vid, authors, **kwargs: SaveResult.FAILED
+    )
+
+    cli.cmd_download(argparse.Namespace())
+
+    out = capsys.readouterr().out
+    assert "permanently dropped" in out
+    assert "still pending for a retry" not in out
+    assert db.get_pending_urls() == []
+    assert db.get_failed_urls() == ["vid-a"]
+
+
+def test_cmd_crop_does_not_crop_when_backup_fails(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+    crop = Mock()
+    monkeypatch.setattr(cli, "crop_image_1_to_1", crop)
+    monkeypatch.setattr(cli, "backup_cover", lambda path: False)
+
+    cmd_crop(argparse.Namespace())
+
+    # Cropping is in place, so without a backup it must be skipped entirely.
+    crop.assert_not_called()
+    change_cover.assert_not_called()
+    assert "could not back up" in capsys.readouterr().out
+
+
+def test_cmd_crop_does_not_record_cropped_when_reembed_fails(
+    monkeypatch, app_settings, capsys
+):
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    change_cover = Mock(return_value=False)
+    _patch_crop_flow(monkeypatch, change_cover)
+
+    cmd_crop(argparse.Namespace())
+
+    assert change_cover.call_count == 1
+    assert "could not re-embed" in capsys.readouterr().out
+    row = db.get_song_by_path("Artist-Song.mp3")
+    assert row is not None
+    assert row[0]["cover_status"] != db.COVER_STATUS_CROPPED

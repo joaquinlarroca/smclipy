@@ -1,5 +1,6 @@
 import io
 import os
+import shutil
 from unittest.mock import Mock
 
 from mutagen.easyid3 import EasyID3
@@ -7,6 +8,7 @@ from mutagen.id3 import APIC, ID3
 from PIL import Image
 
 import smclipy.db as db
+import smclipy.metadata as metadata
 from smclipy.formats import Track
 from smclipy.metadata import (
     SaveResult,
@@ -22,6 +24,7 @@ from smclipy.metadata import (
     list_snapshots,
     read_song_profile,
     read_song_uuid,
+    rename_cover_stem,
     restore_song_from_snapshot,
     save_all_covers,
     save_image,
@@ -209,6 +212,94 @@ def test_scan_library_marks_missing_songs(app_settings):
     assert {e["event"] for e in db.get_events(song_uuid)} == {"appeared", "missing"}
 
 
+def test_scan_library_assigns_new_uuid_to_duplicate(app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    first = music / "A-Song.mp3"
+    second = music / "B-Song.mp3"
+    write_tagged_mp3(first, title="Song", artist="Artist A")
+    write_tagged_mp3(second, title="Song", artist="Artist A")
+    shared_uuid = "11111111-1111-1111-1111-111111111111"
+    write_song_uuid(first, shared_uuid)
+    write_song_uuid(second, shared_uuid)
+
+    scan_library()
+
+    assert read_song_uuid(first) == shared_uuid
+    assert read_song_uuid(second) != shared_uuid
+    assert len(db.list_songs()) == 2
+    assert "duplicate tracking UUID" in capsys.readouterr().err
+
+
+def test_scan_library_keeps_recorded_path_when_a_copy_sorts_first(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    original = music / "B-Song.mp3"
+    write_tagged_mp3(original, title="Song", artist="Artist A")
+    scan_library()
+    song_uuid = read_song_uuid(original)
+    assert song_uuid is not None
+
+    copy = music / "A-Song.mp3"
+    shutil.copyfile(original, copy)
+    assert read_song_uuid(copy) == song_uuid
+
+    scan_library()
+
+    assert read_song_uuid(original) == song_uuid
+    assert read_song_uuid(copy) != song_uuid
+    assert db.get_song_by_uuid(song_uuid)["current_path"] == "B-Song.mp3"
+    assert len(db.list_songs()) == 2
+
+
+def test_recorded_title_treats_legacy_unknown_as_missing():
+    assert metadata._recorded_title("Unknown") == ""
+    assert metadata._recorded_title(None) == ""
+    assert metadata._recorded_title("Song") == "Song"
+
+
+def test_rename_cover_stem_keeps_colliding_extensions(app_settings, capsys):
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    (covers / "old.jpg").write_bytes(b"old")
+    (covers / "new.jpg").write_bytes(b"new")
+    (covers / "old.png").write_bytes(b"png")
+
+    renamed = rename_cover_stem(covers, "old", "new")
+
+    assert renamed == 1
+    assert (covers / "old.jpg").read_bytes() == b"old"
+    assert (covers / "new.jpg").read_bytes() == b"new"
+    assert (covers / "new.png").read_bytes() == b"png"
+    assert not (covers / "old.png").exists()
+    assert "already exists" in capsys.readouterr().err
+    assert rename_cover_stem(covers, "new", "new") == 0
+
+
+def test_scan_library_restores_missing_song_path(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    file = music / "A-Song.mp3"
+    write_tagged_mp3(file, title="Song", artist="Artist A")
+    scan_library()
+    song_uuid = read_song_uuid(file)
+    assert song_uuid is not None
+
+    file.unlink()
+    scan_library()
+    assert db.get_song_by_uuid(song_uuid)["current_path"] is None
+
+    write_tagged_mp3(file, title="Song", artist="Artist A")
+    write_song_uuid(file, song_uuid)
+    summary = scan_library()
+
+    assert summary == ScanSummary(added=0, renamed=0, missing=0, changed=1)
+    row = db.get_song_by_uuid(song_uuid)
+    assert row is not None
+    assert row["current_path"] == "A-Song.mp3"
+    assert "restored" in {e["event"] for e in db.get_events(song_uuid)}
+
+
 def test_scan_library_backfills_row_uuid_into_writable_file(app_settings):
     music = app_settings.music_folder
     music.mkdir(parents=True, exist_ok=True)
@@ -318,6 +409,27 @@ def test_save_all_covers_skips_untagged_and_saves_tagged(app_settings):
     cover = app_settings.covers_folder / "Artist A-Song.png"
     assert cover.is_file()
     assert cover.read_bytes() == make_png_bytes()
+
+
+def test_save_all_covers_uses_filename_stem_for_untitled_song(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    app_settings.covers_folder.mkdir(parents=True, exist_ok=True)
+    tagged = music / "Artist A-Song.mp3"
+    write_tagged_mp3(tagged, title="Song", artist="Artist A")
+    untitled = EasyID3(tagged)
+    del untitled["title"]
+    untitled.save()
+    img = ID3(tagged)
+    img.add(
+        APIC(encoding=3, mime="image/png", type=3, desc="Cover", data=make_png_bytes())
+    )
+    img.save()
+
+    save_all_covers()
+
+    assert (app_settings.covers_folder / "Artist A-Song.png").is_file()
+    assert not (app_settings.covers_folder / "Artist A-Artist A-Song.png").exists()
 
 
 def test_save_all_covers_uses_real_format_extension(app_settings):
@@ -1036,3 +1148,46 @@ def test_save_image_changed_cover_backs_up_previous(app_settings, tmp_path):
     assert (app_settings.backups_folder / "covers" / "A-Song.png").is_file()
     backed = app_settings.backups_folder / "covers" / "A-Song.png"
     assert backed.read_bytes() == b"old-bytes"
+
+
+def test_library_target_path_caps_long_titles(app_settings, tmp_path):
+    source = tmp_path / "temp.mp3"
+    source.write_bytes(MINIMAL_MP3)
+
+    target = metadata.library_target_path(source, "x" * 400, ["Artist"])
+
+    assert target is not None
+    assert target.parent == app_settings.music_folder
+    # The whole component (stem + extension) must stay under the usual 255-byte
+    # filesystem limit, otherwise the move fails and the download is retried.
+    assert len(target.name.encode("utf-8")) <= 255
+    assert target.name.endswith(".mp3")
+
+
+def test_library_target_path_falls_back_for_invalid_names(app_settings, tmp_path):
+    source = tmp_path / "temp.mp3"
+    source.write_bytes(MINIMAL_MP3)
+
+    target = metadata.library_target_path(source, "///", ["..."])
+
+    assert target is not None
+    assert target.name == "Unknown.mp3"
+
+
+def test_apply_tag_update_rejects_missing_image(app_settings, tmp_path, capsys):
+    path = tmp_path / "Song.mp3"
+    write_tagged_mp3(path, title="Foo")
+
+    assert apply_tag_update(path, title="New", image=tmp_path / "missing.png") is False
+
+    assert "does not exist" in capsys.readouterr().err
+    assert str(ID3(path)["TIT2"]) == "Foo"
+
+
+def test_change_cover_missing_image_returns_false(tmp_path, capsys):
+    path = tmp_path / "Song.mp3"
+    write_tagged_mp3(path)
+
+    assert change_cover(tmp_path / "missing.png", path) is False
+
+    assert "does not exist" in capsys.readouterr().err

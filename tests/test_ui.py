@@ -167,10 +167,17 @@ def test_prompt_match_selection_invalid_value_skips(monkeypatch):
 
 def test_collect_tag_changes_only_changed_fields():
     current = {"title": "Old", "artists": "One", "album": "A"}
-    intended = {"title": "New", "artists": "One", "album": "A", "date": "2001"}
+    intended = {
+        "title": "New",
+        "artists": "One",
+        "album": "A",
+        "date": "2001",
+        "genre": "Rock",
+    }
     assert ui.collect_tag_changes(current, intended) == [
         ("title", "Old", "New"),
         ("date", "", "2001"),
+        ("genre", "", "Rock"),
     ]
 
 
@@ -255,3 +262,41 @@ def test_prompt_field_value_no_default_no_suffix(monkeypatch):
 
     monkeypatch.setattr(ui, "prompt", fake_prompt)
     assert ui.prompt_field_value("Genre") == ""
+
+
+def test_prompt_canonical_spelling_builds_merge_dialog(monkeypatch):
+    captured = {}
+
+    class FakeApp:
+        def run(self):
+            return "Artist"
+
+    def fake_dialog(**kwargs):
+        captured.update(kwargs)
+        return FakeApp()
+
+    monkeypatch.setattr(ui, "radiolist_dialog", fake_dialog)
+
+    result = ui.prompt_canonical_spelling(
+        "artist 'artist'", [("Artist", 2), ("artist", 1)], "Artist"
+    )
+
+    assert result == "Artist"
+    assert captured["values"] == [
+        ("Artist", "Artist  (2 songs)"),
+        ("artist", "artist  (1 song)"),
+    ]
+    assert captured["default"] == "Artist"
+    assert captured["ok_text"] == "Merge"
+    assert captured["cancel_text"] == "Skip"
+    assert "artist 'artist'" in captured["title"]
+
+
+def test_prompt_canonical_spelling_returns_none_when_skipped(monkeypatch):
+    class FakeApp:
+        def run(self):
+            return None
+
+    monkeypatch.setattr(ui, "radiolist_dialog", lambda **kwargs: FakeApp())
+
+    assert ui.prompt_canonical_spelling("album 'x'", [("X", 1), ("x", 1)], "X") is None

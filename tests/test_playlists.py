@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 
 import pytest
 
@@ -574,3 +575,63 @@ def test_cmd_playlist_show_json_marks_missing(app_settings, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["songs"][0]["missing"] is True
     assert payload["songs"][0]["path"] is None
+
+
+def test_serialize_m3u_flattens_multiline_labels(app_settings, tmp_path):
+    row = _song_row("Artist-Song.mp3", "Song\n#EXTINF:-1,Evil", "Artist")
+
+    text = pl.serialize_m3u("P", [row], tmp_path, app_settings.music_folder)
+
+    lines = text.splitlines()
+    assert len(lines) == 3
+    assert lines[1] == "#EXTINF:-1,Artist - Song #EXTINF:-1,Evil"
+
+
+def test_serialize_json_uses_export_dir_relative_paths(app_settings, tmp_path):
+    row = _song_row("Artist-Song.mp3")
+    export_dir = tmp_path / "lists"
+
+    data = json.loads(
+        pl.serialize_json("P", [row], app_settings.music_folder, export_dir=export_dir)
+    )
+
+    expected = os.path.relpath(
+        app_settings.music_folder / "Artist-Song.mp3", export_dir
+    )
+    assert data["songs"][0]["path"] == expected
+
+
+def test_cmd_playlist_export_json_is_relative_to_exported_file(app_settings, tmp_path):
+    song_uuid = db.insert_song(current_path="Artist-Song.mp3", title="Song")
+    db.create_playlist("P")
+    db.add_song_to_playlist("P", song_uuid)
+    out = tmp_path / "exports" / "p.json"
+
+    pl.cmd_playlist_export(
+        argparse.Namespace(name="P", format="json", output=str(out), absolute=False)
+    )
+
+    expected = os.path.relpath(
+        app_settings.music_folder / "Artist-Song.mp3", out.parent
+    )
+    assert json.loads(out.read_text())["songs"][0]["path"] == expected
+
+
+def test_cmd_playlist_import_replace_refuses_to_wipe_existing(
+    monkeypatch, app_settings, tmp_path, capsys
+):
+    keep_uuid = db.insert_song(current_path="Keep.mp3", title="Keep")
+    db.create_playlist("Mix")
+    db.add_song_to_playlist("Mix", keep_uuid)
+    monkeypatch.setattr(pl, "scan_library", lambda: None)
+    file_ = tmp_path / "ghost.m3u"
+    file_.write_text("missing-one.mp3\nmissing-two.mp3\n")
+
+    with pytest.raises(SystemExit) as excinfo:
+        pl.cmd_playlist_import(
+            argparse.Namespace(file=str(file_), name="Mix", replace=True)
+        )
+
+    assert excinfo.value.code == 1
+    assert [row["uuid"] for row in db.get_playlist_songs("Mix")] == [keep_uuid]
+    assert "refusing to replace" in capsys.readouterr().err

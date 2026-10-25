@@ -10,9 +10,9 @@ from mutagen.id3 import ID3, TALB, TIT2, TPE1
 from PIL import Image
 
 import smclipy.db as db
-from smclipy import tag
+from smclipy import search, tag
 from smclipy.metadata import has_cover, read_song_uuid, scan_library
-from smclipy.musicbrainz import MusicBrainzMatch
+from smclipy.musicbrainz import CoverArtUnavailable, MusicBrainzMatch
 
 MINIMAL_MP3 = (bytes.fromhex("FFFB9064") + bytes(413)) * 2
 
@@ -71,6 +71,18 @@ def test_enabled_fields_only_valid_and_configured(app_settings):
     assert tag._enabled_fields() == {"cover", "title"}
 
 
+def test_search_query_falls_back_to_file_stem_for_untagged(app_settings):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    file = music / "My Song.mp3"
+    file.write_bytes(MINIMAL_MP3)
+
+    song = tag.LibrarySong(file)
+
+    assert song.current["title"] == ""
+    assert tag._search_query(song) == ("My Song", [], None)
+
+
 def test_intend_title_only_when_changed_and_enabled(app_settings):
     app_settings.tag_fields = ["title"]
     match = a_match(title="New Title")
@@ -108,6 +120,16 @@ def test_intend_album_and_date(app_settings):
     assert tag._intend_album(match, {"album": "Old"}) == "New"
     assert tag._intend_album(match, {"album": "New"}) is None
     assert tag._intend_date(match, {"date": ""}) == "1990"
+
+
+def test_intend_genre_only_when_changed_and_enabled(app_settings):
+    app_settings.tag_fields = ["genre"]
+    match = a_match(genre="progressive rock; rock")
+    assert tag._intend_genre(match, {"genre": ""}) == "progressive rock; rock"
+    assert tag._intend_genre(match, {"genre": "progressive rock; rock"}) is None
+    assert tag._intend_genre(a_match(), {"genre": ""}) is None
+    app_settings.tag_fields = ["title"]
+    assert tag._intend_genre(match, {"genre": ""}) is None
 
 
 def test_intend_album_skips_when_equal_to_title(app_settings):
@@ -177,6 +199,28 @@ def test_process_song_records_skipped_status(monkeypatch, app_settings):
     assert row["musicbrainz_status"] == "skipped"
 
 
+def test_process_song_no_enabled_fields_does_not_mark_tagged(monkeypatch, app_settings):
+    app_settings.tag_fields = []
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-Song.mp3", title="Song", artist="Artist", album="Album"
+    )
+    scan_library()
+    song = tag.LibrarySong(music / "Artist-Song.mp3")
+    assert song.uuid is not None
+
+    def fail_search(*_args, **_kwargs):
+        raise AssertionError("should not search with no enabled fields")
+
+    monkeypatch.setattr(tag, "search_recordings", fail_search)
+
+    assert tag.process_song(song) is False
+    row = db.get_song_by_uuid(song.uuid)
+    assert row["tagged"] == 0
+    assert row["musicbrainz_status"] is None
+
+
 def test_process_song_perfect_match_marks_tagged(monkeypatch, app_settings):
     app_settings.tag_fields = ["title", "artists", "album"]
     music = app_settings.music_folder
@@ -238,6 +282,62 @@ def test_process_song_applies_changes(monkeypatch, app_settings, tmp_path):
     assert str(id3["TIT2"]) == "New Title"
     assert str(id3["TALB"]) == "New Album"
     assert str(id3["TDRC"]) == "1984"
+
+
+def test_process_song_applies_genre_and_reports_it(monkeypatch, app_settings):
+    app_settings.tag_fields = ["genre"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-Old.mp3", title="Old", artist="Artist", album="Album"
+    )
+    scan_library()
+
+    called = []
+    monkeypatch.setattr(tag, "search_recordings", lambda *a, **k: [a_match()])
+    monkeypatch.setattr(
+        tag,
+        "fetch_genre",
+        lambda rg, rec: called.append((rg, rec)) or "progressive rock; rock",
+    )
+    report: list[dict[str, Any]] = []
+    song = tag.LibrarySong(music / "Artist-Old.mp3")
+
+    assert tag.process_song(song, mode="auto", report=report) is True
+
+    assert called == [("rg-1", "rec-1")]
+    id3 = ID3(music / "Artist-Old.mp3")
+    assert str(id3["TCON"]) == "progressive rock; rock"
+    assert song.uuid is not None
+    assert db.get_song_by_uuid(song.uuid)["genre"] == "progressive rock; rock"
+    assert report[0]["outcome"] == "applied"
+    assert report[0]["fields"] == ["genre"]
+
+
+def test_process_song_skips_when_genre_fetch_fails(monkeypatch, app_settings):
+    app_settings.tag_fields = ["genre"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-Old.mp3", title="Old", artist="Artist", album="Album"
+    )
+    scan_library()
+
+    monkeypatch.setattr(tag, "search_recordings", lambda *a, **k: [a_match()])
+    monkeypatch.setattr(tag, "fetch_genre", lambda rg, rec: None)
+    report: list[dict[str, Any]] = []
+    song = tag.LibrarySong(music / "Artist-Old.mp3")
+
+    assert tag.process_song(song, mode="auto", report=report) is False
+
+    assert report[0]["outcome"] == "unavailable"
+    assert ID3(music / "Artist-Old.mp3").get("TCON") is None
+    assert song.uuid is not None
+    row = db.get_song_by_uuid(song.uuid)
+    # The match itself is recorded (the recording ids are useful), but the
+    # song is left untagged so the next run retries the missing genre.
+    assert row["musicbrainz_status"] == db.MB_STATUS_TAGGED
+    assert not row["tagged"]
 
 
 def test_process_song_persists_authors_and_mb_status(
@@ -689,7 +789,9 @@ def test_apply_unselected_artists_preserve_file_and_db(app_settings, tmp_path):
     scan_library()
     song_uuid = read_song_uuid(path)
     assert song_uuid is not None
-    assert db.get_song_by_uuid(song_uuid)["artists"] == "Ace\\Hyde"
+    # The database stores the joined (escaped) form so split_authors can
+    # recover the raw artist name later.
+    assert db.get_song_by_uuid(song_uuid)["artists"] == "Ace\\\\Hyde"
 
     tag._apply(
         tag.LibrarySong(path),
@@ -702,7 +804,7 @@ def test_apply_unselected_artists_preserve_file_and_db(app_settings, tmp_path):
     assert id3["TPE1"].text == ["Ace\\Hyde"]
     row = db.get_song_by_uuid(song_uuid)
     assert row["title"] == "New"
-    assert row["artists"] == "Ace\\Hyde"
+    assert row["artists"] == "Ace\\\\Hyde"
 
 
 def test_process_song_keeps_existing_artist_spelling(
@@ -897,8 +999,11 @@ def test_cmd_tag_json_reports_crashed_song(monkeypatch, app_settings, capsys):
     monkeypatch.setattr(tag, "scan_library", lambda: None)
     monkeypatch.setattr(tag, "process_song", Mock(side_effect=RuntimeError("boom")))
 
-    tag.cmd_tag(argparse.Namespace(auto=True, all=True, json=True))
+    # The JSON report is still emitted, but a crashed song is a failed run.
+    with pytest.raises(SystemExit) as excinfo:
+        tag.cmd_tag(argparse.Namespace(auto=True, all=True, json=True))
 
+    assert excinfo.value.code == 1
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert payload["updated"] == 0
@@ -1026,3 +1131,191 @@ def test_cmd_tag_max_age_invalid_exits(monkeypatch, app_settings, capsys):
 
     with pytest.raises(SystemExit):
         tag.cmd_tag(argparse.Namespace(auto=True, all=True, max_age="bogus"))
+
+
+def test_cmd_tag_search_filters_songs(monkeypatch, app_settings, capsys):
+    app_settings.tag_fields = ["title"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="A", album="First")
+    write_tagged_mp3(music / "Artist-Two.mp3", title="Two", artist="B", album="Second")
+    seen: dict[str, int] = {}
+
+    def fake_selection(count):
+        seen["count"] = count
+        return [0]
+
+    monkeypatch.setattr(tag, "scan_library", lambda: None)
+    monkeypatch.setattr(tag, "prompt_song_selection", fake_selection)
+    monkeypatch.setattr(
+        tag, "search_recordings", lambda *a, **k: [a_match(title="Two New")]
+    )
+    monkeypatch.setattr(tag, "prompt_match_selection", lambda *a, **k: 0)
+    monkeypatch.setattr(tag, "prompt_tag_changes", lambda *a, **k: ["title"])
+    monkeypatch.setattr(tag, "fetch_cover_art", lambda *a, **k: None)
+
+    tag.cmd_tag(argparse.Namespace(search="second"))
+
+    out = capsys.readouterr().out
+    assert "Showing 1 of 2 song(s) matching 'second'." in out
+    assert "Matching songs:" in out
+    assert seen["count"] == 1
+    assert str(ID3(music / "Artist-Two.mp3")["TIT2"]) == "Two New"
+    assert str(ID3(music / "Artist-One.mp3")["TIT2"]) == "One"
+
+
+def test_cmd_tag_specific_autocompletes_and_filters(monkeypatch, app_settings, capsys):
+    app_settings.tag_fields = ["title"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="A", album="First")
+    write_tagged_mp3(music / "Artist-Two.mp3", title="Two", artist="B", album="Second")
+    prompts: list[tuple[str, list[str]]] = []
+
+    def fake_prompt(label, values, default=""):
+        prompts.append((label, values))
+        return "second"
+
+    monkeypatch.setattr(search, "prompt_search_value", fake_prompt)
+    monkeypatch.setattr(tag, "scan_library", lambda: None)
+    monkeypatch.setattr(
+        tag, "search_recordings", lambda *a, **k: [a_match(title="Two New")]
+    )
+    monkeypatch.setattr(tag, "fetch_cover_art", lambda *a, **k: None)
+
+    tag.cmd_tag(argparse.Namespace(auto=True, all=True, specific="album"))
+
+    out = capsys.readouterr().out
+    assert prompts == [("Album", ["First", "Second"])]
+    assert "Showing 1 of 2 song(s) with album 'second'." in out
+    assert "Updated 1 song(s)" in out
+    assert str(ID3(music / "Artist-Two.mp3")["TIT2"]) == "Two New"
+    assert str(ID3(music / "Artist-One.mp3")["TIT2"]) == "One"
+
+
+def test_cmd_tag_search_no_matches_emits_empty_json(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="A", album="First")
+    monkeypatch.setattr(tag, "scan_library", lambda: None)
+
+    tag.cmd_tag(argparse.Namespace(auto=True, all=True, json=True, search="zzz"))
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"updated": 0, "skipped": 0, "songs": []}
+    assert "No songs match 'zzz'." in captured.err
+
+
+def test_cmd_tag_blank_search_reports_error(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="A", album="First")
+    monkeypatch.setattr(tag, "scan_library", lambda: None)
+
+    # A blank filter is a usage error, so the command exits non-zero instead
+    # of reporting an empty (successful-looking) run.
+    with pytest.raises(SystemExit) as excinfo:
+        tag.cmd_tag(argparse.Namespace(auto=True, all=True, json=True, search="   "))
+
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert "--search needs non-empty text" in captured.err
+
+
+def test_process_song_keeps_song_queued_when_cover_fetch_fails(
+    monkeypatch, app_settings
+):
+    app_settings.tag_fields = ["title", "cover"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-New-Title.mp3", title="New Title", artist="Artist")
+    scan_library()
+
+    monkeypatch.setattr(
+        tag, "search_recordings", lambda *a, **k: [a_match(title="New Title")]
+    )
+    monkeypatch.setattr(
+        tag,
+        "fetch_cover_art",
+        Mock(side_effect=CoverArtUnavailable("network down")),
+    )
+    report: list[dict[str, Any]] = []
+    song = tag.LibrarySong(music / "Artist-New-Title.mp3")
+
+    assert tag.process_song(song, mode="auto", report=report) is False
+
+    # The rest of the match still applies, but the song must stay queued so
+    # the missing cover is retried instead of being lost forever.
+    row = db.get_song_by_uuid(song.uuid)
+    assert row["tagged"] == 0
+    assert report[0]["outcome"] == "unavailable"
+    assert "cover" not in report[0]["fields"]
+
+
+def test_process_song_applies_fields_but_retries_cover_on_next_run(
+    monkeypatch, app_settings
+):
+    app_settings.tag_fields = ["title", "cover"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-Old.mp3", title="Old", artist="Artist")
+    scan_library()
+
+    monkeypatch.setattr(
+        tag, "search_recordings", lambda *a, **k: [a_match(title="New Title")]
+    )
+    monkeypatch.setattr(
+        tag, "fetch_cover_art", Mock(side_effect=CoverArtUnavailable("rate limited"))
+    )
+    report: list[dict[str, Any]] = []
+    song = tag.LibrarySong(music / "Artist-Old.mp3")
+
+    assert tag.process_song(song, mode="auto", report=report) is True
+
+    assert str(ID3(music / "Artist-Old.mp3")["TIT2"]) == "New Title"
+    assert not has_cover(music / "Artist-Old.mp3")
+    row = db.get_song_by_uuid(song.uuid)
+    assert row["title"] == "New Title"
+    assert row["tagged"] == 0
+    assert report[0]["outcome"] == "applied"
+    assert report[0]["fields"] == ["title"]
+
+
+def test_process_song_marks_tagged_when_release_has_no_cover(monkeypatch, app_settings):
+    app_settings.tag_fields = ["title", "cover"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-Old.mp3", title="Old", artist="Artist")
+    scan_library()
+
+    monkeypatch.setattr(
+        tag, "search_recordings", lambda *a, **k: [a_match(title="New Title")]
+    )
+    # None means "this release genuinely has no cover" (a 404), which is
+    # final: the song must not be retried forever.
+    monkeypatch.setattr(tag, "fetch_cover_art", lambda *a, **k: None)
+    song = tag.LibrarySong(music / "Artist-Old.mp3")
+
+    assert tag.process_song(song, mode="auto") is True
+
+    row = db.get_song_by_uuid(song.uuid)
+    assert row["tagged"] == 1
+    assert row["musicbrainz_status"] == "tagged"
+
+
+def test_apply_round_trips_artist_names_with_commas(app_settings):
+    app_settings.tag_fields = ["artists"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-Song.mp3", title="Song", artist="Artist")
+    scan_library()
+
+    song = tag.LibrarySong(music / "Artist-Song.mp3")
+    assert tag._apply(song, a_match(artists=["Earth, Wind & Fire"]), None)
+
+    # One artist whose name contains a comma must survive the tag write and the
+    # database round-trip instead of turning into two artists.
+    assert ID3(music / "Artist-Song.mp3")["TPE1"].text == ["Earth, Wind & Fire"]
+    row = db.get_song_by_path("Artist-Song.mp3")
+    assert row is not None
+    assert row[0]["artists"] == "Earth\\, Wind & Fire"

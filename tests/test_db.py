@@ -315,9 +315,11 @@ def test_requeue_marks_url_failed_after_max_attempts(app_settings):
     import sqlite3
 
     db.reset_queue(["A"])
+    assert app_settings.max_download_attempts == 3
     db.requeue(["A"])
     db.requeue(["A"])
-    db.requeue(["A"])
+    # `max_download_attempts` counts total tries, not retries: after the
+    # second failure a third try remains.
     assert db.get_pending_urls() == ["A"]
     assert db.get_failed_urls() == []
 
@@ -331,7 +333,7 @@ def test_requeue_marks_url_failed_after_max_attempts(app_settings):
             "SELECT status, attempts, last_error FROM queue WHERE url = 'A'"
         ).fetchone()
     assert row["status"] == db.QUEUE_FAILED
-    assert row["attempts"] == 4
+    assert row["attempts"] == 3
     assert row["last_error"] == "HTTP Error 404"
 
 
@@ -341,9 +343,7 @@ def test_requeue_honors_custom_max_download_attempts(app_settings):
     app_settings.max_download_attempts = 1
     db.reset_queue(["A"])
 
-    db.requeue(["A"])
-    assert db.get_pending_urls() == ["A"]
-
+    # A limit of one means one try only: the first failure is final.
     db.requeue(["A"])
     assert db.get_pending_urls() == []
     assert db.get_failed_urls() == ["A"]
@@ -356,12 +356,34 @@ def test_reset_queue_recovers_permanently_failed_url(app_settings):
     app_settings.max_download_attempts = 1
     db.reset_queue(["A"])
     db.requeue(["A"])
-    db.requeue(["A"])
     assert db.get_failed_urls() == ["A"]
 
     db.reset_queue(["A"])
     assert db.get_pending_urls() == ["A"]
     assert db.get_failed_urls() == []
+
+
+def test_reset_queue_gives_failed_url_a_fresh_retry_budget(app_settings):
+    import sqlite3
+
+    app_settings.max_download_attempts = 2
+    db.reset_queue(["A"])
+    db.requeue(["A"])
+    db.requeue(["A"])
+    assert db.get_failed_urls() == ["A"]
+
+    db.reset_queue(["A"])
+    with sqlite3.connect(app_settings.db_path) as conn:
+        attempts = conn.execute(
+            "SELECT attempts FROM queue WHERE url = 'A'"
+        ).fetchone()[0]
+    assert attempts == 0
+
+    # The refreshed budget allows the full number of tries again.
+    db.requeue(["A"])
+    assert db.get_pending_urls() == ["A"]
+    db.requeue(["A"])
+    assert db.get_failed_urls() == ["A"]
 
 
 def test_playlist_crud(app_settings):

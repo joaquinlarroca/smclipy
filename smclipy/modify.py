@@ -14,7 +14,7 @@ from PIL import Image
 
 import smclipy.db as db
 from smclipy.config import init
-from smclipy.helpers import distinct_authors, split_authors
+from smclipy.helpers import distinct_authors, join_authors, split_authors
 from smclipy.metadata import (
     apply_tag_update,
     has_cover,
@@ -22,6 +22,7 @@ from smclipy.metadata import (
     scan_library,
     snapshot_song,
 )
+from smclipy.search import apply_filters
 from smclipy.tag import LibrarySong, list_library_songs
 from smclipy.ui import (
     TAG_FIELD_LABELS,
@@ -50,7 +51,7 @@ def _resolve_text(raw: str, default_shown: str) -> str | None:
     """Interpret a text-field answer: None keeps, "" clears, str sets."""
     if raw == default_shown:
         return None
-    if raw == CLEAR_TOKEN:
+    if raw.strip() == CLEAR_TOKEN:
         return ""
     if not raw.strip():
         return None
@@ -61,7 +62,7 @@ def _resolve_artists(raw: str, default_shown: str) -> list[str] | None:
     """Interpret an artist answer: None keeps, [] clears, list sets."""
     if raw == default_shown:
         return None
-    if raw == CLEAR_TOKEN:
+    if raw.strip() == CLEAR_TOKEN:
         return []
     artists: list[str] = split_authors(raw)
     if not artists:
@@ -96,9 +97,9 @@ def prompt_cover() -> Path | str | None:
     )
     if not raw.strip():
         return None
-    if raw == CLEAR_TOKEN:
+    if raw.strip() == CLEAR_TOKEN:
         return "remove"
-    path: Path = Path(raw.strip())
+    path: Path = Path(raw.strip()).expanduser()
     return path if _valid_cover_image(path) else None
 
 
@@ -152,6 +153,11 @@ def _edit_song(
     removing: bool = cover_action == "remove"
     replacing: bool = isinstance(cover_action, Path)
     if not changed_fields and not replacing and not (removing and song.has_cover):
+        # `--reset-mb` asks for a retag even when the user retyped the same
+        # values, so it must still take effect when nothing changed.
+        if reset_mb and song.uuid is not None:
+            db.reset_mb_status(song.uuid)
+            db.log_event(song.uuid, "musicbrainz", {"status": "reset"})
         return set()
 
     # Record the pre-change profile so a mistaken edit can be undone with the
@@ -197,7 +203,9 @@ def _edit_song(
         db.update_song_metadata(
             song.uuid,
             title=title if "title" in changed_fields else None,
-            artists=", ".join(artists or []) if "artists" in changed_fields else None,
+            artists=(
+                join_authors(artists or []) if "artists" in changed_fields else None
+            ),
             album=album if "album" in changed_fields else None,
             date=date if "date" in changed_fields else None,
             genre=genre if "genre" in changed_fields else None,
@@ -233,8 +241,15 @@ def cmd_modify(args: object) -> None:
         print("No audio files found in the library to modify.")
         return
 
-    print(f"Found {len(songs)} audio file(s) in the library.")
-    print("\nSongs in your library:")
+    songs, filtered = apply_filters(songs, args)
+    if not songs:
+        return
+
+    if filtered:
+        print(f"Found {len(songs)} matching audio file(s).")
+    else:
+        print(f"Found {len(songs)} audio file(s) in the library.")
+    print("\nMatching songs:" if filtered else "\nSongs in your library:")
     for index, song in enumerate(songs, start=1):
         line: str = song.display_name
         album: str = song.current.get("album", "")
@@ -303,6 +318,11 @@ def cmd_modify(args: object) -> None:
             print(f"[{position}/{total}] Updated '{target.path.name}'.")
         elif changed is None:
             print(f"[{position}/{total}] Could not modify '{target.path.name}'.")
+        elif reset_mb and target.uuid is not None:
+            print(
+                f"[{position}/{total}] '{target.path.name}' already matched; "
+                "MusicBrainz status reset."
+            )
         else:
             print(f"[{position}/{total}] '{target.path.name}' needs no changes.")
     print(f"\nDone. Updated {updated} song(s).")
