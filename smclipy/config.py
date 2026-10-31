@@ -17,8 +17,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "clean_unwanted_tags": False,
     "audio_format": "mp3",
     "max_download_attempts": 3,
+    "max_backups": -1,
     "cookies": "",
     "cookies_from_browser": "",
+    "source_preferences": ["youtube", "soundcloud"],
     "tag_fields": [
         "title",
         "artists",
@@ -30,6 +32,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cover",
     ],
 }
+
+SOURCE_PROVIDER_ALIASES: dict[str, str] = {
+    "youtube": "youtube",
+    "yt": "youtube",
+    "soundcloud": "soundcloud",
+    "sc": "soundcloud",
+}
+SOURCE_PROVIDERS: tuple[str, ...] = ("youtube", "soundcloud")
+DEFAULT_SOURCE_PREFERENCES: list[str] = ["youtube", "soundcloud"]
 
 COVER_FIELD = "cover"
 TAG_FIELDS: frozenset[str] = frozenset(
@@ -170,6 +181,33 @@ class Settings:
                 file=sys.stderr,
             )
         self.max_download_attempts: int = parsed_attempts
+        raw_backups = raw.get("max_backups", -1)
+        if isinstance(raw_backups, bool):
+            raw_backups = -1
+            print(
+                "Warning: 'max_backups' must be -1 (unlimited) or a positive "
+                "integer, using -1",
+                file=sys.stderr,
+            )
+        try:
+            if isinstance(raw_backups, float) and raw_backups != int(raw_backups):
+                raise ValueError
+            parsed_backups = int(raw_backups)
+        except (TypeError, ValueError):
+            parsed_backups = -1
+            print(
+                "Warning: 'max_backups' must be -1 (unlimited) or a positive "
+                "integer, using -1",
+                file=sys.stderr,
+            )
+        if parsed_backups == 0 or parsed_backups < -1:
+            parsed_backups = -1
+            print(
+                "Warning: 'max_backups' must be -1 (unlimited) or a positive "
+                "integer, using -1",
+                file=sys.stderr,
+            )
+        self.max_backups: int = parsed_backups
         raw_cookies = raw.get("cookies", "")
         if not isinstance(raw_cookies, str):
             raw_cookies = ""
@@ -223,6 +261,41 @@ class Settings:
                 file=sys.stderr,
             )
         self.cookies_from_browser: str = browser_value
+        raw_sources = raw.get("source_preferences", DEFAULT_SOURCE_PREFERENCES)
+        if not isinstance(raw_sources, list):
+            print(
+                "Warning: 'source_preferences' must be a list of providers "
+                f"({', '.join(SOURCE_PROVIDERS)}), using the default",
+                file=sys.stderr,
+            )
+            raw_sources = list(DEFAULT_SOURCE_PREFERENCES)
+        preferences: list[str] = []
+        for entry in raw_sources:
+            if not isinstance(entry, str):
+                print(
+                    "Warning: 'source_preferences' entries must be strings, "
+                    f"ignoring {entry!r}",
+                    file=sys.stderr,
+                )
+                continue
+            provider = SOURCE_PROVIDER_ALIASES.get(entry.strip().casefold())
+            if provider is None:
+                print(
+                    f"Warning: unknown source provider {entry!r}, ignoring it "
+                    f"(use {', '.join(SOURCE_PROVIDERS)})",
+                    file=sys.stderr,
+                )
+                continue
+            if provider not in preferences:
+                preferences.append(provider)
+        if not preferences:
+            print(
+                "Warning: 'source_preferences' has no valid providers, "
+                f"using the default ({', '.join(DEFAULT_SOURCE_PREFERENCES)})",
+                file=sys.stderr,
+            )
+            preferences = list(DEFAULT_SOURCE_PREFERENCES)
+        self.source_preferences: list[str] = preferences
 
 
 # Global settings singleton. This is a CLI: a single settings object lives for

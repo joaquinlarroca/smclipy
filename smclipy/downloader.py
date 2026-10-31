@@ -1,5 +1,6 @@
 import hashlib
 import re
+from dataclasses import dataclass
 from typing import Any, cast
 
 import yt_dlp as yt_dlp
@@ -23,6 +24,36 @@ class VideoDownloadError(Exception):
         self.video_id = video_id
         self.status_code = status_code
 
+
+class SourceSearchError(Exception):
+    """Raised when a source provider search fails."""
+
+
+@dataclass(frozen=True)
+class SourceCandidate:
+    """One search result that could become a song's download source."""
+
+    provider: str
+    title: str
+    uploader: str
+    duration: float | None
+    url: str
+
+
+SOURCE_DURATION_TOLERANCE = 2.0
+
+
+def matches_duration(candidate: SourceCandidate, song_duration: float | None) -> bool:
+    """Whether a candidate's length is close enough to the library song's."""
+    if song_duration is None or song_duration <= 0 or candidate.duration is None:
+        return False
+    return abs(candidate.duration - song_duration) <= SOURCE_DURATION_TOLERANCE
+
+
+SOURCE_SEARCH_PREFIXES: dict[str, str] = {
+    "youtube": "ytsearch",
+    "soundcloud": "scsearch",
+}
 
 _BENIGN_HOST_DELIMITERS = frozenset("([{<'\"" + "`=,;:")
 
@@ -252,6 +283,96 @@ def _yt_dlp_opts(stem: str) -> dict[str, Any]:
     elif s.cookies_from_browser:
         opts["cookiesfrombrowser"] = (s.cookies_from_browser,)
     return opts
+
+
+def _search_opts() -> dict[str, Any]:
+    s = settings()
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+    }
+    if s.cookies:
+        opts["cookiefile"] = s.cookies
+    elif s.cookies_from_browser:
+        opts["cookiesfrombrowser"] = (s.cookies_from_browser,)
+    return opts
+
+
+def _candidate_url(provider: str, entry: dict[str, Any]) -> str | None:
+    if provider == "youtube":
+        video_id = entry.get("id")
+        if isinstance(video_id, str) and re.fullmatch(r"[a-zA-Z0-9_-]{11}", video_id):
+            return f"https://www.youtube.com/watch?v={video_id}"
+    raw = entry.get("webpage_url") or entry.get("url")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    urls = extract_urls(raw)
+    if urls:
+        return urls[0]
+    if raw.startswith(("http://", "https://")):
+        return raw
+    return None
+
+
+def _candidate_from_entry(
+    provider: str, entry: dict[str, Any]
+) -> SourceCandidate | None:
+    title = entry.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return None
+    url = _candidate_url(provider, entry)
+    if url is None:
+        return None
+    raw_uploader = (
+        entry.get("uploader") or entry.get("channel") or entry.get("artist") or ""
+    )
+    uploader = raw_uploader.strip() if isinstance(raw_uploader, str) else ""
+    raw_duration = entry.get("duration")
+    duration = (
+        float(raw_duration)
+        if isinstance(raw_duration, (int, float)) and not isinstance(raw_duration, bool)
+        else None
+    )
+    return SourceCandidate(
+        provider=provider,
+        title=title.strip(),
+        uploader=uploader,
+        duration=duration,
+        url=url,
+    )
+
+
+def search_source(provider: str, query: str, limit: int = 5) -> list[SourceCandidate]:
+    """Search ``provider`` for ``query`` and return flat result candidates.
+
+    Uses yt-dlp's ``ytsearch``/``scsearch`` pseudo-URLs with flattened results
+    so no media is resolved or downloaded. Raises :class:`SourceSearchError`
+    for provider/transport failures; an empty list means no usable results.
+    """
+    prefix = SOURCE_SEARCH_PREFIXES.get(provider)
+    if prefix is None:
+        raise SourceSearchError(f"Unsupported source provider: '{provider}'")
+    if limit < 1 or not query.strip():
+        return []
+    search_url = f"{prefix}{limit}:{query.strip()}"
+    try:
+        with yt_dlp.YoutubeDL(_search_opts()) as ydl:
+            info = cast(dict[str, Any], ydl.extract_info(search_url, download=False))
+    except (yt_dlp.utils.YoutubeDLError, OSError) as exc:
+        if _contains_keyboard_interrupt(exc):
+            raise KeyboardInterrupt from exc
+        raise SourceSearchError(f"{provider} search failed: {exc}") from exc
+    entries = info.get("entries") if isinstance(info, dict) else None
+    candidates: list[SourceCandidate] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        candidate = _candidate_from_entry(provider, entry)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
 
 
 def download(url: str, stem: str = "temp") -> dict[str, Any]:

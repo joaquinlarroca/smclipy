@@ -1,7 +1,10 @@
 import argparse
 import json
+import shlex
 import sys
+import uuid
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 
 import smclipy.db as db
@@ -17,6 +20,7 @@ from smclipy.downloader import (
     get_author,
     temp_stem,
 )
+from smclipy.findsource import cmd_findsource
 from smclipy.formats import SUPPORTED_EXTENSIONS, audio_ext
 from smclipy.helpers import (
     distinct_authors,
@@ -48,7 +52,15 @@ from smclipy.metadata import (
     snapshot_song,
 )
 from smclipy.modify import cmd_modify
-from smclipy.playlists import cmd_playlist
+from smclipy.playlists import (
+    PlaylistSongMeta,
+    _index_songs,
+    _resolve_entry,
+    cmd_playlist,
+    entry_source_url,
+    parse_json_v2,
+    song_meta_from_entry,
+)
 from smclipy.restore import cmd_restore
 from smclipy.search import SPECIFIC_FIELDS
 from smclipy.stats import DEFAULT_TOP, cmd_stats
@@ -110,8 +122,20 @@ def _collect_batch(batch_file: Path) -> list[str]:
     return urls
 
 
+def _valid_song_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return True
+
+
 def process_video(
-    url: str, authors_list: list[str], *, no_prompt: bool = False
+    url: str,
+    authors_list: list[str],
+    *,
+    no_prompt: bool = False,
+    meta: PlaylistSongMeta | None = None,
 ) -> SaveResult:
     s: Settings = settings()
     stem: str = temp_stem(url)
@@ -143,7 +167,29 @@ def process_video(
     album: str
     artists: list[str]
     authors: str
-    if no_prompt:
+    extra_fields: dict[str, str] | None = None
+    if meta is not None:
+        title = meta.title or default_title or stem
+        if not meta.title and not default_title:
+            print(f"Warning: no title in video info, using '{stem}'.")
+        album = meta.album or get_album(info_dictionary)
+        source_artists: list[str] = meta.artists or get_author(info_dictionary)
+        if source_artists:
+            artists = resolve_known_authors(source_artists, authors_list)
+        else:
+            artists = ["Unknown Artist"]
+            print(
+                "Warning: no artist information found, using 'Unknown Artist'.",
+                file=sys.stderr,
+            )
+        authors = join_authors(artists)
+        extra_fields = {
+            "date": meta.date,
+            "genre": meta.genre,
+            "album_artist": meta.album_artist,
+            "track_number": meta.track_number,
+        }
+    elif no_prompt:
         title = default_title or stem
         if not default_title:
             print(f"Warning: no title in video info, using '{stem}'.")
@@ -182,6 +228,17 @@ def process_video(
     if planned is not None and planned.is_file():
         previous_uuid = read_song_uuid(planned)
 
+    song_uuid_for_save: str | None = previous_uuid
+    if (
+        song_uuid_for_save is None
+        and meta is not None
+        and meta.uuid is not None
+        and _valid_song_uuid(meta.uuid)
+    ):
+        playlist_row = db.get_song_by_uuid(meta.uuid)
+        if playlist_row is None or not playlist_row["current_path"]:
+            song_uuid_for_save = meta.uuid
+
     result: SaveResult
     target: Path | None
     result, target = save_song_temp_to_main(
@@ -191,7 +248,8 @@ def process_video(
         authors,
         album,
         overwrite=False if no_prompt else None,
-        song_uuid=previous_uuid,
+        song_uuid=song_uuid_for_save,
+        extra_fields=extra_fields,
     )
     if result is SaveResult.SAVED and target is not None:
         db.add_authors(new_authors)
@@ -207,6 +265,10 @@ def process_video(
                     title=title,
                     artists=join_authors(current_authors_list),
                     album=album,
+                    date=meta.date if meta is not None else "",
+                    genre=meta.genre if meta is not None else "",
+                    album_artist=meta.album_artist if meta is not None else "",
+                    track_number=meta.track_number if meta is not None else "",
                     has_cover=has_cover(target),
                     duration=duration,
                     source_url=url,
@@ -217,10 +279,19 @@ def process_video(
                     title=title,
                     artists=join_authors(current_authors_list),
                     album=album,
+                    date=(meta.date or None) if meta is not None else None,
+                    genre=(meta.genre or None) if meta is not None else None,
+                    album_artist=(meta.album_artist or None)
+                    if meta is not None
+                    else None,
+                    track_number=(meta.track_number or None)
+                    if meta is not None
+                    else None,
                     has_cover=has_cover(target),
                     duration=duration,
                     source_url=url,
                 )
+                db.set_song_path(song_uuid, rel_path)
             db.log_event(song_uuid, "downloaded", {"url": url, "path": rel_path})
     return result
 
@@ -245,16 +316,143 @@ def _cleanup_temp_files(s: Settings) -> None:
                 temp_file.unlink()
 
 
+def _download_playlist(path: Path, authors_list: list[str], *, no_prompt: bool) -> None:
+    """Download missing songs from a v2 playlist JSON and apply its metadata."""
+    try:
+        text: str = path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError as exc:
+        print(f"Error: could not read playlist '{path}': {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    try:
+        name, entries = parse_json_v2(text)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    if not entries:
+        print(f"No songs found in '{path.name}'.")
+        return
+
+    music_folder: Path = settings().music_folder
+    by_uuid, by_abs, by_name = _index_songs()
+    pending: list[tuple[str, PlaylistSongMeta]] = []
+    seen_urls: set[str] = set()
+    already: int = 0
+    without_source: int = 0
+    duplicates: int = 0
+    for entry in entries:
+        resolved: str | None = _resolve_entry(
+            entry, music_folder, path.parent, by_uuid, by_abs, by_name
+        )
+        if resolved is not None:
+            row = db.get_song_by_uuid(resolved)
+            if row is not None and row["current_path"]:
+                already += 1
+                continue
+        meta: PlaylistSongMeta = song_meta_from_entry(entry)
+        if resolved is not None:
+            meta = replace(meta, uuid=resolved)
+        source_url: str | None = entry_source_url(entry)
+        if source_url is None:
+            without_source += 1
+            continue
+        if source_url in seen_urls:
+            duplicates += 1
+            continue
+        seen_urls.add(source_url)
+        pending.append((source_url, meta))
+
+    label: str = name or path.stem
+    missing: int = len(entries) - already
+    print(f"Playlist '{label}': {already} already in library, {missing} missing.")
+    if without_source:
+        print(
+            f"{without_source} missing song(s) have no source URL and cannot be "
+            "downloaded automatically."
+        )
+    if duplicates:
+        print(f"Ignoring {duplicates} duplicate source URL(s).")
+    if not pending:
+        print("Nothing to download.")
+        return
+
+    print(f"Downloading {len(pending)} song(s)...")
+    downloaded: int = 0
+    skipped: int = 0
+    failed: int = 0
+    interrupted: bool = False
+    try:
+        total: int = len(pending)
+        for index, (source_url, meta) in enumerate(pending, start=1):
+            print(f"\n[{index}/{total}] {source_url}")
+            try:
+                result: SaveResult = process_video(
+                    source_url,
+                    authors_list,
+                    no_prompt=no_prompt,
+                    meta=meta,
+                )
+            except VideoDownloadError as exc:
+                print(f"Skipping '{source_url}': {exc}")
+                failed += 1
+                continue
+            except KeyboardInterrupt:
+                print("\nInterrupted, exiting...")
+                interrupted = True
+                break
+            except Exception as exc:
+                print(f"Skipping '{source_url}': unexpected error: {exc!r}")
+                failed += 1
+                continue
+            if result is SaveResult.SAVED:
+                downloaded += 1
+                try:
+                    db.mark_processed(source_url)
+                except Exception as exc:
+                    print(
+                        f"Warning: '{source_url}' was downloaded but could not be "
+                        f"recorded as processed: {exc!r}"
+                    )
+            elif result is SaveResult.SKIPPED:
+                skipped += 1
+            else:
+                failed += 1
+    finally:
+        _cleanup_temp_files(settings())
+
+    print(
+        f"{'Interrupted' if interrupted else 'Finished'}: downloaded "
+        f"{downloaded}, skipped {skipped}, failed {failed}."
+    )
+    if downloaded:
+        print(
+            "Hint: re-run `smclipy playlist import "
+            f"{shlex.quote(str(path))}` to add them to the playlist."
+        )
+    if interrupted:
+        raise SystemExit(130) from None
+    if failed:
+        raise SystemExit(1)
+
+
 def cmd_download(args: argparse.Namespace) -> None:
     s: Settings = init()
-    no_prompt: bool = bool(getattr(args, "no_prompt", False))
+    no_prompt: bool = bool(
+        getattr(args, "no_prompt", False) or getattr(args, "auto", False)
+    )
     batch_raw: str | None = getattr(args, "batch", None)
+    file_raw: str | None = getattr(args, "file", None)
 
     print("Scanning music files...")
     scan_library()
 
     print("Fetching all authors names...")
     authors_list: list[str] = db.get_authors()
+
+    if file_raw is not None:
+        _download_playlist(
+            Path(file_raw).expanduser(), authors_list, no_prompt=no_prompt
+        )
+        return
 
     pending_ids: list[str] = db.get_pending_urls()
     failed_ids: list[str] = db.get_failed_urls()
@@ -589,7 +787,7 @@ def cmd_update(args: argparse.Namespace) -> None:
 
 
 _TTY_REQUIRED_COMMANDS: frozenset[str] = frozenset(
-    {"download", "crop", "tag", "modify", "dedupe", "restore"}
+    {"download", "crop", "tag", "findsource", "modify", "dedupe", "restore"}
 )
 _TTY_REQUIRED_PLAYLIST_ACTIONS: frozenset[str] = frozenset({"add", "remove", "move"})
 
@@ -599,8 +797,13 @@ def _requires_tty(args: argparse.Namespace) -> bool:
     if sys.stdin.isatty():
         return False
     if args.command == "download":
-        return not (getattr(args, "batch", None) and getattr(args, "no_prompt", False))
-    if args.command == "tag":
+        headless: bool = bool(
+            getattr(args, "no_prompt", False) or getattr(args, "auto", False)
+        )
+        if getattr(args, "batch", None) or getattr(args, "file", None):
+            return not headless
+        return True
+    if args.command in ("tag", "findsource"):
         if getattr(args, "specific", None):
             # The autocomplete prompt always needs a terminal, even alongside
             # --auto --all.
@@ -624,6 +827,7 @@ def main(argv: list[str] | None = None) -> None:
             "examples:\n"
             "  smclipy download   Batch download songs and tag them interactively\n"
             "  smclipy download --batch urls.txt --no-prompt  Headless batch download\n"
+            "  smclipy download --file playlist.json --auto  Fetch missing songs\n"
             "  smclipy tag        Retag library songs using MusicBrainz metadata\n"
             "  smclipy tag --auto Full-auto retag: top match applied to each song\n"
             "  smclipy tag --semi Auto-pick the top match, confirm each change\n"
@@ -631,13 +835,23 @@ def main(argv: list[str] | None = None) -> None:
             "  smclipy tag --auto --all --json  Same, with a JSON report on stdout\n"
             "  smclipy tag --search TEXT  Only retag songs matching TEXT\n"
             "  smclipy tag --specific album  Autocomplete an album, then retag it\n"
+            "  smclipy findsource  Find and record sources, picking candidates\n"
+            "  smclipy findsource --auto --all  Headless source search for all songs\n"
+            "  smclipy findsource --auto --all-providers  Rank across all providers\n"
+            "  smclipy findsource --skip-skipped  Skip songs skipped before\n"
+            "  smclipy findsource --search TEXT  Only search songs matching TEXT\n"
+            "  smclipy findsource --specific artists  Search one artist's songs\n"
+            "  smclipy findsource --file playlist.json  Fill missing playlist URLs\n"
             "  smclipy modify     Manually edit the tags of one or more songs\n"
             "  smclipy modify --search TEXT  Find songs by text, then edit them\n"
             "  smclipy modify --specific artists  Autocomplete an artist, then edit\n"
+            "  smclipy modify --file playlist.json  Edit exported playlist entries\n"
             "  smclipy dedupe     Merge differently styled artist/album names\n"
             "  smclipy dedupe --albums  Only merge album spellings\n"
             "  smclipy dedupe --dry-run  Preview a merge without writing\n"
             "  smclipy restore    Roll back a song to an earlier tag backup\n"
+            "  smclipy restore --all  Show every recorded restore point\n"
+            "  smclipy restore --limit 5  Show only the newest 5 restore points\n"
             "  smclipy crop       Crop pillarboxed cover images and re-embed them\n"
             "  smclipy update     Rescan the library and sync the tracking database\n"
             "  smclipy update --json  Machine-readable scan report on stdout\n"
@@ -669,16 +883,30 @@ def main(argv: list[str] | None = None) -> None:
         help="Batch download songs from YouTube or SoundCloud and tag them.",
         description=(
             "Batch download songs from YouTube or SoundCloud, then interactively "
-            "tag each one with a title, artist, and album before saving it."
+            "tag each one with a title, artist, and album before saving it. "
+            "Use --file to fetch the missing songs from a v2 playlist JSON and "
+            "apply the playlist metadata automatically."
         ),
     )
-    download_parser.add_argument(
+    download_source = download_parser.add_mutually_exclusive_group()
+    download_source.add_argument(
         "-b",
         "--batch",
         metavar="FILE",
         help=(
             "Read URLs from FILE (one per line) instead of prompting, so download "
             "can run without an interactive terminal."
+        ),
+    )
+    download_source.add_argument(
+        "-f",
+        "--file",
+        metavar="FILE",
+        help=(
+            "Download the missing songs from a smclipy v2 playlist JSON. Songs "
+            "already in the library are skipped; each entry's title, artists, "
+            "album, date, genre, album artist, and track number are applied "
+            "without prompting when present."
         ),
     )
     download_parser.add_argument(
@@ -689,6 +917,15 @@ def main(argv: list[str] | None = None) -> None:
             "without asking (useful with --batch). A file that already exists "
             "with the same artist-title name is kept and skipped without "
             "prompting."
+        ),
+    )
+    download_parser.add_argument(
+        "-a",
+        "--auto",
+        action="store_true",
+        help=(
+            "Synonym for --no-prompt: skip all prompts, including the cover "
+            "crop question. Useful with --file."
         ),
     )
 
@@ -742,7 +979,16 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help=(
             "Tag every untagged song in the library instead of asking for a range. "
-            "Combine with --auto to run without an interactive terminal."
+            "Combine with --auto to run without an interactive terminal. Use "
+            "--force to include songs that were already tagged."
+        ),
+    )
+    tag_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Re-tag songs that were already tagged by a previous tag run instead "
+            "of skipping them."
         ),
     )
     tag_parser.add_argument(
@@ -794,16 +1040,138 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
 
+    findsource_parser: argparse.ArgumentParser = subparsers.add_parser(
+        "findsource",
+        help="Find and record download sources for library songs.",
+        description=(
+            "Search the providers listed in the config's 'source_preferences' "
+            "(default: YouTube, then SoundCloud) for each selected song (or "
+            "playlist entry with --file) and save the matching URL in the "
+            "tracking database. Candidates are "
+            "ranked by matching duration, then artist similarity, then "
+            "provider preference. A candidate is only accepted when it names "
+            "the song's artist (in the uploader or an 'Artist - Title feat. "
+            "Artist2' title) or repeats the song title; unmatched results are "
+            "skipped. The first provider with results wins unless "
+            "--all-providers is set; interactive mode shows the ranked list "
+            "and --auto saves the best plausible one. Each processed song is "
+            "announced as `[i/n] === Title - Artist (mm:ss) ===`; skipped songs "
+            "are followed by a `Skipped: <reason>` line (already sourced, no "
+            "candidates, provider failure, no artist/title match, or no "
+            "source selected). With --file, URLs are written back to the "
+            "playlist and to the database for already-downloaded entries."
+        ),
+    )
+    findsource_parser.add_argument(
+        "-f",
+        "--file",
+        metavar="FILE",
+        help=(
+            "Search the entries of a smclipy v2 playlist JSON instead of the "
+            "library. Existing source_url values are kept unless --force; "
+            "found URLs are written back to the playlist and, for entries "
+            "already downloaded/tracked, to the database too."
+        ),
+    )
+    findsource_parser.add_argument(
+        "-a",
+        "--auto",
+        action="store_true",
+        help=(
+            "Fully automatic: save the best-ranked plausible search result "
+            "for each selected song without showing the candidate picker."
+        ),
+    )
+    findsource_parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Search every song in the library (or every entry with --file) "
+            "instead of asking for a range. Combine with --auto to run without "
+            "an interactive terminal."
+        ),
+    )
+    findsource_parser.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help=(
+            "Print a machine-readable JSON report to stdout while human "
+            "messages go to stderr. Requires --auto --all (headless search). "
+            "Exits with status 1 when any song crashed."
+        ),
+    )
+    findsource_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Search songs that already have a recorded source URL and replace "
+            "it when a new source is found."
+        ),
+    )
+    findsource_parser.add_argument(
+        "--skip-skipped",
+        action="store_true",
+        help=(
+            "Skip songs that were skipped, had no match, or were rejected on "
+            "a previous findsource run instead of searching them again. Run "
+            "without this flag to retry them."
+        ),
+    )
+    findsource_parser.add_argument(
+        "--all-providers",
+        action="store_true",
+        help=(
+            "With --auto, search every provider in 'source_preferences' "
+            "instead of stopping at the first one that returns results. "
+            "Candidates are ranked by matching duration, then artist "
+            "similarity, then provider order."
+        ),
+    )
+    findsource_filter = findsource_parser.add_mutually_exclusive_group()
+    findsource_filter.add_argument(
+        "--search",
+        metavar="TEXT",
+        help=(
+            "Only process songs whose title, album, or any artist contains "
+            "TEXT (case-insensitive). Combine with --auto --all for a "
+            "headless search of the matches."
+        ),
+    )
+    findsource_filter.add_argument(
+        "--specific",
+        choices=SPECIFIC_FIELDS,
+        metavar="FIELD",
+        help=(
+            "Autocomplete the library's existing FIELD values (title, album, "
+            "or artists) and only process songs that match the chosen value. "
+            "Needs an interactive terminal."
+        ),
+    )
+
     modify_parser: argparse.ArgumentParser = subparsers.add_parser(
         "modify",
         help="Manually edit the tags of one or more library songs.",
         description=(
             "Pick songs from your library (numbers or ranges) and edit their tags "
             "by hand: title, artists, album, release date, genre, album artist, "
-            "track number, and cover art. One set of values is applied to every "
-            "selected song, so a range bulk-edits an album and a single number "
-            "edits just that song. A blank answer keeps the field, typing /clear "
-            "empties it."
+            "track number, cover art, and source URL. One set of values is applied "
+            "to every selected song, so a range bulk-edits an album and a single "
+            "number edits just that song. A blank answer keeps the field, typing "
+            "/clear empties it. Source URL is stored only in the tracking database "
+            "(not in the audio file) and is not part of restore snapshots. Use "
+            "--file to edit one audio file directly or the entries of a v2 "
+            "playlist JSON (playlist source URLs stay in the file)."
+        ),
+    )
+    modify_parser.add_argument(
+        "-f",
+        "--file",
+        metavar="FILE",
+        help=(
+            "Edit one audio file directly, or edit the entries of a smclipy v2 "
+            "playlist JSON. Playlist entries are changed only in the JSON; "
+            "source_url stays a JSON field there."
         ),
     )
     modify_filter = modify_parser.add_mutually_exclusive_group()
@@ -864,17 +1232,31 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
 
-    subparsers.add_parser(
+    restore_parser: argparse.ArgumentParser = subparsers.add_parser(
         "restore",
         help="Undo tag changes from recorded backups.",
         description=(
-            "Pick songs from your library and roll back to an earlier backup. "
-            "A backup of each song's tags (and cover art) is recorded "
-            "automatically before every `tag`, `modify`, `crop`, and `dedupe` "
-            "change, so a "
-            "mistaken MusicBrainz match or manual edit can be undone here. The "
-            "restore itself is also backed up, so undoing an undo is possible."
+            "Browse a single list of restore points, newest first, and roll "
+            "songs back to an earlier backup. Each row names the song, the "
+            "operation that followed the backup, when it was taken, and the "
+            "values it would restore. A backup of each song's tags (and cover "
+            "art) is recorded automatically before every `tag`, `modify`, "
+            "`crop`, and `dedupe` change, so a mistaken MusicBrainz match or "
+            "manual edit can be undone here. The restore itself is also "
+            "backed up, so undoing an undo is possible."
         ),
+    )
+    restore_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show every restore point instead of only the newest 25.",
+    )
+    restore_parser.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        metavar="N",
+        help="Show at most N restore points (default: 25).",
     )
 
     playlist_parser: argparse.ArgumentParser = subparsers.add_parser(
@@ -980,17 +1362,20 @@ def main(argv: list[str] | None = None) -> None:
 
     playlist_export = playlist_sub.add_parser(
         "export",
-        help="Export a playlist to .m3u or .json.",
+        help="Export a playlist to .m3u, .m3u-link, or .json.",
         description=(
-            "Export a playlist to an .m3u or .json file. Paths are written "
-            "relative to the exported file unless --absolute is given."
+            "Export a playlist to an .m3u, .m3u-link, or .json file. Rescans "
+            "the library first so the paths are current; use --no-scan to "
+            "export the tracking database as-is. Paths are written relative "
+            "to the exported file unless --absolute is given. The m3u-link "
+            "format writes one source URL per line instead of local paths."
         ),
     )
     playlist_export.add_argument("name", help="Name of the playlist to export.")
     playlist_export.add_argument(
         "-f",
         "--format",
-        choices=("m3u", "json"),
+        choices=("m3u", "m3u-link", "json"),
         help="Export format (default: inferred from --output, else m3u).",
     )
     playlist_export.add_argument(
@@ -1001,6 +1386,11 @@ def main(argv: list[str] | None = None) -> None:
     playlist_export.add_argument(
         "--absolute", action="store_true", help="Write absolute paths."
     )
+    playlist_export.add_argument(
+        "--no-scan",
+        action="store_true",
+        help="Skip the library rescan and export the tracking database as-is.",
+    )
 
     playlist_import = playlist_sub.add_parser(
         "import",
@@ -1009,7 +1399,10 @@ def main(argv: list[str] | None = None) -> None:
             "Import an .m3u/.m3u8 or smclipy .json playlist. Entries are matched "
             "to your tracked library songs by path (relative to the file, your "
             "music folder, or absolute) or UUID; unmatched entries are skipped and "
-            "reported."
+            "reported. For .json imports, the missing songs are counted and "
+            "smclipy suggests `smclipy download --file FILE`, which downloads "
+            "them from their recorded source_url and applies the playlist "
+            "metadata automatically."
         ),
     )
     playlist_import.add_argument("file", help="Path to the .m3u/.m3u8/.json file.")
@@ -1092,13 +1485,21 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("the following arguments are required: command")
 
     if (
-        args.command == "tag"
+        args.command in ("tag", "findsource")
         and getattr(args, "json", False)
         and not (
             bool(getattr(args, "auto", False)) and bool(getattr(args, "all", False))
         )
     ):
-        parser.error("--json requires --auto and --all (run a headless retag)")
+        action = "retag" if args.command == "tag" else "source search"
+        parser.error(f"--json requires --auto and --all (run a headless {action})")
+
+    if (
+        args.command == "findsource"
+        and getattr(args, "all_providers", False)
+        and not getattr(args, "auto", False)
+    ):
+        parser.error("--all-providers requires --auto")
 
     if _requires_tty(args):
         print(
@@ -1114,6 +1515,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_crop(args)
     elif args.command == "tag":
         cmd_tag(args)
+    elif args.command == "findsource":
+        cmd_findsource(args)
     elif args.command == "modify":
         cmd_modify(args)
     elif args.command == "dedupe":

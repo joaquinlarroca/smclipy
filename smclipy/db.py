@@ -23,6 +23,7 @@ from smclipy.helpers import normalize_author
 
 _SONGS_COLUMNS = """    uuid TEXT PRIMARY KEY,
     source_url TEXT,
+    source_status TEXT,
     musicbrainz_recording_id TEXT,
     musicbrainz_release_group_id TEXT,
     musicbrainz_status TEXT,
@@ -120,6 +121,13 @@ MB_STATUS_TAGGED = "tagged"
 MB_STATUS_SKIPPED = "skipped"
 MB_STATUS_NOT_FOUND = "not_found"
 
+SOURCE_STATUS_SAVED = "saved"
+SOURCE_STATUS_SKIPPED = "skipped"
+SOURCE_STATUS_NOT_FOUND = "not_found"
+SOURCE_STATUS_UNAVAILABLE = "unavailable"
+SOURCE_STATUS_REJECTED = "rejected"
+SOURCE_STATUS_ERROR = "error"
+
 COVER_STATUS_NOT_PILLARBOX = "not_pillarbox"
 COVER_STATUS_FALSE_POSITIVE = "false_positive"
 COVER_STATUS_CROPPED = "cropped"
@@ -131,7 +139,7 @@ QUEUE_FAILED = "failed"
 _LEGACY_MIGRATED_KEY = "legacy_migrated"
 
 # Bumped when the schema changes; _migrate_schema applies incremental upgrades.
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 
 def _now() -> str:
@@ -235,6 +243,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         # v4 tracks playback length for the stats command. Already present on
         # fresh databases (SCHEMA) and on tables rebuilt above.
         conn.execute("ALTER TABLE songs ADD COLUMN duration REAL")
+    if not _column_exists(conn, "songs", "source_status"):
+        # v5 remembers the outcome of the last source search so
+        # `findsource --skip-skipped` can avoid retrying resolved songs.
+        conn.execute("ALTER TABLE songs ADD COLUMN source_status TEXT")
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
         (str(_SCHEMA_VERSION),),
@@ -577,6 +589,23 @@ def record_mb_status(
             c.close()
 
 
+def record_source_status(
+    song_uuid: str, status: str, conn: sqlite3.Connection | None = None
+) -> None:
+    """Record the outcome of a ``findsource`` search for skip filtering."""
+    c, owner = _rw(conn)
+    try:
+        c.execute(
+            "UPDATE songs SET source_status = ?, updated_at = ? WHERE uuid = ?",
+            (status, _now(), song_uuid),
+        )
+        if owner:
+            c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
 def set_cover_status(
     song_uuid: str, status: str, conn: sqlite3.Connection | None = None
 ) -> None:
@@ -585,6 +614,21 @@ def set_cover_status(
         c.execute(
             "UPDATE songs SET cover_status = ?, updated_at = ? WHERE uuid = ?",
             (status, _now(), song_uuid),
+        )
+        if owner:
+            c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
+def reset_source_status(song_uuid: str, conn: sqlite3.Connection | None = None) -> None:
+    """Clear a song's `findsource` outcome so it is searched again."""
+    c, owner = _rw(conn)
+    try:
+        c.execute(
+            "UPDATE songs SET source_status = NULL, updated_at = ? WHERE uuid = ?",
+            (_now(), song_uuid),
         )
         if owner:
             c.commit()

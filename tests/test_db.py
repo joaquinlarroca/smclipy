@@ -667,3 +667,60 @@ def test_update_song_metadata_sets_duration(app_settings):
     song = db.insert_song(current_path="a.mp3")
     db.update_song_metadata(song, duration=42.0)
     assert db.get_song_by_uuid(song)["duration"] == 42.0
+
+
+def test_source_status_roundtrip(app_settings):
+    song = db.insert_song(current_path="a.mp3")
+    assert db.get_song_by_uuid(song)["source_status"] is None
+
+    db.record_source_status(song, db.SOURCE_STATUS_NOT_FOUND)
+    assert db.get_song_by_uuid(song)["source_status"] == "not_found"
+
+    db.record_source_status(song, db.SOURCE_STATUS_SAVED)
+    assert db.get_song_by_uuid(song)["source_status"] == "saved"
+
+
+def test_v4_database_gains_source_status_column(app_settings):
+    import sqlite3
+
+    if app_settings.db_path.exists():
+        app_settings.db_path.unlink()
+    app_settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    old_columns = (
+        "\n".join(
+            line
+            for line in db._SONGS_COLUMNS.splitlines()
+            if "source_status" not in line
+        )
+        .rstrip()
+        .removesuffix(",")
+    )
+    with sqlite3.connect(app_settings.db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta VALUES ('schema_version', '4');
+            CREATE TABLE songs (
+            """
+            + old_columns
+            + """
+            );
+            INSERT INTO songs (uuid, current_path) VALUES ('legacy-1', 'old.mp3');
+            """
+        )
+        conn.commit()
+
+    song = db.insert_song(current_path="new.mp3")
+
+    with sqlite3.connect(app_settings.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        assert db._column_exists(conn, "songs", "source_status")
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        assert version["value"] == str(db._SCHEMA_VERSION)
+    assert db.get_song_by_uuid(song)["source_status"] is None
+    legacy = db.get_song_by_uuid("legacy-1")
+    assert legacy is not None
+    assert legacy["source_status"] is None

@@ -1,6 +1,7 @@
 import io
 import os
 import shutil
+from datetime import datetime
 from unittest.mock import Mock
 
 from mutagen.easyid3 import EasyID3
@@ -553,6 +554,68 @@ def test_tag_file_writes_tags_cover_and_tracking_uuid(tmp_path):
     assert read_song_uuid(mp3_file) is not None
 
 
+def test_tag_file_writes_optional_extra_fields(tmp_path):
+    mp3_file = tmp_path / "song.mp3"
+    mp3_file.write_bytes(MINIMAL_MP3)
+
+    assert (
+        _tag_file(
+            mp3_file,
+            "Song",
+            ["Artist"],
+            "Album",
+            None,
+            extra_fields={
+                "date": "1980-01-01",
+                "genre": "pop; rock",
+                "album_artist": "Album Artist",
+                "track_number": "3",
+            },
+        )
+        is True
+    )
+
+    tags = EasyID3(mp3_file)
+    assert tags["date"] == ["1980-01-01"]
+    assert tags["genre"] == ["pop; rock"]
+    assert tags["albumartist"] == ["Album Artist"]
+    assert tags["tracknumber"] == ["3"]
+
+
+def test_tag_file_empty_extra_fields_keep_source_tags(tmp_path):
+    mp3_file = tmp_path / "song.mp3"
+    mp3_file.write_bytes(MINIMAL_MP3)
+    audio = EasyID3()
+    audio["date"] = ["1999"]
+    audio["genre"] = ["Rock"]
+    audio["albumartist"] = ["Source Album Artist"]
+    audio["tracknumber"] = ["7"]
+    audio.save(mp3_file)
+
+    assert (
+        _tag_file(
+            mp3_file,
+            "Song",
+            ["Artist"],
+            "Album",
+            None,
+            extra_fields={
+                "date": "",
+                "genre": "",
+                "album_artist": "",
+                "track_number": "",
+            },
+        )
+        is True
+    )
+
+    tags = EasyID3(mp3_file)
+    assert tags["date"] == ["1999"]
+    assert tags["genre"] == ["Rock"]
+    assert tags["albumartist"] == ["Source Album Artist"]
+    assert tags["tracknumber"] == ["7"]
+
+
 def test_tag_file_preserves_existing_tracking_uuid(tmp_path):
     mp3_file = tmp_path / "song.mp3"
     mp3_file.write_bytes(MINIMAL_MP3)
@@ -1077,6 +1140,98 @@ def test_snapshot_keeps_cover_art(app_settings, tmp_path):
     assert len(snapshots) == 1
     assert snapshots[0].cover is not None
     assert snapshots[0].cover.read_bytes() == make_png_bytes()
+
+
+def test_snapshot_unlimited_keeps_every_backup(app_settings, tmp_path, monkeypatch):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    path = app_settings.music_folder / "A-Song.mp3"
+    write_tagged_mp3(path, title="Song", artist="Artist A")
+    song_uuid = write_song_uuid(path)
+    assert song_uuid is not None
+    monkeypatch.setattr(
+        metadata,
+        "datetime",
+        Mock(
+            now=Mock(
+                side_effect=[datetime(2026, 1, 1, 0, 0, second) for second in (1, 2, 3)]
+            )
+        ),
+    )
+
+    for _ in range(3):
+        snapshot_song(path, song_uuid, "tag")
+
+    assert len(list_snapshots(song_uuid)) == 3
+
+
+def test_snapshot_prunes_oldest_and_its_cover(app_settings, tmp_path, monkeypatch):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    path = app_settings.music_folder / "A-Song.mp3"
+    write_tagged_mp3(path, title="Song", artist="Artist A")
+    song_uuid = write_song_uuid(path)
+    assert song_uuid is not None
+    image = tmp_path / "cover.png"
+    image.write_bytes(make_png_bytes())
+    change_cover(image, path)
+    app_settings.max_backups = 2
+    monkeypatch.setattr(
+        metadata,
+        "datetime",
+        Mock(
+            now=Mock(
+                side_effect=[datetime(2026, 1, 1, 0, 0, second) for second in (1, 2, 3)]
+            )
+        ),
+    )
+
+    snapshot_song(path, song_uuid, "tag")
+    oldest = list_snapshots(song_uuid)[0]
+    assert oldest.cover is not None
+    snapshot_song(path, song_uuid, "tag")
+    snapshot_song(path, song_uuid, "tag")
+
+    snapshots = list_snapshots(song_uuid)
+    assert [snapshot.at for snapshot in snapshots] == [
+        "2026-01-01T00:00:02.000000",
+        "2026-01-01T00:00:03.000000",
+    ]
+    assert not oldest.path.exists()
+    assert not oldest.cover.exists()
+
+
+def test_restore_keeps_selected_snapshot_until_applied(
+    app_settings, tmp_path, monkeypatch
+):
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    path = app_settings.music_folder / "A-Song.mp3"
+    write_tagged_mp3(path, title="Song", artist="Artist A")
+    song_uuid = write_song_uuid(path)
+    assert song_uuid is not None
+    scan_library()
+    monkeypatch.setattr(
+        metadata,
+        "datetime",
+        Mock(
+            now=Mock(
+                side_effect=[datetime(2026, 1, 1, 0, 0, second) for second in (1, 2, 3)]
+            )
+        ),
+    )
+
+    snapshot_song(path, song_uuid, "tag")
+    older = list_snapshots(song_uuid)[0]
+    assert apply_tag_update(path, title="Wrong") is True
+    snapshot_song(path, song_uuid, "modify")
+    app_settings.max_backups = 1
+
+    assert restore_song_from_snapshot(path, older) is True
+
+    profile, _ = read_song_profile(path)
+    assert profile["title"] == "Song"
+    snapshots = list_snapshots(song_uuid)
+    assert len(snapshots) == 1
+    assert snapshots[0].source == "restore"
+    assert snapshots[0].title == "Wrong"
 
 
 def test_backup_cover_copies_into_backups(app_settings, tmp_path):

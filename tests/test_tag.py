@@ -710,6 +710,36 @@ def test_cmd_tag_skips_already_tagged(monkeypatch, app_settings, capsys):
     assert "Updated 0 song(s)" in out
 
 
+def test_cmd_tag_force_retags_already_tagged(monkeypatch, app_settings, capsys):
+    app_settings.tag_fields = ["title", "artists", "album", "date", "cover"]
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-One.mp3", title="One", artist="Artist", album="Album"
+    )
+    scan_library()
+    song_uuid = read_song_uuid(music / "Artist-One.mp3")
+    assert song_uuid is not None
+    db.record_mb_status(song_uuid, db.MB_STATUS_TAGGED, tagged=True)
+
+    monkeypatch.setattr(tag, "prompt_song_selection", lambda count: [0])
+    processed: list[str] = []
+
+    def fake_process(song, *args, **kwargs):
+        processed.append(song.display_name)
+        return True
+
+    monkeypatch.setattr(tag, "process_song", fake_process)
+
+    tag.cmd_tag(argparse.Namespace(force=True))
+
+    out = capsys.readouterr().out
+    assert processed, "already-tagged song should be re-processed with --force"
+    assert "Force mode: already-tagged songs will be re-processed" in out
+    assert "already tagged before" not in out
+    assert "Updated 1 song(s)" in out
+
+
 def test_apply_dedupes_case_insensitive_authors(app_settings, tmp_path):
     app_settings.tag_fields = ["title", "artists", "album", "date", "cover"]
     music = app_settings.music_folder

@@ -1,5 +1,6 @@
 import argparse
 import io
+import json
 
 import pytest
 from mutagen.easyid3 import EasyID3
@@ -555,3 +556,342 @@ def test_cmd_modify_reset_mb_without_field_changes(monkeypatch, app_settings, ca
     assert row["musicbrainz_status"] is None
     assert row["musicbrainz_recording_id"] is None
     assert row["tagged"] == 0
+
+
+def test_cmd_modify_source_url_updates_db_without_writing_file(
+    monkeypatch, app_settings, capsys
+):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    path = music / "Artist-Song.mp3"
+    write_tagged_mp3(path)
+    scan_library()
+    row = db.get_song_by_path("Artist-Song.mp3")[0]
+    song_uuid = str(row["uuid"])
+    db.update_song_metadata(song_uuid, source_url="https://old.example/song")
+    db.record_source_status(song_uuid, db.SOURCE_STATUS_NOT_FOUND)
+    before = path.read_bytes()
+    prompts: list[tuple[str, str]] = []
+
+    def fake_field_value(label, default=""):
+        prompts.append((label, default))
+        return "https://new.example/song"
+
+    monkeypatch.setattr(modify, "prompt_song_selection", lambda count: [0])
+    monkeypatch.setattr(
+        modify, "prompt_field_selection", lambda *a, **k: ["source_url"]
+    )
+    monkeypatch.setattr(modify, "prompt_field_value", fake_field_value)
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+    monkeypatch.setattr(
+        modify,
+        "apply_tag_update",
+        lambda *a, **k: pytest.fail("source-only edits must not write the file"),
+    )
+    monkeypatch.setattr(
+        modify,
+        "snapshot_song",
+        lambda *a, **k: pytest.fail("source-only edits must not snapshot"),
+    )
+
+    modify.cmd_modify(argparse.Namespace())
+
+    out = capsys.readouterr().out
+    assert prompts == [("Source URL", "https://old.example/song")]
+    assert "Updated 1 song(s)" in out
+    assert path.read_bytes() == before
+    updated = db.get_song_by_uuid(song_uuid)
+    assert updated["source_url"] == "https://new.example/song"
+    assert updated["source_status"] is None
+    event = [e for e in db.get_events(song_uuid) if e["event"] == "modified"][-1]
+    detail = json.loads(event["detail"])
+    assert "source_url" in detail["fields"]
+    assert detail["source_url"] == "https://new.example/song"
+
+
+def test_cmd_modify_source_url_clear(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-Song.mp3")
+    scan_library()
+    row = db.get_song_by_path("Artist-Song.mp3")[0]
+    song_uuid = str(row["uuid"])
+    db.update_song_metadata(song_uuid, source_url="https://old.example/song")
+    db.record_source_status(song_uuid, db.SOURCE_STATUS_REJECTED)
+
+    monkeypatch.setattr(modify, "prompt_song_selection", lambda count: [0])
+    monkeypatch.setattr(
+        modify, "prompt_field_selection", lambda *a, **k: ["source_url"]
+    )
+    monkeypatch.setattr(
+        modify, "prompt_field_value", lambda label, default="": "/clear"
+    )
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+    monkeypatch.setattr(
+        modify,
+        "apply_tag_update",
+        lambda *a, **k: pytest.fail("source-only edits must not write the file"),
+    )
+
+    modify.cmd_modify(argparse.Namespace())
+
+    assert "Updated 1 song(s)" in capsys.readouterr().out
+    row = db.get_song_by_uuid(song_uuid)
+    assert row["source_url"] == ""
+    assert row["source_status"] is None
+
+
+def test_cmd_modify_source_url_blank_keeps_current(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-Song.mp3")
+    scan_library()
+    row = db.get_song_by_path("Artist-Song.mp3")[0]
+    song_uuid = str(row["uuid"])
+    db.update_song_metadata(song_uuid, source_url="https://old.example/song")
+
+    monkeypatch.setattr(modify, "prompt_song_selection", lambda count: [0])
+    monkeypatch.setattr(
+        modify, "prompt_field_selection", lambda *a, **k: ["source_url"]
+    )
+    monkeypatch.setattr(modify, "prompt_field_value", lambda label, default="": default)
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+    monkeypatch.setattr(
+        modify,
+        "apply_tag_update",
+        lambda *a, **k: pytest.fail("source-only edits must not write the file"),
+    )
+
+    modify.cmd_modify(argparse.Namespace())
+
+    out = capsys.readouterr().out
+    assert "needs no changes" in out
+    assert db.get_song_by_uuid(song_uuid)["source_url"] == "https://old.example/song"
+
+
+def test_cmd_modify_source_url_with_tag_change(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    path = music / "Artist-Song.mp3"
+    write_tagged_mp3(path)
+    scan_library()
+    row = db.get_song_by_path("Artist-Song.mp3")[0]
+    song_uuid = str(row["uuid"])
+
+    def fake_field_value(label, default=""):
+        if label.startswith("Title"):
+            return "Renamed"
+        return "https://new.example/song"
+
+    monkeypatch.setattr(modify, "prompt_song_selection", lambda count: [0])
+    monkeypatch.setattr(
+        modify, "prompt_field_selection", lambda *a, **k: ["title", "source_url"]
+    )
+    monkeypatch.setattr(modify, "prompt_field_value", fake_field_value)
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+
+    modify.cmd_modify(argparse.Namespace())
+
+    assert "Updated 1 song(s)" in capsys.readouterr().out
+    id3 = ID3(path)
+    assert str(id3["TIT2"]) == "Renamed"
+    updated = db.get_song_by_uuid(song_uuid)
+    assert updated is not None
+    assert updated["title"] == "Renamed"
+    assert updated["source_url"] == "https://new.example/song"
+    detail = json.loads(
+        [e for e in db.get_events(song_uuid) if e["event"] == "modified"][-1]["detail"]
+    )
+    assert detail["fields"] == ["source_url", "title"]
+
+
+def test_cmd_modify_source_url_untracked_song_warns(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    path = music / "Artist-Song.mp3"
+    write_tagged_mp3(path)
+    before = path.read_bytes()
+
+    monkeypatch.setattr(modify, "prompt_song_selection", lambda count: [0])
+    monkeypatch.setattr(
+        modify, "prompt_field_selection", lambda *a, **k: ["source_url"]
+    )
+    monkeypatch.setattr(
+        modify,
+        "prompt_field_value",
+        lambda label, default="": "https://new.example/song",
+    )
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+    monkeypatch.setattr(
+        modify,
+        "apply_tag_update",
+        lambda *a, **k: pytest.fail("source-only edits must not write the file"),
+    )
+
+    modify.cmd_modify(argparse.Namespace())
+
+    captured = capsys.readouterr()
+    assert "not tracked in the database" in captured.err
+    assert "needs no changes" in captured.out
+    assert path.read_bytes() == before
+    assert db.get_song_by_path("Artist-Song.mp3") == []
+
+
+def test_cmd_modify_source_url_with_reset_mb(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-Song.mp3")
+    scan_library()
+    row = db.get_song_by_path("Artist-Song.mp3")[0]
+    song_uuid = str(row["uuid"])
+    db.record_mb_status(
+        song_uuid,
+        db.MB_STATUS_TAGGED,
+        recording_id="rec-1",
+        release_group_id="rg-1",
+        tagged=True,
+    )
+
+    monkeypatch.setattr(modify, "prompt_song_selection", lambda count: [0])
+    monkeypatch.setattr(
+        modify, "prompt_field_selection", lambda *a, **k: ["source_url"]
+    )
+    monkeypatch.setattr(
+        modify,
+        "prompt_field_value",
+        lambda label, default="": "https://new.example/song",
+    )
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+
+    modify.cmd_modify(argparse.Namespace(reset_mb=True))
+
+    assert "Updated 1 song(s)" in capsys.readouterr().out
+    updated = db.get_song_by_uuid(song_uuid)
+    assert updated is not None
+    assert updated["source_url"] == "https://new.example/song"
+    assert updated["musicbrainz_status"] is None
+    assert updated["tagged"] == 0
+
+
+def _write_playlist(path, entries):
+    path.write_text(
+        json.dumps(
+            {"smclipy_playlist": 2, "name": "Test List", "songs": entries},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_cmd_modify_file_playlist_edits_entries(
+    monkeypatch, app_settings, capsys, tmp_path
+):
+    playlist = tmp_path / "list.json"
+    _write_playlist(
+        playlist,
+        [
+            {
+                "title": "One",
+                "artists": "Artist",
+                "artists_list": ["Artist"],
+                "album": "Album",
+                "source_url": "",
+            },
+            {
+                "title": "Two",
+                "artists": "Artist",
+                "artists_list": ["Artist"],
+                "album": "Album",
+                "source_url": "",
+            },
+        ],
+    )
+
+    def fake_value(label, default=""):
+        if label.startswith("Title"):
+            return "Renamed"
+        if label.startswith("Source URL"):
+            return "https://new.example/song"
+        return default
+
+    monkeypatch.setattr(modify, "prompt_song_selection", lambda count: [0, 1])
+    monkeypatch.setattr(
+        modify,
+        "prompt_field_selection",
+        lambda *args, **kwargs: ["title", "source_url", "artists"],
+    )
+    monkeypatch.setattr(modify, "prompt_field_value", fake_value)
+    monkeypatch.setattr(
+        modify, "prompt_authors", lambda known, default="": "New Artist"
+    )
+
+    modify.cmd_modify(argparse.Namespace(file=str(playlist), reset_mb=False))
+
+    payload = json.loads(playlist.read_text(encoding="utf-8"))
+    for entry in payload["songs"]:
+        assert entry["title"] == "Renamed"
+        assert entry["source_url"] == "https://new.example/song"
+        assert entry["artists_list"] == ["New Artist"]
+        assert entry["artists"] == "New Artist"
+    assert "Updated 2 playlist entr" in capsys.readouterr().out
+    assert db.list_songs() == []
+
+
+def test_cmd_modify_file_playlist_rejects_reset_mb(
+    monkeypatch, app_settings, capsys, tmp_path
+):
+    playlist = tmp_path / "list.json"
+    _write_playlist(playlist, [])
+
+    with pytest.raises(SystemExit) as excinfo:
+        modify.cmd_modify(argparse.Namespace(file=str(playlist), reset_mb=True))
+
+    assert excinfo.value.code == 1
+    assert "--reset-mb only applies to audio files" in capsys.readouterr().err
+
+
+def test_cmd_modify_file_audio_edits_tags_and_db(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    path = music / "Artist-Song.mp3"
+    write_tagged_mp3(path, title="Song", artist="Artist", album="Album")
+    scan_library()
+
+    def fake_value(label, default=""):
+        if label.startswith("Title"):
+            return "New Title"
+        if label.startswith("Album"):
+            return "New Album"
+        return default
+
+    monkeypatch.setattr(modify, "scan_library", lambda: None)
+    monkeypatch.setattr(
+        modify, "prompt_field_selection", lambda *args, **kwargs: ["title", "album"]
+    )
+    monkeypatch.setattr(modify, "prompt_field_value", fake_value)
+
+    modify.cmd_modify(argparse.Namespace(file=str(path), reset_mb=False))
+
+    id3 = ID3(path)
+    assert str(id3["TIT2"]) == "New Title"
+    assert str(id3["TALB"]) == "New Album"
+    row = db.get_song_by_path("Artist-Song.mp3")[0]
+    assert row["title"] == "New Title"
+    assert row["album"] == "New Album"
+    assert "Updated 'Artist-Song.mp3'" in capsys.readouterr().out
+
+
+def test_cmd_modify_file_audio_rejects_search_filters(
+    monkeypatch, app_settings, capsys, tmp_path
+):
+    path = tmp_path / "song.mp3"
+    write_tagged_mp3(path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        modify.cmd_modify(
+            argparse.Namespace(file=str(path), search="x", reset_mb=False)
+        )
+
+    assert excinfo.value.code == 1
+    assert "--search/--specific only apply" in capsys.readouterr().err

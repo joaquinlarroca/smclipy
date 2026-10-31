@@ -6,7 +6,9 @@
     "clean_unwanted_tags": false,
     "audio_format": "mp3",
     "max_download_attempts": 3,
+    "max_backups": -1,
     "cookies": "",
     "cookies_from_browser": "",
+    "source_preferences": ["youtube", "soundcloud"],
     "tag_fields": ["title", "artists", "album", "date", "genre", "album_artist", "track_number", "cover"]
 }

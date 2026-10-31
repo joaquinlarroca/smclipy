@@ -375,3 +375,136 @@ def test_download_reraises_keyboard_interrupt_from_chain(monkeypatch, app_settin
     _patch_ytdlp(monkeypatch, FakeYDL(error=error))
     with pytest.raises(KeyboardInterrupt):
         download("https://soundcloud.com/artist/track")
+
+
+class FakeSearchYDL:
+    def __init__(self, result=None, error=None) -> None:
+        self._result = result
+        self._error = error
+        self.url: str | None = None
+        self.download: bool | None = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> None:
+        return None
+
+    def extract_info(self, url: str, download: bool) -> dict:
+        self.url = url
+        self.download = download
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+def _patch_search_ytdlp(monkeypatch, fake: FakeSearchYDL) -> None:
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", lambda _opts: fake)
+
+
+def test_search_source_builds_youtube_search_url(monkeypatch, app_settings):
+    fake = FakeSearchYDL(
+        {
+            "entries": [
+                {
+                    "id": "abcdefghijk",
+                    "title": " Song ",
+                    "uploader": "Artist",
+                    "duration": 123,
+                }
+            ]
+        }
+    )
+    _patch_search_ytdlp(monkeypatch, fake)
+
+    results = downloader.search_source("youtube", "Artist Song", limit=5)
+
+    assert fake.url == "ytsearch5:Artist Song"
+    assert fake.download is False
+    assert results == [
+        downloader.SourceCandidate(
+            provider="youtube",
+            title="Song",
+            uploader="Artist",
+            duration=123.0,
+            url="https://www.youtube.com/watch?v=abcdefghijk",
+        )
+    ]
+
+
+def test_search_source_builds_soundcloud_search_url(monkeypatch, app_settings):
+    fake = FakeSearchYDL(
+        {
+            "entries": [
+                {
+                    "webpage_url": "https://soundcloud.com/user/track",
+                    "title": "Track",
+                    "uploader": "User",
+                }
+            ]
+        }
+    )
+    _patch_search_ytdlp(monkeypatch, fake)
+
+    results = downloader.search_source("soundcloud", "Track", limit=3)
+
+    assert fake.url == "scsearch3:Track"
+    assert results == [
+        downloader.SourceCandidate(
+            provider="soundcloud",
+            title="Track",
+            uploader="User",
+            duration=None,
+            url="https://soundcloud.com/user/track",
+        )
+    ]
+
+
+def test_search_source_skips_entries_without_url_or_title(monkeypatch, app_settings):
+    fake = FakeSearchYDL(
+        {
+            "entries": [
+                {"id": "abcdefghijk"},
+                {"title": "No URL"},
+                {"id": "abcdefghijk", "title": "Good"},
+            ]
+        }
+    )
+    _patch_search_ytdlp(monkeypatch, fake)
+
+    results = downloader.search_source("youtube", "query")
+
+    assert [candidate.title for candidate in results] == ["Good"]
+
+
+def test_search_source_empty_results(monkeypatch, app_settings):
+    _patch_search_ytdlp(monkeypatch, FakeSearchYDL({"entries": []}))
+    assert downloader.search_source("youtube", "query") == []
+
+
+def test_search_source_wraps_provider_errors(monkeypatch, app_settings):
+    error = yt_dlp.utils.DownloadError("ERROR: network down")
+    _patch_search_ytdlp(monkeypatch, FakeSearchYDL(error=error))
+
+    with pytest.raises(downloader.SourceSearchError):
+        downloader.search_source("youtube", "query")
+
+
+def test_search_source_wraps_other_ytdlp_errors(monkeypatch, app_settings):
+    error = yt_dlp.utils.MaxDownloadsReached("limit reached")
+    _patch_search_ytdlp(monkeypatch, FakeSearchYDL(error=error))
+
+    with pytest.raises(downloader.SourceSearchError):
+        downloader.search_source("youtube", "query")
+
+
+def test_search_source_wraps_os_errors(monkeypatch, app_settings):
+    _patch_search_ytdlp(monkeypatch, FakeSearchYDL(error=OSError("cookie vanished")))
+
+    with pytest.raises(downloader.SourceSearchError):
+        downloader.search_source("youtube", "query")
+
+
+def test_search_source_rejects_unknown_provider(app_settings):
+    with pytest.raises(downloader.SourceSearchError):
+        downloader.search_source("bandcamp", "query")

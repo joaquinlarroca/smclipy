@@ -982,6 +982,259 @@ def test_process_video_reprompts_on_empty_authors(monkeypatch, app_settings):
     assert captured["authors"] == "Artist"
 
 
+def test_process_video_playlist_meta_skips_metadata_prompts(monkeypatch, app_settings):
+    import smclipy.cli as cli
+    from smclipy.playlists import PlaylistSongMeta
+
+    captured = {}
+    monkeypatch.setattr(
+        cli, "download", lambda url, stem="temp": {"title": "Source Title"}
+    )
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "get_album", lambda info: "Source Album")
+    monkeypatch.setattr(cli, "get_author", lambda info: [])
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    for name in ("prompt_title", "prompt_album", "prompt_authors", "prompt_crop"):
+        monkeypatch.setattr(cli, name, Mock(side_effect=AssertionError(name)))
+
+    def fake_save(temp, cover, title, authors, album, **kwargs):
+        captured.update(
+            title=title, authors=authors, album=album, overwrite=kwargs.get("overwrite")
+        )
+        captured["extra_fields"] = kwargs.get("extra_fields")
+        return SaveResult.SAVED, None
+
+    monkeypatch.setattr(cli, "save_song_temp_to_main", fake_save)
+    meta = PlaylistSongMeta(
+        uuid="12345678-1234-5678-1234-567812345678",
+        title="Json Title",
+        artists=["Json Artist"],
+        album="Json Album",
+        album_artist="Json Album Artist",
+        genre="pop; rock",
+        date="1980-01-01",
+        track_number="3",
+        source_url="https://example.test/song",
+    )
+
+    process_video("https://soundcloud.com/artist/track", [], meta=meta)
+
+    assert captured["title"] == "Json Title"
+    assert captured["album"] == "Json Album"
+    assert captured["authors"] == "Json Artist"
+    assert captured["overwrite"] is None
+    assert captured["extra_fields"] == {
+        "date": "1980-01-01",
+        "genre": "pop; rock",
+        "album_artist": "Json Album Artist",
+        "track_number": "3",
+    }
+
+
+def test_process_video_playlist_meta_falls_back_to_source(monkeypatch, app_settings):
+    import smclipy.cli as cli
+    from smclipy.playlists import PlaylistSongMeta
+
+    captured = {}
+    monkeypatch.setattr(cli, "download", lambda url, stem="temp": {})
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "get_album", lambda info: "")
+    monkeypatch.setattr(cli, "get_author", lambda info: [])
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    for name in ("prompt_title", "prompt_album", "prompt_authors", "prompt_crop"):
+        monkeypatch.setattr(cli, name, Mock(side_effect=AssertionError(name)))
+
+    def fake_save(temp, cover, title, authors, album, **kwargs):
+        captured.update(title=title, authors=authors, album=album)
+        captured["extra_fields"] = kwargs.get("extra_fields")
+        return SaveResult.SAVED, None
+
+    monkeypatch.setattr(cli, "save_song_temp_to_main", fake_save)
+
+    process_video(
+        "https://soundcloud.com/artist/track",
+        [],
+        no_prompt=True,
+        meta=PlaylistSongMeta(),
+    )
+
+    assert captured["title"] == "sc-artist-track"
+    assert captured["album"] == ""
+    assert captured["authors"] == "Unknown Artist"
+    assert captured["extra_fields"] == {
+        "date": "",
+        "genre": "",
+        "album_artist": "",
+        "track_number": "",
+    }
+
+
+def test_process_video_playlist_meta_writes_tags_and_db(monkeypatch, app_settings):
+    import smclipy.cli as cli
+    from smclipy.formats import Track
+    from smclipy.playlists import PlaylistSongMeta
+
+    url = "https://soundcloud.com/artist/track"
+    stem = cli.temp_stem(url)
+    app_settings.temp_folder.mkdir(parents=True, exist_ok=True)
+    app_settings.music_folder.mkdir(parents=True, exist_ok=True)
+    (app_settings.temp_folder / f"{stem}.mp3").write_bytes(MINIMAL_MP3)
+    monkeypatch.setattr(cli, "_cleanup_temp_files", lambda s: None)
+    monkeypatch.setattr(
+        cli, "download", lambda url, stem="temp": {"title": "Source Title"}
+    )
+    monkeypatch.setattr(cli, "get_image_from_file", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "show_video_info", lambda *a, **k: None)
+    for name in ("prompt_title", "prompt_album", "prompt_authors", "prompt_crop"):
+        monkeypatch.setattr(cli, name, Mock(side_effect=AssertionError(name)))
+
+    song_uuid = "12345678-1234-5678-1234-567812345678"
+    result = process_video(
+        url,
+        [],
+        no_prompt=True,
+        meta=PlaylistSongMeta(
+            uuid=song_uuid,
+            title="Json Title",
+            artists=["Json Artist"],
+            album="Json Album",
+            album_artist="Json Album Artist",
+            genre="pop; rock",
+            date="1980-01-01",
+            track_number="3",
+            source_url="https://example.test/song",
+        ),
+    )
+
+    assert result is SaveResult.SAVED
+    target = app_settings.music_folder / "Json Artist-Json Title.mp3"
+    assert target.is_file()
+    track = Track.open(target)
+    assert track is not None
+    assert track.read_text("title") == "Json Title"
+    assert track.read_text("album") == "Json Album"
+    assert track.read_text("date") == "1980-01-01"
+    assert track.read_text("genre") == "pop; rock"
+    assert track.read_text("album_artist") == "Json Album Artist"
+    assert track.read_text("track_number") == "3"
+    assert track.read_uuid() == song_uuid
+
+    row = db.get_song_by_uuid(song_uuid)
+    assert row is not None
+    assert row["title"] == "Json Title"
+    assert row["album"] == "Json Album"
+    assert row["date"] == "1980-01-01"
+    assert row["genre"] == "pop; rock"
+    assert row["album_artist"] == "Json Album Artist"
+    assert row["track_number"] == "3"
+    assert row["source_url"] == url
+
+
+def test_cmd_download_playlist_file_downloads_missing(
+    monkeypatch, app_settings, tmp_path, capsys
+):
+    import smclipy.cli as cli
+
+    existing_uuid = db.insert_song(current_path="Artist-Existing.mp3", title="Existing")
+    playlist_file = tmp_path / "roadtrip.json"
+    playlist_file.write_text(
+        json.dumps(
+            {
+                "smclipy_playlist": 2,
+                "name": "Roadtrip",
+                "songs": [
+                    {"uuid": existing_uuid, "path": "Artist-Existing.mp3"},
+                    {
+                        "uuid": "missing-uuid",
+                        "title": "Missing Title",
+                        "artists_list": ["Missing Artist"],
+                        "album": "Missing Album",
+                        "date": "1980",
+                        "genres": ["pop"],
+                        "source_url": "https://example.test/missing",
+                    },
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    monkeypatch.setattr(cli, "scan_library", lambda: None)
+    monkeypatch.setattr(
+        cli, "_index_songs", lambda: ({existing_uuid: existing_uuid}, {}, {})
+    )
+    calls = []
+
+    def fake_process(url, authors, **kwargs):
+        calls.append((url, kwargs))
+        return SaveResult.SAVED
+
+    monkeypatch.setattr(cli, "process_video", fake_process)
+    monkeypatch.setattr(cli.db, "mark_processed", lambda url: None)
+
+    cli.cmd_download(argparse.Namespace(file=str(playlist_file), auto=True))
+
+    assert len(calls) == 1
+    url, kwargs = calls[0]
+    assert url == "https://example.test/missing"
+    assert kwargs["no_prompt"] is True
+    meta = kwargs["meta"]
+    assert meta.title == "Missing Title"
+    assert meta.artists == ["Missing Artist"]
+    assert meta.album == "Missing Album"
+    assert meta.date == "1980"
+    assert meta.genre == "pop"
+    out = capsys.readouterr().out
+    assert "1 already in library, 1 missing" in out
+    assert "downloaded 1, skipped 0, failed 0" in out
+    assert "re-run `smclipy playlist import" in out
+
+
+def test_cmd_download_playlist_file_reports_entries_without_source(
+    monkeypatch, app_settings, tmp_path, capsys
+):
+    import smclipy.cli as cli
+
+    playlist_file = tmp_path / "roadtrip.json"
+    playlist_file.write_text(
+        json.dumps(
+            {
+                "smclipy_playlist": 2,
+                "name": "Roadtrip",
+                "songs": [{"uuid": "missing-uuid", "title": "Missing"}],
+            }
+        )
+    )
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    monkeypatch.setattr(cli, "scan_library", lambda: None)
+    monkeypatch.setattr(cli, "_index_songs", lambda: ({}, {}, {}))
+    process_video = Mock()
+    monkeypatch.setattr(cli, "process_video", process_video)
+
+    cli.cmd_download(argparse.Namespace(file=str(playlist_file), auto=True))
+
+    process_video.assert_not_called()
+    out = capsys.readouterr().out
+    assert "1 missing song(s) have no source URL" in out
+    assert "Nothing to download." in out
+
+
+def test_cmd_download_playlist_file_rejects_wrong_version(
+    monkeypatch, app_settings, tmp_path, capsys
+):
+    import smclipy.cli as cli
+
+    playlist_file = tmp_path / "old.json"
+    playlist_file.write_text('{"smclipy_playlist": 1, "songs": []}')
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    monkeypatch.setattr(cli, "scan_library", lambda: None)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_download(argparse.Namespace(file=str(playlist_file), auto=True))
+
+    assert exc.value.code == 1
+    assert "unsupported playlist version" in capsys.readouterr().err
+
+
 def test_cmd_download_skips_unexpected_errors(monkeypatch, app_settings, capsys):
     import smclipy.cli as cli
 
@@ -1376,6 +1629,18 @@ def test_main_playlist_import_runs_without_tty(monkeypatch, app_settings, capsys
     assert calls[0].playlist_action == "import"
 
 
+def test_main_playlist_export_no_scan_flag(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_playlist", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["playlist", "export", "Chill", "--no-scan"])
+    assert len(calls) == 1
+    assert calls[0].no_scan is True
+
+
 def test_main_directories_flag_rejects_command(monkeypatch, app_settings, capsys):
     import smclipy.cli as cli
 
@@ -1429,6 +1694,32 @@ def test_main_download_batch_runs_without_tty(monkeypatch, app_settings, capsys)
     assert "interactive terminal" not in capsys.readouterr().out
 
 
+def test_main_download_file_auto_runs_without_tty(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_download", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["download", "--file", "playlist.json", "--auto"])
+
+    assert len(calls) == 1
+    assert calls[0].file == "playlist.json"
+    assert calls[0].auto is True
+    assert "interactive terminal" not in capsys.readouterr().out
+
+
+def test_main_download_file_without_auto_requires_tty(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["download", "--file", "playlist.json"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
 def test_main_download_batch_without_no_prompt_requires_tty(monkeypatch, capsys):
     import smclipy.cli as cli
 
@@ -1449,8 +1740,14 @@ def test_main_restore_dispatches(monkeypatch, capsys):
 
     cli.main(["restore"])
     assert len(calls) == 1
+    assert calls[0].all is False
+    assert calls[0].limit == 25
     captured = capsys.readouterr()
     assert "interactive terminal" not in captured.out + captured.err
+
+    cli.main(["restore", "--all", "--limit", "5"])
+    assert calls[1].all is True
+    assert calls[1].limit == 5
 
 
 def test_main_restore_requires_tty(monkeypatch, capsys):
@@ -1767,3 +2064,128 @@ def test_cmd_crop_does_not_record_cropped_when_reembed_fails(
     row = db.get_song_by_path("Artist-Song.mp3")
     assert row is not None
     assert row[0]["cover_status"] != db.COVER_STATUS_CROPPED
+
+
+def test_main_dispatch_dispatches_findsource(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_findsource", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["findsource", "--force"])
+
+    assert len(calls) == 1
+    assert calls[0].command == "findsource"
+    assert calls[0].auto is False
+    assert calls[0].all is False
+    assert calls[0].force is True
+    assert calls[0].search is None
+    assert calls[0].specific is None
+
+
+def test_main_findsource_auto_all_runs_without_tty(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_findsource", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["findsource", "--auto", "--all"])
+
+    assert len(calls) == 1
+    assert calls[0].auto is True
+    assert calls[0].all is True
+    assert "interactive terminal" not in capsys.readouterr().out
+
+
+def test_main_findsource_all_without_auto_requires_tty(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["findsource", "--all"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_findsource_specific_requires_tty_even_auto_all(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["findsource", "--auto", "--all", "--specific", "album"])
+    assert exc.value.code == 1
+    assert "interactive terminal" in capsys.readouterr().err
+
+
+def test_main_findsource_rejects_search_and_specific_together(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["findsource", "--search", "x", "--specific", "album"])
+    assert exc.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_main_rejects_findsource_json_without_auto_all(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["findsource", "--json"])
+    assert exc.value.code == 2
+    assert "--json requires --auto and --all" in capsys.readouterr().err
+
+
+def test_main_accepts_findsource_json_auto_all(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_findsource", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["findsource", "--json", "--auto", "--all"])
+
+    assert len(calls) == 1
+    assert calls[0].json is True
+    assert calls[0].auto is True
+    assert calls[0].all is True
+
+
+def test_main_findsource_all_providers_requires_auto(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["findsource", "--all-providers"])
+    assert exc.value.code == 2
+    assert "--all-providers requires --auto" in capsys.readouterr().err
+
+
+def test_main_accepts_findsource_all_providers_auto(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_findsource", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["findsource", "--auto", "--all", "--all-providers"])
+
+    assert len(calls) == 1
+    assert calls[0].all_providers is True
+
+
+def test_main_accepts_findsource_skip_skipped(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_findsource", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["findsource", "--auto", "--all", "--skip-skipped"])
+
+    assert len(calls) == 1
+    assert calls[0].skip_skipped is True

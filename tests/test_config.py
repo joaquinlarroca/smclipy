@@ -299,6 +299,28 @@ def test_settings_rejects_bogus_max_download_attempts(tmp_path, capsys):
     assert "max_download_attempts" in capsys.readouterr().err
 
 
+def test_settings_default_max_backups_is_unlimited(tmp_path):
+    s = Settings({"path_to_music_folder": str(tmp_path)})
+    assert s.max_backups == -1
+
+
+def test_settings_parses_max_backups(tmp_path):
+    s = Settings({"path_to_music_folder": str(tmp_path), "max_backups": "5"})
+    assert s.max_backups == 5
+
+
+def test_settings_parses_unlimited_max_backups(tmp_path):
+    s = Settings({"path_to_music_folder": str(tmp_path), "max_backups": "-1"})
+    assert s.max_backups == -1
+
+
+@pytest.mark.parametrize("value", [0, -2, True, "often", 2.5])
+def test_settings_rejects_bogus_max_backups(tmp_path, capsys, value):
+    s = Settings({"path_to_music_folder": str(tmp_path), "max_backups": value})
+    assert s.max_backups == -1
+    assert "max_backups" in capsys.readouterr().err
+
+
 def test_settings_default_cookies_empty(tmp_path):
     s = Settings({"path_to_music_folder": str(tmp_path)})
     assert s.cookies == ""
@@ -477,3 +499,45 @@ def test_setup_folders_reports_unwritable_music_folder(tmp_path, monkeypatch, ca
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "could not create" in captured.err
+
+
+def test_source_preferences_default(tmp_path):
+    s = Settings({"path_to_music_folder": str(tmp_path)})
+    assert s.source_preferences == ["youtube", "soundcloud"]
+
+
+def test_source_preferences_normalizes_aliases_and_dedupes(tmp_path):
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "source_preferences": ["yt", "soundcloud", "youtube", "sc"],
+        }
+    )
+    assert s.source_preferences == ["youtube", "soundcloud"]
+
+
+def test_source_preferences_drops_unknown_providers(tmp_path, capsys):
+    s = Settings(
+        {
+            "path_to_music_folder": str(tmp_path),
+            "source_preferences": ["soundcloud", "bogus", 42],
+        }
+    )
+    assert s.source_preferences == ["soundcloud"]
+    captured = capsys.readouterr()
+    assert "unknown source provider 'bogus'" in captured.err
+    assert "entries must be strings" in captured.err
+
+
+def test_source_preferences_empty_list_falls_back_to_default(tmp_path, capsys):
+    s = Settings({"path_to_music_folder": str(tmp_path), "source_preferences": []})
+    assert s.source_preferences == ["youtube", "soundcloud"]
+    assert "no valid providers" in capsys.readouterr().err
+
+
+def test_source_preferences_non_list_falls_back_to_default(tmp_path, capsys):
+    s = Settings(
+        {"path_to_music_folder": str(tmp_path), "source_preferences": "youtube"}
+    )
+    assert s.source_preferences == ["youtube", "soundcloud"]
+    assert "must be a list" in capsys.readouterr().err

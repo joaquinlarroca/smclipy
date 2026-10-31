@@ -1,10 +1,12 @@
 import sys
+from html import escape
 from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit import prompt
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.filters import has_focus
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
 from prompt_toolkit.key_binding.bindings.focus import focus_next, focus_previous
 from prompt_toolkit.key_binding.defaults import load_key_bindings
@@ -15,9 +17,10 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Button, CheckboxList, Dialog, Label
 
 from smclipy.config import settings
-from smclipy.downloader import get_author
+from smclipy.downloader import get_author, matches_duration
 
 if TYPE_CHECKING:
+    from smclipy.downloader import SourceCandidate
     from smclipy.musicbrainz import MusicBrainzMatch
 
 
@@ -242,6 +245,89 @@ def prompt_match_selection(matches: list["MusicBrainzMatch"]) -> int | None:
     return index - 1
 
 
+def format_duration(seconds: float) -> str:
+    total = int(seconds)
+    if total >= 3600:
+        return f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}"
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def prompt_source_selection(
+    candidates: list["SourceCandidate"],
+    *,
+    song_duration: float | None = None,
+    matches: list[bool] | None = None,
+) -> int | None:
+    """Let the user pick one source candidate, or None to skip the song.
+
+    Candidates whose length is within a couple of seconds of the library song
+    are highlighted so the most plausible match stands out. When ``matches``
+    is given, candidates marked ``False`` are shown in red as unmatched, and
+    if none match, Skip is highlighted and selected by default.
+    """
+    if matches is not None and len(matches) != len(candidates):
+        raise ValueError("matches must have one entry per candidate")
+    no_match: bool = matches is not None and not any(matches)
+    options: list[tuple[str, Any]] = []
+    skip_label: str = "Skip this song"
+    if no_match:
+        skip_label += "  [no artist/title match]"
+        options.append(
+            (
+                "Skip this song",
+                HTML(f"<ansired><b>{escape(skip_label)}</b></ansired>"),
+            )
+        )
+    else:
+        options.append(("Skip this song", skip_label))
+    for index, candidate in enumerate(candidates, start=1):
+        label: str = candidate.title
+        if candidate.uploader:
+            label += f" - {candidate.uploader}"
+        label += f" | {candidate.provider}"
+        if candidate.duration:
+            label += f" ({format_duration(candidate.duration)})"
+        if matches is not None and not matches[index - 1]:
+            label += "  [no artist/title match]"
+            options.append((str(index), HTML(f"<ansired>{escape(label)}</ansired>")))
+        elif matches_duration(candidate, song_duration):
+            label = f"★ {label}  [same length]"
+            options.append(
+                (
+                    str(index),
+                    HTML(f"<ansigreen><b>{escape(label)}</b></ansigreen>"),
+                )
+            )
+        else:
+            options.append((str(index), label))
+    duration_hint: str = (
+        f" ({format_duration(song_duration)})"
+        if song_duration is not None and song_duration > 0
+        else ""
+    )
+    if matches is None:
+        default: str = "1" if candidates else "Skip this song"
+    else:
+        default = next(
+            (str(index) for index, matched in enumerate(matches, start=1) if matched),
+            "Skip this song",
+        )
+    selection: str = choice(
+        message=f"Pick a source for this song{duration_hint}:",
+        options=options,
+        default=default,
+    )
+    if selection == "Skip this song":
+        return None
+    try:
+        index = int(selection)
+    except ValueError:
+        return None
+    if 1 <= index <= len(candidates):
+        return index - 1
+    return None
+
+
 _DARK_DIALOG_STYLE: Style = Style.from_dict(
     {
         "dialog": "bg:#1e1e1e #d4d4d4",
@@ -280,6 +366,7 @@ TAG_FIELD_LABELS: dict[str, str] = {
     "genre": "Genre",
     "album_artist": "Album artist",
     "track_number": "Track number",
+    "source_url": "Source URL",
 }
 
 

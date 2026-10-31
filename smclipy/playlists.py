@@ -8,19 +8,21 @@ tracked songs), and can be ordered by hand or sorted by common metadata.
 
 import json
 import os
+import shlex
 import sqlite3
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import smclipy.db as db
 from smclipy.config import settings
-from smclipy.helpers import sanitize_filename
+from smclipy.helpers import display_authors, sanitize_filename, split_authors
 from smclipy.metadata import scan_library
 from smclipy.ui import prompt_position_selection, prompt_song_selection
 
 M3U_HEADER = "#EXTM3U"
-JSON_PLAYLIST_VERSION = 1
+JSON_PLAYLIST_VERSION = 2
 
 SORT_KEYS: dict[str, str] = {
     "title": "title",
@@ -31,6 +33,75 @@ SORT_KEYS: dict[str, str] = {
 }
 
 
+@dataclass(frozen=True)
+class PlaylistSongMeta:
+    """Metadata embedded in a playlist JSON entry for a missing song."""
+
+    uuid: str | None = None
+    title: str = ""
+    artists: list[str] = field(default_factory=list)
+    album: str = ""
+    album_artist: str = ""
+    genre: str = ""
+    date: str = ""
+    track_number: str = ""
+    source_url: str = ""
+
+
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [
+        str(item).strip()
+        for item in value
+        if isinstance(item, str) and str(item).strip()
+    ]
+
+
+def entry_source_url(entry: Any) -> str | None:
+    """The download URL carried by a playlist entry, if any."""
+    if not isinstance(entry, dict):
+        return None
+    source_url: str = _text(entry.get("source_url"))
+    return source_url or None
+
+
+def song_meta_from_entry(entry: Any) -> PlaylistSongMeta:
+    """Read the v2 metadata fields from one playlist entry.
+
+    ``artists_list`` (written by newer exports) is preferred because the
+    human-facing ``artists`` string cannot represent names containing commas
+    unambiguously. Playlists from other tools still fall back to splitting
+    ``artists``.
+    """
+    if not isinstance(entry, dict):
+        return PlaylistSongMeta()
+    artists: list[str] = _text_list(entry.get("artists_list"))
+    if not artists:
+        artists = split_authors(_text(entry.get("artists")))
+    raw_genres: Any = entry.get("genres")
+    genre: str = (
+        "; ".join(_text_list(raw_genres))
+        if isinstance(raw_genres, list)
+        else "; ".join(_genres(raw_genres))
+    )
+    return PlaylistSongMeta(
+        uuid=_text(entry.get("uuid")) or None,
+        title=_text(entry.get("title")),
+        artists=artists,
+        album=_text(entry.get("album")),
+        album_artist=_text(entry.get("album_artist")),
+        genre=genre,
+        date=_text(entry.get("date")),
+        track_number=_text(entry.get("track_number")),
+        source_url=_text(entry.get("source_url")),
+    )
+
+
 def _fallback_title(row: sqlite3.Row) -> str:
     path: str = str(row["current_path"] or row["first_seen_path"] or "")
     return Path(path).stem or "(unknown title)"
@@ -39,7 +110,7 @@ def _fallback_title(row: sqlite3.Row) -> str:
 def _song_label(row: sqlite3.Row, *, extinf: bool = False) -> str:
     """``Title - Artists`` for listing, ``Artists - Title`` for EXTINF."""
     title: str = str(row["title"] or "") or _fallback_title(row)
-    artists: str = str(row["artists"] or "")
+    artists: str = display_authors(str(row["artists"] or ""))
     if extinf:
         return f"{artists} - {title}" if artists else title
     return f"{title} - {artists}" if artists else title
@@ -67,7 +138,6 @@ def _m3u_label(row: sqlite3.Row) -> str:
 
 
 def serialize_m3u(
-    name: str,
     rows: list[sqlite3.Row],
     export_dir: Path,
     music_folder: Path,
@@ -87,6 +157,29 @@ def serialize_m3u(
     return "\n".join(lines) + "\n"
 
 
+def serialize_m3u_link(rows: list[sqlite3.Row]) -> str:
+    """Render rows as a link ``.m3u`` playlist: one source URL per line.
+
+    Each URL is preceded by an ``#EXTINF`` line carrying the song's artists
+    and title. Songs without a recorded source URL are skipped.
+    """
+    entries: list[str] = []
+    for row in rows:
+        url: str = str(row["source_url"] or "").strip()
+        if not url:
+            continue
+        entries.append(f"#EXTINF:-1,{_m3u_label(row)}")
+        entries.append(url)
+    if not entries:
+        return ""
+    return "\n".join([M3U_HEADER, *entries]) + "\n"
+
+
+def _genres(value: Any) -> list[str]:
+    """Split the stored ``"; "``-joined genre string into a clean list."""
+    return [part.strip() for part in str(value or "").split(";") if part.strip()]
+
+
 def serialize_json(
     name: str,
     rows: list[sqlite3.Row],
@@ -102,7 +195,7 @@ def serialize_json(
     the exported file), matching the m3u format and the CLI docs, so import
     resolves them the same way.
     """
-    songs: list[dict[str, str]] = []
+    songs: list[dict[str, Any]] = []
     for row in rows:
         path: str | None = _export_path(
             row, music_folder, export_dir or music_folder, absolute=absolute
@@ -113,7 +206,14 @@ def serialize_json(
             {
                 "uuid": str(row["uuid"]),
                 "title": str(row["title"] or ""),
-                "artists": str(row["artists"] or ""),
+                "artists": display_authors(str(row["artists"] or "")),
+                "artists_list": split_authors(str(row["artists"] or "")),
+                "album": str(row["album"] or ""),
+                "album_artist": str(row["album_artist"] or ""),
+                "genres": _genres(row["genre"]),
+                "date": str(row["date"] or ""),
+                "track_number": str(row["track_number"] or ""),
+                "source_url": str(row["source_url"] or ""),
                 "path": path,
             }
         )
@@ -136,14 +236,17 @@ def parse_m3u(text: str) -> list[str]:
     return entries
 
 
-def parse_json(text: str) -> tuple[str | None, list[Any]]:
-    """Parse the smclipy playlist JSON format into (name, entries)."""
+def _parse_json_payload(text: str) -> dict[str, Any]:
     try:
         data: Any = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid playlist JSON: {exc}") from None
     if not isinstance(data, dict):
         raise ValueError("invalid playlist JSON: expected an object")
+    return data
+
+
+def _payload_entries(data: dict[str, Any]) -> tuple[str | None, list[Any]]:
     songs: Any = data.get("songs")
     if not isinstance(songs, list):
         raise ValueError("invalid playlist JSON: expected a 'songs' list")
@@ -154,8 +257,41 @@ def parse_json(text: str) -> tuple[str | None, list[Any]]:
     return name, songs
 
 
+def parse_json(text: str) -> tuple[str | None, list[Any]]:
+    """Parse the smclipy playlist JSON format into (name, entries)."""
+    return _payload_entries(_parse_json_payload(text))
+
+
+def parse_json_v2_payload(
+    text: str,
+) -> tuple[dict[str, Any], str | None, list[Any]]:
+    """Parse a v2 playlist while keeping the full payload for editing."""
+    data: dict[str, Any] = _parse_json_payload(text)
+    raw_version: Any = data.get("smclipy_playlist")
+    try:
+        version: int = int(raw_version)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "invalid playlist JSON: missing 'smclipy_playlist' version"
+        ) from None
+    if version != JSON_PLAYLIST_VERSION:
+        raise ValueError(
+            f"unsupported playlist version {version}; expected {JSON_PLAYLIST_VERSION}"
+        )
+    name, entries = _payload_entries(data)
+    return data, name, entries
+
+
+def parse_json_v2(text: str) -> tuple[str | None, list[Any]]:
+    """Parse a playlist JSON file that must use the current v2 format."""
+    _data, name, entries = parse_json_v2_payload(text)
+    return name, entries
+
+
 def _format_from_filename(filename: str) -> str:
     ext: str = Path(filename).suffix.lower().lstrip(".")
+    if ext == "m3u-link":
+        return "m3u-link"
     if ext in ("m3u", "m3u8"):
         return "m3u"
     if ext == "json":
@@ -315,15 +451,15 @@ def cmd_playlist_show(args: Any) -> None:
                     "name": name,
                     "songs": [
                         {
-                            "position": int(row["position"]),
+                            "position": index,
                             "uuid": row["uuid"],
                             "title": str(row["title"] or "") or _fallback_title(row),
-                            "artists": row["artists"] or "",
+                            "artists": display_authors(str(row["artists"] or "")),
                             "album": row["album"] or "",
                             "path": row["current_path"],
                             "missing": not row["current_path"],
                         }
-                        for row in rows
+                        for index, row in enumerate(rows, start=1)
                     ],
                 },
                 indent=2,
@@ -348,7 +484,7 @@ def _scan_and_list_songs() -> list[sqlite3.Row]:
 def cmd_playlist_add(args: Any) -> None:
     name: str = args.name.strip()
     _require_playlist(name)
-    songs = _scan_and_list_songs()
+    songs = [row for row in _scan_and_list_songs() if row["current_path"]]
     if not songs:
         print("No songs in the library to add.")
         return
@@ -356,8 +492,7 @@ def cmd_playlist_add(args: Any) -> None:
     print(f"\nSongs in your library ('[in playlist]' songs are already in '{name}'):")
     for index, row in enumerate(songs, start=1):
         marker: str = " [in playlist]" if str(row["uuid"]) in present else ""
-        missing: str = " (missing)" if not row["current_path"] else ""
-        print(f"{index:3}. {_song_label(row)}{marker}{missing}")
+        print(f"{index:3}. {_song_label(row)}{marker}")
 
     selected: list[int] = prompt_song_selection(len(songs))
     added = already = 0
@@ -454,23 +589,38 @@ def cmd_playlist_export(args: Any) -> None:
     if not rows:
         print(f"Playlist '{name}' is empty; nothing to export.")
         return
+    s = settings()
+    if not bool(getattr(args, "no_scan", False)):
+        if not s.music_folder.is_dir():
+            print(
+                f"Error: music folder not found at '{s.music_folder}'.", file=sys.stderr
+            )
+            raise SystemExit(1)
+        print("Scanning music files...")
+        scan_library()
+        rows = db.get_playlist_songs(name)
     fmt: str = _infer_export_format(args)
+    default_ext: str = "m3u" if fmt == "m3u-link" else fmt
     out_path: Path = (
         Path(args.output).expanduser()
         if args.output
-        else Path(f"{sanitize_filename(name)}.{fmt}")
+        else Path(f"{sanitize_filename(name) or 'playlist'}.{default_ext}")
     )
-    s = settings()
-    missing_count: int = sum(1 for row in rows if not row["current_path"])
+    if fmt == "m3u-link":
+        missing_count: int = sum(
+            1 for row in rows if not str(row["source_url"] or "").strip()
+        )
+        content: str = serialize_m3u_link(rows)
+    else:
+        missing_count = sum(1 for row in rows if not row["current_path"])
     if fmt == "m3u":
-        content: str = serialize_m3u(
-            name,
+        content = serialize_m3u(
             rows,
             out_path.parent,
             s.music_folder,
             absolute=bool(args.absolute),
         )
-    else:
+    elif fmt == "json":
         content = serialize_json(
             name,
             rows,
@@ -490,10 +640,50 @@ def cmd_playlist_export(args: Any) -> None:
         f"{'s' if exported != 1 else ''})."
     )
     if missing_count:
+        reason: str = "missing" if fmt != "m3u-link" else "sourceless"
         message += (
-            f" Skipped {missing_count} missing song{'s' if missing_count != 1 else ''}."
+            f" Skipped {missing_count} {reason} song"
+            f"{'s' if missing_count != 1 else ''}."
         )
     print(message)
+
+
+def _print_download_hint(
+    fmt: str,
+    path: Path,
+    missing_entries: list[Any],
+    *,
+    stream: TextIO | None = None,
+) -> None:
+    """Suggest the download command that can fetch missing JSON entries."""
+    if fmt != "json" or not missing_entries:
+        return
+    out: TextIO = stream or sys.stdout
+    with_source: list[Any] = [
+        entry for entry in missing_entries if entry_source_url(entry)
+    ]
+    if not with_source:
+        print(
+            "Hint: those songs have no source URL, so they cannot be "
+            "downloaded automatically.",
+            file=out,
+        )
+        return
+    command: str = f"smclipy download --file {shlex.quote(str(path))}"
+    total: int = len(missing_entries)
+    if len(with_source) == total:
+        print(
+            f"Hint: run `{command}` to download them and apply the playlist "
+            "metadata automatically.",
+            file=out,
+        )
+    else:
+        print(
+            f"Hint: run `{command}` to download {len(with_source)} of them and "
+            f"apply the playlist metadata automatically; the other "
+            f"{total - len(with_source)} have no source URL.",
+            file=out,
+        )
 
 
 def cmd_playlist_import(args: Any) -> None:
@@ -550,46 +740,51 @@ def cmd_playlist_import(args: Any) -> None:
     music_folder: Path = settings().music_folder
     by_uuid, by_abs, by_name = _index_songs()
     uuids: list[str] = []
-    unresolved: int = 0
+    unresolved: list[Any] = []
+    missing_files: list[Any] = []
     for entry in entries:
         uuid: str | None = _resolve_entry(
             entry, music_folder, path.parent, by_uuid, by_abs, by_name
         )
         if uuid is None:
-            unresolved += 1
+            unresolved.append(entry)
             continue
+        row = db.get_song_by_uuid(uuid)
+        if row is not None and not row["current_path"]:
+            missing_files.append(entry)
         if uuid not in uuids:
             uuids.append(uuid)
+    not_found_entries: list[Any] = unresolved + missing_files
+    not_found: int = len(not_found_entries)
 
-    if playlist is not None and args.replace and not uuids:
-        # `--replace` clears the existing contents first; when the file resolved
-        # to nothing (wrong folder, renamed library) that would silently wipe
-        # the playlist, so refuse instead.
+    if not uuids:
+        # Nothing resolved (wrong folder, renamed library): creating an empty
+        # playlist or clearing a populated one would silently destroy data.
+        action_word: str = "replace" if playlist is not None else "create"
         print(
-            f"Error: none of the {len(entries)} entr"
-            f"{'y' if len(entries) == 1 else 'ies'} in '{path.name}' matched a "
-            f"library song; refusing to replace playlist '{name}'.",
+            f"Error: {not_found} song(s) not found in your library; refusing to "
+            f"{action_word} playlist '{name}' from '{path.name}'.",
             file=sys.stderr,
         )
+        _print_download_hint(fmt, path, not_found_entries, stream=sys.stderr)
         raise SystemExit(1)
 
-    if playlist is None:
-        db.create_playlist(name)
-    if args.replace:
-        db.set_playlist_songs(name, uuids)
-    else:
-        for uuid in uuids:
-            db.add_song_to_playlist(name, uuid)
+    with db.transaction() as conn:
+        if playlist is None:
+            db.create_playlist(name, conn=conn)
+        if args.replace:
+            db.set_playlist_songs(name, uuids, conn=conn)
+        else:
+            for uuid in uuids:
+                db.add_song_to_playlist(name, uuid, conn=conn)
 
     message: str = (
         f"Imported {len(uuids)} song(s) into playlist '{name}' from '{path.name}'."
     )
-    if unresolved:
-        message += (
-            f" {unresolved} entr{'y' if unresolved == 1 else 'ies'} did not "
-            "match a library song."
-        )
+    if not_found:
+        message += f" {not_found} song(s) not found in your library."
     print(message)
+    _print_download_hint(fmt, path, not_found_entries)
 
 
 _ACTIONS: dict[str, Any] = {

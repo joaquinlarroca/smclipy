@@ -580,8 +580,9 @@ def _run_tag(
 ) -> tuple[int, int]:
     """Run the retag workflow; returns ``(updated, skipped)``.
 
-    ``skipped`` counts songs skipped because they were already tagged or,
-    with ``--skip-not-found``, because a previous lookup found no match.
+    ``skipped`` counts songs skipped because they were already tagged (unless
+    ``--force`` is given, which re-processes them) or, with
+    ``--skip-not-found``, because a previous lookup found no match.
     While ``report`` is collecting, every human-facing message is sent to
     stderr so the caller can emit a machine-readable JSON report on stdout.
     """
@@ -645,12 +646,22 @@ def _run_tag(
             tagged_by_uuid[uuid] = bool(row["tagged"])
             mb_status_by_uuid[uuid] = str(row["musicbrainz_status"] or "")
         skip_not_found: bool = bool(getattr(args, "skip_not_found", False))
+        force: bool = bool(getattr(args, "force", False))
+        if force:
+            print(
+                "Force mode: already-tagged songs will be re-processed "
+                "instead of skipped."
+            )
         updated = 0
         skipped = 0
         try:
             for index, position in enumerate(selected, start=1):
                 song = songs[position]
-                if song.uuid is not None and tagged_by_uuid.get(song.uuid):
+                if (
+                    song.uuid is not None
+                    and tagged_by_uuid.get(song.uuid)
+                    and not force
+                ):
                     print(f"Skipping '{song.display_name}': already tagged before.")
                     skipped += 1
                     if report is not None:

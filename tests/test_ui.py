@@ -1,6 +1,8 @@
 import pytest
+from prompt_toolkit.formatted_text import to_formatted_text
 
 import smclipy.ui as ui
+from smclipy.downloader import SourceCandidate
 
 
 def _patch_prompt(monkeypatch, answers):
@@ -300,3 +302,117 @@ def test_prompt_canonical_spelling_returns_none_when_skipped(monkeypatch):
     monkeypatch.setattr(ui, "radiolist_dialog", lambda **kwargs: FakeApp())
 
     assert ui.prompt_canonical_spelling("album 'x'", [("X", 1), ("x", 1)], "X") is None
+
+
+def _source_candidate(duration: float | None, title: str = "Song") -> SourceCandidate:
+    return SourceCandidate(
+        provider="youtube",
+        title=title,
+        uploader="Artist",
+        duration=duration,
+        url="https://www.youtube.com/watch?v=abcdefghijk",
+    )
+
+
+def _label_text(label) -> str:
+    return "".join(part[1] for part in to_formatted_text(label))
+
+
+def test_format_duration_minutes_and_hours():
+    assert ui.format_duration(100) == "1:40"
+    assert ui.format_duration(0) == "0:00"
+    assert ui.format_duration(3671) == "1:01:11"
+
+
+def test_prompt_source_selection_highlights_matching_duration(monkeypatch):
+    captured = _patch_choice(monkeypatch, "1")
+    candidates = [_source_candidate(100.0), _source_candidate(200.0)]
+
+    assert ui.prompt_source_selection(candidates, song_duration=101.0) == 0
+
+    texts = [_label_text(label) for _value, label in captured["options"]]
+    assert "same length" not in texts[0]
+    assert "same length" in texts[1]
+    assert "same length" not in texts[2]
+    assert captured["message"] == "Pick a source for this song (1:41):"
+
+
+def test_prompt_source_selection_no_highlight_without_close_duration(monkeypatch):
+    captured = _patch_choice(monkeypatch, "1")
+
+    assert (
+        ui.prompt_source_selection([_source_candidate(200.0)], song_duration=100.0) == 0
+    )
+
+    texts = [_label_text(label) for _value, label in captured["options"]]
+    assert all("same length" not in text for text in texts)
+    assert captured["message"] == "Pick a source for this song (1:40):"
+
+
+def test_prompt_source_selection_escapes_title_in_highlight(monkeypatch):
+    captured = _patch_choice(monkeypatch, "1")
+    candidates = [_source_candidate(100.0, title="Song <A> & B")]
+
+    ui.prompt_source_selection(candidates, song_duration=100.0)
+
+    text = _label_text(captured["options"][1][1])
+    assert "Song <A> & B" in text
+    assert "same length" in text
+
+
+def test_prompt_source_selection_marks_unmatched_candidates(monkeypatch):
+    captured = _patch_choice(monkeypatch, "2")
+    candidates = [
+        _source_candidate(100.0, title="Wrong"),
+        _source_candidate(200.0, title="Song"),
+    ]
+
+    assert (
+        ui.prompt_source_selection(
+            candidates, song_duration=100.0, matches=[False, True]
+        )
+        == 1
+    )
+
+    assert captured["default"] == "2"
+    texts = [_label_text(label) for _value, label in captured["options"]]
+    assert "no artist/title match" not in texts[0]
+    assert "no artist/title match" in texts[1]
+    assert "same length" not in texts[1]
+    assert "no artist/title match" not in texts[2]
+
+
+def test_prompt_source_selection_highlights_skip_when_nothing_matches(monkeypatch):
+    captured = _patch_choice(monkeypatch, "Skip this song")
+    candidates = [_source_candidate(100.0, title="Wrong")]
+
+    assert (
+        ui.prompt_source_selection(candidates, song_duration=100.0, matches=[False])
+        is None
+    )
+
+    assert captured["default"] == "Skip this song"
+    skip_text = _label_text(captured["options"][0][1])
+    assert "no artist/title match" in skip_text
+    candidate_text = _label_text(captured["options"][1][1])
+    assert "no artist/title match" in candidate_text
+    assert "same length" not in candidate_text
+
+
+def test_prompt_source_selection_defaults_to_first_match(monkeypatch):
+    captured = _patch_choice(monkeypatch, "2")
+    candidates = [
+        _source_candidate(100.0, title="Wrong"),
+        _source_candidate(200.0, title="Song"),
+    ]
+
+    ui.prompt_source_selection(candidates, matches=[False, True])
+
+    assert captured["default"] == "2"
+
+
+def test_prompt_source_selection_rejects_mismatched_flags(monkeypatch):
+    _patch_choice(monkeypatch, "1")
+
+    with pytest.raises(ValueError, match="one entry per candidate"):
+        ui.prompt_source_selection([_source_candidate(100.0)], matches=[])

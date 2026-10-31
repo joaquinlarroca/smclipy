@@ -4,7 +4,7 @@ import shutil
 import sys
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import suppress
 from datetime import datetime
 from enum import Enum, auto
@@ -527,6 +527,7 @@ def save_song_temp_to_main(
     *,
     overwrite: bool | None = None,
     song_uuid: str | None = None,
+    extra_fields: Mapping[str, str] | None = None,
 ) -> tuple[SaveResult, Path | None]:
     """Move a tagged track into the library under ``artist-title``.
 
@@ -538,6 +539,9 @@ def save_song_temp_to_main(
     ``song_uuid`` lets a download that overwrites a tracked file reuse the
     existing song's tracking UUID (and its database row) instead of inserting
     a phantom duplicate row.
+
+    ``extra_fields`` writes optional tags (date, genre, album artist, track
+    number) in the same pass; empty values leave the source tags untouched.
     """
     authors_list: list[str] = split_authors(authors)
     if not authors_list:
@@ -557,7 +561,15 @@ def save_song_temp_to_main(
                 return SaveResult.SKIPPED, None
         elif not overwrite:
             return SaveResult.SKIPPED, None
-    if not _tag_file(file, title, authors_list, album, image, song_uuid=song_uuid):
+    if not _tag_file(
+        file,
+        title,
+        authors_list,
+        album,
+        image,
+        song_uuid=song_uuid,
+        extra_fields=extra_fields,
+    ):
         return SaveResult.FAILED, None
     os.replace(str(file), str(target))
     return SaveResult.SAVED, target
@@ -571,6 +583,7 @@ def _tag_file(
     image: Path | None,
     *,
     song_uuid: str | None = None,
+    extra_fields: Mapping[str, str] | None = None,
 ) -> bool:
     track: Track | None = _open_audio(target)
     if track is None:
@@ -585,6 +598,9 @@ def _tag_file(
     track.set_field("title", title)
     track.set_artists(authors)
     track.set_field("album", album)
+    for field, value in (extra_fields or {}).items():
+        if value:
+            track.set_field(field, value)
     if song_uuid is not None:
         track.write_uuid(song_uuid)
     elif track.read_uuid() is None:
@@ -690,7 +706,13 @@ def remove_cover(file: Path) -> bool:
     return _edit_track_atomically(file, edit)
 
 
-def snapshot_song(file: Path, song_uuid: str | None, source: str) -> Path | None:
+def snapshot_song(
+    file: Path,
+    song_uuid: str | None,
+    source: str,
+    *,
+    protect: Path | None = None,
+) -> Path | None:
     """Snapshot a song's current tags and cover art before a mutating change.
 
     Snapshots live in ``<backups_folder>/<uuid>/`` as one JSON file (plus a
@@ -730,10 +752,60 @@ def snapshot_song(file: Path, song_uuid: str | None, source: str) -> Path | None
                 payload["cover"] = cover_name
         snap_path: Path = folder.joinpath(f"{at}.json")
         snap_path.write_text(json.dumps(payload), encoding="utf-8")
+        _prune_snapshots(song_uuid, settings().max_backups, protect=protect)
         return snap_path
     except OSError as exc:
         print(f"Warning: could not snapshot '{file.name}': {exc}", file=sys.stderr)
         return None
+
+
+def _prune_snapshots(song_uuid: str, limit: int, protect: Path | None = None) -> None:
+    """Delete the oldest snapshots so at most ``limit`` remain.
+
+    ``protect`` keeps one snapshot even when it falls outside the newest
+    ``limit``; ``restore`` uses it so the snapshot being restored is never
+    removed before it is applied.
+    """
+    if limit < 0:
+        return
+    folder: Path = settings().backups_folder.joinpath(song_uuid)
+    if not folder.is_dir():
+        return
+    json_files: list[Path] = sorted(folder.glob("*.json"), key=lambda path: path.name)
+    keep: list[Path] = json_files[-limit:] if limit > 0 else []
+    if protect is not None and protect not in keep and protect.is_file():
+        keep.append(protect)
+    for json_file in json_files:
+        if json_file in keep:
+            continue
+        cover_name: str | None = None
+        try:
+            payload: Any = json.loads(json_file.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                raw_cover = payload.get("cover")
+                if isinstance(raw_cover, str) and raw_cover:
+                    cover_name = raw_cover
+        except (OSError, json.JSONDecodeError):
+            pass
+        try:
+            json_file.unlink()
+        except OSError as exc:
+            print(
+                f"Warning: could not prune backup '{json_file.name}': {exc}",
+                file=sys.stderr,
+            )
+            continue
+        if cover_name is not None:
+            cover_path: Path = folder.joinpath(cover_name)
+            try:
+                cover_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(
+                    f"Warning: could not prune backup cover '{cover_path.name}': {exc}",
+                    file=sys.stderr,
+                )
 
 
 def list_snapshots(song_uuid: str) -> list[Snapshot]:
@@ -778,7 +850,7 @@ def restore_song_from_snapshot(file: Path, snapshot: Snapshot) -> bool:
     track_number, cover art) are restored: tracking UUID, download history,
     and MusicBrainz status are left as they are.
     """
-    snapshot_song(file, read_song_uuid(file), "restore")
+    snapshot_song(file, read_song_uuid(file), "restore", protect=snapshot.path)
     artists: list[str] = split_authors(snapshot.artists)
     ok: bool = apply_tag_update(
         file,
@@ -814,6 +886,7 @@ def restore_song_from_snapshot(file: Path, snapshot: Snapshot) -> bool:
             "restored",
             {"at": snapshot.at, "source": snapshot.source},
         )
+        _prune_snapshots(song_uuid, settings().max_backups)
     return True
 
 
