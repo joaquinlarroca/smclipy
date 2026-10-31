@@ -316,7 +316,7 @@ def _cleanup_temp_files(s: Settings) -> None:
                 temp_file.unlink()
 
 
-def _download_playlist(path: Path, authors_list: list[str], *, no_prompt: bool) -> None:
+def _download_playlist(path: Path, *, no_prompt: bool) -> None:
     """Download missing songs from a v2 playlist JSON and apply its metadata."""
     try:
         text: str = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -332,6 +332,8 @@ def _download_playlist(path: Path, authors_list: list[str], *, no_prompt: bool) 
         print(f"No songs found in '{path.name}'.")
         return
 
+    print("Scanning music files...")
+    scan_library()
     music_folder: Path = settings().music_folder
     by_uuid, by_abs, by_name = _index_songs()
     pending: list[tuple[str, PlaylistSongMeta]] = []
@@ -376,6 +378,8 @@ def _download_playlist(path: Path, authors_list: list[str], *, no_prompt: bool) 
         return
 
     print(f"Downloading {len(pending)} song(s)...")
+    print("Fetching all authors names...")
+    authors_list: list[str] = db.get_authors()
     downloaded: int = 0
     skipped: int = 0
     failed: int = 0
@@ -442,17 +446,15 @@ def cmd_download(args: argparse.Namespace) -> None:
     batch_raw: str | None = getattr(args, "batch", None)
     file_raw: str | None = getattr(args, "file", None)
 
+    if file_raw is not None:
+        _download_playlist(Path(file_raw).expanduser(), no_prompt=no_prompt)
+        return
+
     print("Scanning music files...")
     scan_library()
 
     print("Fetching all authors names...")
     authors_list: list[str] = db.get_authors()
-
-    if file_raw is not None:
-        _download_playlist(
-            Path(file_raw).expanduser(), authors_list, no_prompt=no_prompt
-        )
-        return
 
     pending_ids: list[str] = db.get_pending_urls()
     failed_ids: list[str] = db.get_failed_urls()
@@ -860,6 +862,8 @@ def main(argv: list[str] | None = None) -> None:
             "  smclipy playlist create Chill  Create an empty playlist\n"
             "  smclipy playlist add Chill     Interactively add library songs to it\n"
             "  smclipy playlist export Chill -f m3u  Export it as an .m3u file\n"
+            "  smclipy playlist export Chill -f m3u-link"
+            "  Export it as URLs, one per line\n"
             "  smclipy playlist import mix.m3u       Import a playlist from a file\n"
             "  smclipy playlist show Chill --json    Print its songs as JSON\n"
             "  smclipy -d         Print the directories smclipy uses\n"
@@ -1267,7 +1271,8 @@ def main(argv: list[str] | None = None) -> None:
             "library songs. Playlists live in the tracking database and reference "
             "songs by UUID, so renames and relocations never break them. Songs can "
             "be added, removed, moved, or sorted by metadata, and playlists can be "
-            "exported to .m3u or .json and imported back."
+            "exported to .m3u, .m3u-link (one source URL per line with "
+            "artist/title labels), or .json and imported back."
         ),
     )
     playlist_sub: argparse._SubParsersAction[argparse.ArgumentParser] = (
@@ -1368,7 +1373,8 @@ def main(argv: list[str] | None = None) -> None:
             "the library first so the paths are current; use --no-scan to "
             "export the tracking database as-is. Paths are written relative "
             "to the exported file unless --absolute is given. The m3u-link "
-            "format writes one source URL per line instead of local paths."
+            "format writes one source URL per line instead of local paths, "
+            "each preceded by an #EXTINF line with the song's artists and title."
         ),
     )
     playlist_export.add_argument("name", help="Name of the playlist to export.")
@@ -1396,16 +1402,18 @@ def main(argv: list[str] | None = None) -> None:
         "import",
         help="Import a playlist from .m3u or .json.",
         description=(
-            "Import an .m3u/.m3u8 or smclipy .json playlist. Entries are matched "
-            "to your tracked library songs by path (relative to the file, your "
-            "music folder, or absolute) or UUID; unmatched entries are skipped and "
-            "reported. For .json imports, the missing songs are counted and "
-            "smclipy suggests `smclipy download --file FILE`, which downloads "
+            "Import an .m3u/.m3u8/.m3u-link or smclipy .json playlist. Entries "
+            "are matched to your tracked library songs by path (relative to the "
+            "file, your music folder, or absolute) or UUID; unmatched entries are "
+            "skipped and reported. For .json imports, the missing songs are counted "
+            "and smclipy suggests `smclipy download --file FILE`, which downloads "
             "them from their recorded source_url and applies the playlist "
             "metadata automatically."
         ),
     )
-    playlist_import.add_argument("file", help="Path to the .m3u/.m3u8/.json file.")
+    playlist_import.add_argument(
+        "file", help="Path to the .m3u/.m3u8/.m3u-link/.json file."
+    )
     playlist_import.add_argument(
         "--name", help="Playlist name (default: the file's name or the JSON name)."
     )

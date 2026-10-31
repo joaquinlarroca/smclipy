@@ -1,9 +1,10 @@
 """Library playlists stored in the tracking database.
 
 Playlists reference songs by their tracking UUID, so a song keeps its
-playlist slot through renames and relocations. Contents can be exported
-to ``.m3u`` or ``.json`` and re-imported (resolving entries back to
-tracked songs), and can be ordered by hand or sorted by common metadata.
+playlist slot through renames and relocations. Contents can be exported to
+``.m3u``, ``.m3u-link`` (one source URL per line with ``#EXTINF`` labels), or
+``.json`` and re-imported (resolving entries back to tracked songs), and can
+be ordered by hand or sorted by common metadata.
 """
 
 import json
@@ -694,7 +695,7 @@ def cmd_playlist_import(args: Any) -> None:
     fmt: str = _format_from_filename(path.name)
     if not fmt:
         print(
-            "Error: unsupported playlist file. Use .m3u/.m3u8 or .json.",
+            "Error: unsupported playlist file. Use .m3u/.m3u8/.m3u-link or .json.",
             file=sys.stderr,
         )
         raise SystemExit(1)

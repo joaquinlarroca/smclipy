@@ -11,7 +11,7 @@
 - **Interactive Tagging:** For each track you set the Title, Album, and Artists (with autocompletion). The title defaults from the video's title, and the artists from the channel/uploader — corrected against your known authors (ignoring case and spaces).
 - **MusicBrainz Re-tagging (`tag`):** List every song already in your library and look it up on [MusicBrainz](https://musicbrainz.org/) (free, no API key) to fix title, artists, album, release date, genre, track number, album artist, and cover art — reviewing each candidate and the exact diff before applying. Narrow the run with `--search TEXT` (title, album, or artist) or `--specific FIELD` (autocomplete an existing title, album, or artist).
 - **Source Finding (`findsource`):** Search YouTube and SoundCloud for songs already in your library and record the matching URL in the tracking database. Providers are tried in the order set by `source_preferences` (default: YouTube, then SoundCloud); by default you pick from the candidates, while `--auto` saves the best plausible result. A result only counts when it names the song's artist (uploader or an `Artist - Title feat. Artist2` title) or repeats its title, so unrelated videos that merely share a duration are skipped. Narrow the run with `--search TEXT` or `--specific FIELD`, use `--force` to replace an existing source, and combine `--auto --all` for a headless run.
-- **Playlists (`playlist`):** Build playlists of your library songs (create/rename/delete/list/show), add/remove/move songs interactively, sort by metadata, and export them to `.m3u`, `.m3u-link` (one URL per line with artist/title labels), or `.json` — or import `.m3u`/`.json` playlists by resolving the entries against your library (UUID first, then each path relative to the file, your music folder, or a unique matching filename). Playlists are stored in `smclipy.db` and reference songs by their tracking UUID, so renaming or relocating a song never breaks its playlists. When a JSON import leaves songs unmatched, it reports how many are missing and points to `smclipy download --file`, which downloads each missing song from its recorded `source_url` and applies the playlist metadata automatically (`--auto` also skips the cover-crop question). Use `smclipy findsource --file playlist.json` to search for and fill missing source URLs, and `smclipy modify --file playlist.json` to edit the exported entries by hand.
+- **Playlists (`playlist`):** Build playlists of your library songs (create/rename/delete/list/show), add/remove/move songs interactively, sort by metadata, and export them to `.m3u`, `.m3u-link` (one URL per line with artist/title labels), or `.json` — or import `.m3u`/`.m3u8`/`.m3u-link`/`.json` playlists by resolving the entries against your library (UUID first, then each path relative to the file, your music folder, or a unique matching filename). Playlists are stored in `smclipy.db` and reference songs by their tracking UUID, so renaming or relocating a song never breaks its playlists. When a JSON import leaves songs unmatched, it reports how many are missing and points to `smclipy download --file`, which downloads each missing song from its recorded `source_url` and applies the playlist metadata automatically (`--auto` also skips the cover-crop question). Use `smclipy findsource --file playlist.json` to search for and fill missing source URLs, and `smclipy modify --file playlist.json` to edit the exported entries by hand.
 - **Video Info Preview:** Before tagging, the video's title, artist/s, and the first `description_max_lines` lines of its description are shown for context.
 - **Cover Art Cropping:** Crop cover art to a perfect 1:1 square ratio during tagging, with a terminal preview of the art.
 - **Cover Rescan (`crop`):** Re-extracts covers from your existing audio files, detects pillarboxed art, lets you crop it to 1:1, and re-embeds it into the matching files. Images you decline to crop are remembered so you're not asked twice.
@@ -706,7 +706,7 @@ options:
 ```text
 usage: smclipy playlist import [-h] [--name NAME] [--replace] file
 
-Import an .m3u/.m3u8 or smclipy .json playlist. Entries are matched to your
+Import an .m3u/.m3u8/.m3u-link or smclipy .json playlist. Entries are matched to your
 tracked library songs by path (relative to the file, your music folder, or
 absolute) or UUID; unmatched entries are skipped and reported. For .json
 imports, the missing songs are counted and smclipy suggests `smclipy download
@@ -714,7 +714,7 @@ imports, the missing songs are counted and smclipy suggests `smclipy download
 the playlist metadata automatically.
 
 positional arguments:
-  file         Path to the .m3u/.m3u8/.json file.
+  file         Path to the .m3u/.m3u8/.m3u-link/.json file.
 
 options:
   -h, --help   show this help message and exit
