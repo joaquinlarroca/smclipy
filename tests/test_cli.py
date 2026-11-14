@@ -17,7 +17,7 @@ MINIMAL_MP3 = (bytes.fromhex("FFFB9064") + bytes(413)) * 2
 def test_collect_new_queue_resets_state(monkeypatch, app_settings):
     import smclipy.cli as cli
 
-    monkeypatch.setattr(cli, "collect_urls", lambda: ["A", "B"])
+    monkeypatch.setattr(cli, "collect_urls", lambda *_a, **_k: ["A", "B"])
     pending_ids = cli._collect_new_queue()
     assert pending_ids == ["A", "B"]
     assert db.get_pending_urls() == ["A", "B"]
@@ -841,6 +841,45 @@ def test_main_help_works_without_tty(monkeypatch, capsys):
     assert "download" in capsys.readouterr().out
 
 
+def test_main_short_help_hides_examples(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-h"])
+
+    out = capsys.readouterr().out
+    assert exc.value.code == 0
+    assert "download" in out
+    assert "examples:" not in out
+
+
+def test_main_long_help_shows_examples(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--help"])
+
+    out = capsys.readouterr().out
+    assert exc.value.code == 0
+    assert "examples:" in out
+    assert "smclipy download --playlist-items 1-25" in out
+
+
+def test_download_short_help_still_shows_examples(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["download", "-h"])
+
+    out = capsys.readouterr().out
+    assert exc.value.code == 0
+    assert "examples:" in out
+    assert "--playlist-items" in out
+
+
 @pytest.mark.parametrize("flag", ["-v", "--version"])
 def test_main_version_prints_version(monkeypatch, capsys, flag):
     import smclipy.cli as cli
@@ -1255,7 +1294,7 @@ def test_cmd_download_skips_unexpected_errors(monkeypatch, app_settings, capsys)
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a", "vid-b"])
+    monkeypatch.setattr(cli, "collect_urls", lambda *_a, **_k: ["vid-a", "vid-b"])
     monkeypatch.setattr(
         cli,
         "process_video",
@@ -1282,7 +1321,7 @@ def test_cmd_download_cleans_temp_files_on_finish(monkeypatch, app_settings):
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda: [])
+    monkeypatch.setattr(cli, "collect_urls", lambda *_a, **_k: [])
 
     cli.cmd_download(argparse.Namespace())
 
@@ -1299,7 +1338,7 @@ def test_cmd_download_survives_processed_recording_error(
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a"])
+    monkeypatch.setattr(cli, "collect_urls", lambda *_a, **_k: ["vid-a"])
     monkeypatch.setattr(
         cli, "process_video", lambda vid, authors, **kwargs: SaveResult.SAVED
     )
@@ -1326,7 +1365,7 @@ def test_cmd_download_repends_unsaved_videos(monkeypatch, app_settings):
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a"])
+    monkeypatch.setattr(cli, "collect_urls", lambda *_a, **_k: ["vid-a"])
     monkeypatch.setattr(
         cli, "process_video", lambda vid, authors, **kwargs: SaveResult.FAILED
     )
@@ -1350,7 +1389,7 @@ def test_cmd_download_notices_permanently_failed_videos(
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda: [])
+    monkeypatch.setattr(cli, "collect_urls", lambda *_a, **_k: [])
 
     cli.cmd_download(argparse.Namespace())
 
@@ -1370,7 +1409,7 @@ def test_cmd_download_interrupt_exits_130(monkeypatch, app_settings, capsys):
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a", "vid-b"])
+    monkeypatch.setattr(cli, "collect_urls", lambda *_a, **_k: ["vid-a", "vid-b"])
     monkeypatch.setattr(cli, "process_video", _raises_keyboard_interrupt)
 
     with pytest.raises(SystemExit) as exc:
@@ -1386,7 +1425,7 @@ def test_cmd_download_interrupt_persists_skipped(monkeypatch, app_settings):
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a", "vid-b"])
+    monkeypatch.setattr(cli, "collect_urls", lambda *_a, **_k: ["vid-a", "vid-b"])
 
     calls: list[str] = []
 
@@ -2212,6 +2251,328 @@ def test_collect_batch_missing_file_exits(monkeypatch, app_settings, tmp_path, c
     assert "could not read batch file" in capsys.readouterr().err
 
 
+def test_collect_batch_playlist_requires_playlist_items(
+    monkeypatch, app_settings, tmp_path, capsys
+):
+    import smclipy.cli as cli
+
+    batch = tmp_path / "urls.txt"
+    batch.write_text(
+        "https://www.youtube.com/playlist?list=PLabcdefghijk\n", encoding="utf-8"
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli._collect_batch(batch)
+
+    assert exc.value.code == 1
+    assert "--playlist-items" in capsys.readouterr().err
+    assert db.get_pending_urls() == []
+
+
+def test_collect_batch_expands_playlist_and_skips_known(
+    monkeypatch, app_settings, tmp_path, capsys
+):
+    import smclipy.cli as cli
+
+    db.insert_song(
+        current_path="A.mp3",
+        source_url="https://www.youtube.com/watch?v=aaaaaaaaaaa",
+    )
+    batch = tmp_path / "urls.txt"
+    batch.write_text(
+        "https://www.youtube.com/playlist?list=PLabcdefghijk\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        cli,
+        "expand_playlist",
+        lambda url, items: [
+            "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+            "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+            "https://www.youtube.com/watch?v=ccccccccccc",
+        ],
+    )
+
+    result = cli._collect_batch(batch, "1-10")
+
+    assert result == [
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+        "https://www.youtube.com/watch?v=ccccccccccc",
+    ]
+    assert db.get_pending_urls() == result
+    assert "1 item(s) already in the library" in capsys.readouterr().out
+
+
+def test_collect_batch_watch_with_list_keeps_single_video(
+    monkeypatch, app_settings, tmp_path
+):
+    import smclipy.cli as cli
+
+    batch = tmp_path / "urls.txt"
+    batch.write_text(
+        "https://www.youtube.com/watch?v=abcdefghijk&list=PLabcdefghijk\n",
+        encoding="utf-8",
+    )
+
+    result = cli._collect_batch(batch)
+
+    assert result == ["https://www.youtube.com/watch?v=abcdefghijk"]
+    assert db.get_pending_urls() == result
+
+
+def test_collect_batch_expands_attached_playlist_when_items_given(
+    monkeypatch, app_settings, tmp_path
+):
+    import smclipy.cli as cli
+
+    batch = tmp_path / "urls.txt"
+    batch.write_text(
+        "https://www.youtube.com/watch?v=abcdefghijk&list=PLabcdefghijk\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_expand(url, items):
+        captured["url"] = url
+        captured["items"] = items
+        return [
+            "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+            "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+        ]
+
+    monkeypatch.setattr(cli, "expand_playlist", fake_expand)
+
+    result = cli._collect_batch(batch, "1-10")
+
+    assert captured == {
+        "url": "https://www.youtube.com/playlist?list=PLabcdefghijk",
+        "items": "1-10",
+    }
+    assert result == [
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+    ]
+    assert db.get_pending_urls() == result
+
+
+def test_expand_playlist_rejects_all_for_autogenerated_mix(
+    monkeypatch, app_settings, capsys
+):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr(
+        cli,
+        "expand_playlist",
+        lambda url, items: pytest.fail("must not fetch an unbounded mix"),
+    )
+
+    result = cli._expand_playlist(
+        "https://www.youtube.com/playlist?list=RDabcdefghijk",
+        "all",
+        interactive=False,
+    )
+
+    assert result == []
+    assert "infinite" in capsys.readouterr().err
+
+
+def test_collect_urls_expands_playlist_with_prompt(monkeypatch, app_settings):
+    import smclipy.cli as cli
+    from smclipy.downloader import PlaylistPreview
+
+    answers = iter(["https://www.youtube.com/playlist?list=PLabcdefghijk", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    monkeypatch.setattr(
+        cli,
+        "fetch_playlist_preview",
+        lambda url: PlaylistPreview(title="Chill", count=3),
+    )
+    prompted = {}
+
+    def fake_prompt(title, *, default, allow_unbounded):
+        prompted.update(title=title, default=default, allow_unbounded=allow_unbounded)
+        return "2-3"
+
+    monkeypatch.setattr(cli, "prompt_playlist_items", fake_prompt)
+    monkeypatch.setattr(
+        cli,
+        "expand_playlist",
+        lambda url, items: [
+            "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+            "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+        ],
+    )
+
+    result = cli.collect_urls()
+
+    assert result == [
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+    ]
+    assert prompted == {
+        "title": "Chill",
+        "default": "1-50",
+        "allow_unbounded": True,
+    }
+
+
+def test_collect_urls_skips_playlist_when_prompt_cancelled(monkeypatch, app_settings):
+    import smclipy.cli as cli
+    from smclipy.downloader import PlaylistPreview
+
+    answers = iter(["https://www.youtube.com/playlist?list=PLabcdefghijk", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    monkeypatch.setattr(
+        cli,
+        "fetch_playlist_preview",
+        lambda url: PlaylistPreview(title="Chill", count=None),
+    )
+    monkeypatch.setattr(cli, "prompt_playlist_items", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli,
+        "expand_playlist",
+        lambda url, items: pytest.fail("cancelled playlist must not be fetched"),
+    )
+
+    assert cli.collect_urls() == []
+
+
+def test_collect_urls_attached_playlist_can_keep_song(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    answers = iter(
+        [
+            "https://www.youtube.com/watch?v=abcdefghijk&list=PLabcdefghijk",
+            "",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    monkeypatch.setattr(cli, "prompt_playlist_choice", lambda: "song")
+    monkeypatch.setattr(
+        cli,
+        "fetch_playlist_preview",
+        lambda url: pytest.fail("song choice must not fetch the playlist"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "expand_playlist",
+        lambda url, items: pytest.fail("song choice must not expand the playlist"),
+    )
+
+    assert cli.collect_urls() == ["https://www.youtube.com/watch?v=abcdefghijk"]
+
+
+def test_collect_urls_attached_playlist_can_expand(monkeypatch, app_settings):
+    import smclipy.cli as cli
+    from smclipy.downloader import PlaylistPreview
+
+    answers = iter(
+        [
+            "https://www.youtube.com/watch?v=abcdefghijk&list=PLabcdefghijk",
+            "",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    monkeypatch.setattr(cli, "prompt_playlist_choice", lambda: "playlist")
+    monkeypatch.setattr(
+        cli,
+        "fetch_playlist_preview",
+        lambda url: PlaylistPreview(title="Chill", count=2),
+    )
+    monkeypatch.setattr(cli, "prompt_playlist_items", lambda *a, **k: "1-2")
+    captured = {}
+
+    def fake_expand(url, items):
+        captured["url"] = url
+        captured["items"] = items
+        return [
+            "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+            "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+        ]
+
+    monkeypatch.setattr(cli, "expand_playlist", fake_expand)
+
+    assert cli.collect_urls() == [
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+    ]
+    assert captured == {
+        "url": "https://www.youtube.com/playlist?list=PLabcdefghijk",
+        "items": "1-2",
+    }
+
+
+def test_collect_urls_attached_playlist_cancel_skips_url(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    answers = iter(
+        [
+            "https://www.youtube.com/watch?v=abcdefghijk&list=PLabcdefghijk",
+            "",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    monkeypatch.setattr(cli, "prompt_playlist_choice", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "expand_playlist",
+        lambda url, items: pytest.fail("cancelled URL must not be expanded"),
+    )
+
+    assert cli.collect_urls() == []
+
+
+def test_cmd_download_batch_forwards_playlist_items(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+    monkeypatch.setattr(cli, "scan_library", lambda: None)
+    captured = {}
+
+    def fake_batch(path, items=None):
+        captured["items"] = items
+        return []
+
+    monkeypatch.setattr(cli, "_collect_batch", fake_batch)
+    monkeypatch.setattr(cli, "prompt_resume", lambda: False)
+
+    cli.cmd_download(argparse.Namespace(batch="urls.txt", playlist_items="1-5"))
+
+    assert captured["items"] == "1-5"
+
+
+def test_cmd_download_rejects_invalid_playlist_items(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr(cli, "init", lambda: app_settings)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.cmd_download(argparse.Namespace(playlist_items="nope"))
+
+    assert exc.value.code == 1
+    assert "invalid --playlist-items" in capsys.readouterr().err
+
+
+def test_main_download_playlist_items_flag(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_download", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(
+        [
+            "download",
+            "--batch",
+            "urls.txt",
+            "--no-prompt",
+            "--playlist-items",
+            "1-5",
+        ]
+    )
+
+    assert calls[0].playlist_items == "1-5"
+
+
 def test_main_modify_search_flag_parses(monkeypatch, app_settings):
     import smclipy.cli as cli
 
@@ -2371,7 +2732,7 @@ def test_cmd_download_reports_permanently_dropped_videos(
     monkeypatch.setattr(cli, "init", lambda: app_settings)
     monkeypatch.setattr(cli, "scan_library", lambda: None)
     monkeypatch.setattr(cli, "prompt_resume", lambda: False)
-    monkeypatch.setattr(cli, "collect_urls", lambda: ["vid-a"])
+    monkeypatch.setattr(cli, "collect_urls", lambda *_a, **_k: ["vid-a"])
     monkeypatch.setattr(
         cli, "process_video", lambda vid, authors, **kwargs: SaveResult.FAILED
     )

@@ -876,6 +876,48 @@ def get_failed_urls(conn: sqlite3.Connection | None = None) -> list[str]:
             c.close()
 
 
+def known_download_urls(
+    urls: list[str], conn: sqlite3.Connection | None = None
+) -> set[str]:
+    """URLs already saved to the library or processed in the queue.
+
+    Used by playlist expansion to avoid re-downloading entries that are
+    already present. The ``IN (...)`` queries are chunked so a large playlist
+    stays below SQLite's parameter limit.
+    """
+    unique: list[str] = list(dict.fromkeys(urls))
+    if not unique:
+        return set()
+    known: set[str] = set()
+    c, owner = _rw(conn)
+    try:
+        for start in range(0, len(unique), 500):
+            chunk: list[str] = unique[start : start + 500]
+            placeholders: str = ",".join("?" for _ in chunk)
+            known.update(
+                row["source_url"]
+                for row in c.execute(
+                    "SELECT source_url FROM songs WHERE source_url IN "
+                    f"({placeholders}) AND current_path IS NOT NULL"
+                    " AND current_path != ''",
+                    chunk,
+                ).fetchall()
+                if row["source_url"] is not None
+            )
+            known.update(
+                row["url"]
+                for row in c.execute(
+                    "SELECT url FROM queue WHERE status = ? AND url IN "
+                    f"({placeholders})",
+                    (QUEUE_PROCESSED, *chunk),
+                ).fetchall()
+            )
+    finally:
+        if owner:
+            c.close()
+    return known
+
+
 def get_authors(conn: sqlite3.Connection | None = None) -> list[str]:
     c, owner = _rw(conn)
     try:

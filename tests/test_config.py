@@ -299,6 +299,23 @@ def test_settings_rejects_bogus_max_download_attempts(tmp_path, capsys):
     assert "max_download_attempts" in capsys.readouterr().err
 
 
+def test_settings_default_playlist_max_items(tmp_path):
+    s = Settings({"path_to_music_folder": str(tmp_path)})
+    assert s.playlist_max_items == 50
+
+
+def test_settings_parses_playlist_max_items(tmp_path):
+    s = Settings({"path_to_music_folder": str(tmp_path), "playlist_max_items": "10"})
+    assert s.playlist_max_items == 10
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "often", 2.5])
+def test_settings_rejects_bogus_playlist_max_items(tmp_path, capsys, value):
+    s = Settings({"path_to_music_folder": str(tmp_path), "playlist_max_items": value})
+    assert s.playlist_max_items == 50
+    assert "playlist_max_items" in capsys.readouterr().err
+
+
 def test_settings_default_max_backups_is_unlimited(tmp_path):
     s = Settings({"path_to_music_folder": str(tmp_path)})
     assert s.max_backups == -1

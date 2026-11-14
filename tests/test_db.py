@@ -771,3 +771,28 @@ def test_v4_database_gains_source_status_column(app_settings):
     legacy = db.get_song_by_uuid("legacy-1")
     assert legacy is not None
     assert legacy["source_status"] is None
+
+
+def test_known_download_urls_from_library_and_processed_queue(app_settings):
+    db.reset_queue(["https://example.com/watch?v=queued"])
+    db.mark_processed("https://example.com/watch?v=queued")
+    db.insert_song(current_path="A.mp3", source_url="https://example.com/watch?v=saved")
+    db.insert_song(current_path="", source_url="https://example.com/watch?v=missing")
+
+    known = db.known_download_urls(
+        [
+            "https://example.com/watch?v=queued",
+            "https://example.com/watch?v=saved",
+            "https://example.com/watch?v=missing",
+            "https://example.com/watch?v=new",
+        ]
+    )
+
+    assert known == {
+        "https://example.com/watch?v=queued",
+        "https://example.com/watch?v=saved",
+    }
+
+
+def test_known_download_urls_empty(app_settings):
+    assert db.known_download_urls([]) == set()

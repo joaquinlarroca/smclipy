@@ -7,7 +7,7 @@
 
 ## Features
 
-- **Batch Downloading:** Queue up as many YouTube or SoundCloud URLs as you want before processing. Recognizes `youtube.com` watch/shorts/live/embed links, `youtu.be` links, and `soundcloud.com` tracks. Unrecognizable pastes are warned about and duplicate URLs are collapsed.
+- **Batch Downloading:** Queue up as many YouTube or SoundCloud URLs as you want before processing. Recognizes `youtube.com` watch/shorts/live/embed links, `youtu.be` links, `soundcloud.com` tracks, and playlist links (`youtube.com/playlist?list=...`, `music.youtube.com/playlist?list=...`, `soundcloud.com/<user>/sets/...`) — playlists are expanded into individual songs with a range you choose, and entries already in your library are skipped. A watch link that carries a `list=` parameter asks whether to download just that video or the playlist (headless batch runs download just the video unless `--playlist-items` is given). Unrecognizable pastes are warned about and duplicate URLs are collapsed.
 - **Interactive Tagging:** For each track you set the Title, Album, and Artists (with autocompletion). The title defaults from the video's title, and the artists from the channel/uploader — corrected against your known authors (ignoring case and spaces).
 - **MusicBrainz Re-tagging (`tag`):** List every song already in your library and look it up on [MusicBrainz](https://musicbrainz.org/) (free, no API key) to fix title, artists, album, release date, genre, track number, album artist, and cover art — reviewing each candidate and the exact diff before applying. Narrow the run with `--search TEXT` (title, album, or artist) or `--specific FIELD` (autocomplete an existing title, album, or artist).
 - **Source Finding (`findsource`):** Search YouTube and SoundCloud for songs already in your library and record the matching URL in the tracking database. Providers are tried in the order set by `source_preferences` (default: YouTube, then SoundCloud); by default you pick from the candidates, while `--auto` saves the best plausible result. A result only counts when it names the song's artist (uploader or an `Artist - Title feat. Artist2` title) or repeats its title, so unrelated videos that merely share a duration are skipped. Narrow the run with `--search TEXT` or `--specific FIELD`, use `--force` to replace an existing source, and combine `--auto --all` for a headless run.
@@ -48,6 +48,7 @@ On the first run of `download`, `crop`, `tag`, `findsource`, `modify`, `dedupe`,
   "clean_unwanted_tags": false,
   "audio_format": "mp3",
   "max_download_attempts": 3,
+  "playlist_max_items": 50,
   "max_backups": -1,
   "cookies": "",
   "cookies_from_browser": "",
@@ -65,6 +66,7 @@ On the first run of `download`, `crop`, `tag`, `findsource`, `modify`, `dedupe`,
 - `clean_unwanted_tags`: When `true`, MP3 downloads strip every tag except title, artists, album, cover art, and the tracking UUID before embedding new tags (FLAC, M4A, OGG, and OPUS encode their own minimal tag sets, so there is nothing extra to strip there). When `false` (default), any tags the source provided (genre, date, lyrics, comments, ...) are kept untouched; the `tag` command still overwrites the fields you confirm.
 - `audio_format`: The format new downloads are saved in. Valid values are `mp3` (default), `m4a`, `flac`, `opus`, and `ogg` (Ogg Vorbis). Existing files in other supported formats are still recognized and re-tagged, so changing this never orphans your library.
 - `max_download_attempts`: How many times `download` tries a URL before giving up on it permanently. After this many failed attempts the URL is marked failed, reported at the start of the next run, and not re-queued again (default is 3).
+- `playlist_max_items`: The default item range offered when you paste a playlist URL interactively — the prompt pre-fills `1-N` with this value (default is 50). Headless runs must still pass an explicit `--playlist-items` range.
 - `max_backups`: How many tag snapshots to keep per song in `smclipy/backups/<uuid>/`. The default `-1` keeps every snapshot; a positive number keeps only the newest N and deletes older snapshots (and their saved cover art) whenever a new one is recorded. `0` and values below `-1` are invalid and fall back to `-1` with a warning. Pre-crop cover copies in `backups/covers/` are not affected.
 - `cookies`: Path to a Netscape-format `cookies.txt` file passed to yt-dlp. Needed for age-restricted or sign-in-required videos (see the [yt-dlp cookie guide](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)). `~` is expanded; a missing or unreadable file is ignored with a warning. Leave empty to disable.
 - `cookies_from_browser`: Browser name to extract cookies from (e.g. `firefox`, `chrome`) — must be one of the browsers yt-dlp supports, otherwise it is ignored with a warning. Lower priority than `cookies` — if both are set, the cookies file wins. Leave empty to disable.
@@ -83,7 +85,7 @@ You can also invoke it as a module: `python -m smclipy <command>`. Note that `do
 
 ### Commands
 
-- **`smclipy download`** — Batch download and tag songs from YouTube or SoundCloud. Pass `--batch FILE` to read URLs from a file and `--no-prompt` to accept the default title, album, and artists, which together make it safe for cron/scripts. Pass `--file FILE` with a v2 playlist JSON to download only its missing songs and apply each entry's title, artists, album, date, genre, album artist, and track number automatically; `--auto` is a synonym for `--no-prompt` that also skips the cover-crop question. Downloaded songs are not added to the playlist automatically — re-run `smclipy playlist import` afterwards.
+- **`smclipy download`** — Batch download and tag songs from YouTube or SoundCloud. Paste playlist links to expand them into individual songs: pick a range interactively, or pass `--playlist-items ITEMS` (yt-dlp syntax such as `1-50` or `3,5-8`; required in headless runs, and auto-generated YouTube mixes must be bounded). When a watch URL carries a `list=` parameter, smclipy asks whether to download just that video or the playlist; in batch mode it downloads just the video unless `--playlist-items` is given. Pass `--batch FILE` to read URLs from a file and `--no-prompt` to accept the default title, album, and artists, which together make it safe for cron/scripts. Pass `--file FILE` with a v2 playlist JSON to download only its missing songs and apply each entry's title, artists, album, date, genre, album artist, and track number automatically; `--auto` is a synonym for `--no-prompt` that also skips the cover-crop question. Downloaded songs are not added to the playlist automatically — re-run `smclipy playlist import` afterwards.
 - **`smclipy crop`** — Re-extract covers from your audio files, find pillarboxed art, crop to 1:1, and re-embed into the matching files. By default the pillarboxed covers are listed and you pick a range; `--all` selects every one. Images you decline to crop are remembered so you're not asked again.
   - `smclipy crop --auto` (`-a`) — Crop every selected cover without the per-cover `Crop cover to 1:1?` question. Combine with `--all` (`smclipy crop --auto --all`) to run without an interactive terminal.
   - `smclipy crop --all` — Skip the cover-range prompt and select every pillarboxed cover.
@@ -136,7 +138,7 @@ You can also invoke it as a module: `python -m smclipy <command>`. Note that `do
 
 ### Download flow
 
-1. **Queue URLs:** Paste your URLs one by one (enter an empty line to finish).
+1. **Queue URLs:** Paste your URLs one by one (enter an empty line to finish). A pure playlist link (`youtube.com/playlist?list=...` or `soundcloud.com/<user>/sets/...`) is expanded into individual songs: you are asked which items to take (`1-25`, `3,5-8`, ...; Enter accepts `1-<playlist_max_items>`), and entries already in your library are skipped. Auto-generated YouTube mixes can be infinite, so they require a bounded range. In headless runs (`--batch`/`--no-prompt`) an explicit `--playlist-items` range is required for pure playlists. A watch link that also carries a `list=` parameter asks whether to download just that song or the playlist; in batch mode it downloads just the song unless `--playlist-items` is given.
 2. **Resume or restart:** If a previous run left an unfinished queue, you're asked whether to resume from where it stopped or start a fresh queue.
 3. **Tagging Flow (Per Track):**
    - The track is downloaded to `Music/smclipy/.temp`.
@@ -199,7 +201,7 @@ See [roadmap.md](roadmap.md) for planned work: async/concurrent downloads, a con
 
 ## CLI reference
 
-The exact `--help` output of the CLI and of every command. This is always current: run any command with `--help` (or `smclipy <cmd> <action> --help` for playlist actions) to see the live version.
+The exact `--help` output of the CLI and of every command. This is always current: run any command with `--help` (or `smclipy <cmd> <action> --help` for playlist actions) to see the live version. On the top-level command, `-h` shows the same help without the examples block.
 
 #### `smclipy`
 
@@ -224,7 +226,8 @@ positional arguments:
     stats            Report library totals: songs, albums, artists, playtime.
 
 options:
-  -h, --help         show this help message and exit
+  -h                 show this help message and exit
+  --help             show this help message with examples and exit
   -v, --version      Print the version and exit.
   -d, --directories  Print the directories smclipy uses and exit (cannot be
                      combined with a command).
@@ -232,6 +235,7 @@ options:
 examples:
   smclipy download   Batch download songs and tag them interactively
   smclipy download --batch urls.txt --no-prompt  Headless batch download
+  smclipy download --playlist-items 1-25  Download a playlist range
   smclipy download --file playlist.json --auto  Fetch missing songs
   smclipy tag        Retag library songs using MusicBrainz metadata
   smclipy tag --auto Full-auto retag: top match applied to each song
@@ -306,11 +310,15 @@ options:
 
 ```text
 usage: smclipy download [-h] [-b FILE | -f FILE] [--no-prompt] [-a]
+                        [--playlist-items ITEMS]
 
-Batch download songs from YouTube or SoundCloud, then interactively tag each
-one with a title, artist, and album before saving it. Use --file to fetch the
-missing songs from a v2 playlist JSON and apply the playlist metadata
-automatically.
+Batch download songs from YouTube or SoundCloud, then interactively
+tag each one with a title, artist, and album before saving it. Playlist
+URLs are expanded into individual songs (choose a range with
+--playlist-items). A watch URL that carries a list parameter asks
+whether to download just that video or the playlist. Use --file to
+fetch the missing songs from a v2 playlist JSON and apply the playlist
+metadata automatically.
 
 options:
   -h, --help            show this help message and exit
@@ -329,6 +337,19 @@ options:
                         kept and skipped without prompting.
   -a, --auto            Synonym for --no-prompt: skip all prompts, including
                         the cover crop question. Useful with --file.
+  --playlist-items ITEMS
+                        Which items to download from playlist URLs, using yt-
+                        dlp syntax (e.g. 1-50, 3,5-8). 'all' is allowed only
+                        for finite playlists; auto-generated YouTube mixes
+                        need a bounded range. Required for playlist URLs in
+                        headless runs; in batch mode it also expands a watch
+                        URL's attached playlist instead of just the video.
+
+examples:
+  smclipy download
+  smclipy download --playlist-items 1-25
+  smclipy download --batch urls.txt --no-prompt --playlist-items 1-50
+  smclipy download --file playlist.json --auto
 ```
 
 #### `smclipy update`

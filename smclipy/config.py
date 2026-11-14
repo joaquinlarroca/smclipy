@@ -17,6 +17,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "clean_unwanted_tags": False,
     "audio_format": "mp3",
     "max_download_attempts": 3,
+    "playlist_max_items": 50,
     "max_backups": -1,
     "cookies": "",
     "cookies_from_browser": "",
@@ -181,6 +182,32 @@ class Settings:
                 file=sys.stderr,
             )
         self.max_download_attempts: int = parsed_attempts
+        raw_playlist_items = raw.get("playlist_max_items", 50)
+        if isinstance(raw_playlist_items, bool):
+            raw_playlist_items = 50
+            print(
+                "Warning: 'playlist_max_items' must be a positive integer, using 50",
+                file=sys.stderr,
+            )
+        try:
+            if isinstance(raw_playlist_items, float) and raw_playlist_items != int(
+                raw_playlist_items
+            ):
+                raise ValueError
+            parsed_playlist_items = int(raw_playlist_items)
+        except (TypeError, ValueError):
+            parsed_playlist_items = 50
+            print(
+                "Warning: 'playlist_max_items' must be a positive integer, using 50",
+                file=sys.stderr,
+            )
+        if parsed_playlist_items < 1:
+            parsed_playlist_items = 50
+            print(
+                "Warning: 'playlist_max_items' must be a positive integer, using 50",
+                file=sys.stderr,
+            )
+        self.playlist_max_items: int = parsed_playlist_items
         raw_backups = raw.get("max_backups", -1)
         if isinstance(raw_backups, bool):
             raw_backups = -1

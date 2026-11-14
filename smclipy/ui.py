@@ -17,7 +17,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Button, CheckboxList, Dialog, Label
 
 from smclipy.config import settings
-from smclipy.downloader import get_author, matches_duration
+from smclipy.downloader import get_author, matches_duration, validate_playlist_items
 from smclipy.matching import duration_matches
 
 if TYPE_CHECKING:
@@ -87,6 +87,42 @@ def prompt_overwrite() -> bool:
 
 def prompt_title(default: str) -> str:
     return prompt("Enter Title: ", default=default)
+
+
+def prompt_playlist_items(
+    title: str, *, default: str, allow_unbounded: bool
+) -> str | None:
+    """Ask which items to download from a playlist; None skips it."""
+    choices = "e.g. 1-25, 1,3,5-8" + (", all" if allow_unbounded else "")
+    question = f"Playlist '{title}' — items to download ({choices}) [{default}]: "
+    while True:
+        try:
+            answer: str = prompt(question)
+        except (KeyboardInterrupt, EOFError):
+            print("\nSkipping playlist...")
+            return None
+        answer = answer.strip()
+        if answer.casefold() in ("q", "quit", "exit", "cancel", "skip"):
+            return None
+        try:
+            return validate_playlist_items(
+                answer or default, allow_unbounded=allow_unbounded
+            )
+        except ValueError as exc:
+            print(f"Invalid selection: {exc}")
+
+
+def prompt_playlist_choice() -> str | None:
+    """Ask whether to queue the video alone or its attached playlist.
+
+    Returns ``"song"``, ``"playlist"``, or ``None`` when the dialog is
+    cancelled (skip the URL).
+    """
+    return choice(
+        message=("This URL also belongs to a playlist. What do you want to download?"),
+        options=[("song", "Just this song"), ("playlist", "The playlist")],
+        default="song",
+    )
 
 
 def prompt_album(default: str) -> str:
