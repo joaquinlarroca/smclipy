@@ -116,6 +116,53 @@ def test_false_positives(app_settings):
     assert db.get_false_positives() == {"Artist-Song"}
 
 
+def test_dedupe_skips_roundtrip(app_settings):
+    assert db.get_dedupe_skips() == {}
+    db.record_dedupe_skip("artists", "artist", "", ["Artist", "artist"])
+    db.record_dedupe_skip("album", "album", "artist", ["Album", "album"])
+    assert db.get_dedupe_skips() == {
+        ("artists", "artist", ""): frozenset({"Artist", "artist"}),
+        ("album", "album", "artist"): frozenset({"Album", "album"}),
+    }
+
+    db.record_dedupe_skip("artists", "artist", "", ["Artist", "a r t i s t"])
+    assert db.get_dedupe_skips()[("artists", "artist", "")] == frozenset(
+        {"Artist", "a r t i s t"}
+    )
+
+    db.remove_dedupe_skip("artists", "artist", "")
+    assert ("artists", "artist", "") not in db.get_dedupe_skips()
+    assert db.clear_dedupe_skips() == 1
+    assert db.get_dedupe_skips() == {}
+
+
+def test_dedupe_skips_tolerate_malformed_variants(app_settings):
+    import sqlite3
+
+    db.record_dedupe_skip("artists", "artist", "", ["Artist", "artist"])
+    with sqlite3.connect(app_settings.db_path) as conn:
+        conn.execute(
+            "UPDATE dedupe_skips SET variants = 'not-json' WHERE group_key = 'artist'"
+        )
+        conn.commit()
+
+    assert db.get_dedupe_skips()[("artists", "artist", "")] == frozenset()
+
+
+def test_cover_scans_roundtrip(app_settings):
+    assert db.list_cover_scans() == {}
+    db.set_cover_scan("Artist-Song", 1234, 5678, db.COVER_STATUS_CROPPED)
+    db.set_cover_scan("Artist-Other", 99, 100, db.COVER_STATUS_NOT_PILLARBOX)
+
+    assert db.list_cover_scans() == {
+        "Artist-Song": (1234, 5678, "cropped"),
+        "Artist-Other": (99, 100, "not_pillarbox"),
+    }
+
+    db.set_cover_scan("Artist-Song", 4321, 8765, db.COVER_STATUS_NOT_PILLARBOX)
+    assert db.list_cover_scans()["Artist-Song"] == (4321, 8765, "not_pillarbox")
+
+
 def test_log_event_and_get_events(app_settings):
     song_uuid = db.insert_song(current_path="Song.mp3")
     db.log_event(song_uuid, "downloaded", {"url": "https://example.com/x"})

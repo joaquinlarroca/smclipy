@@ -97,6 +97,22 @@ CREATE TABLE IF NOT EXISTS false_positives (
     stem TEXT PRIMARY KEY
 );
 
+CREATE TABLE IF NOT EXISTS dedupe_skips (
+    field TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT '',
+    variants TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (field, group_key, scope)
+);
+
+CREATE TABLE IF NOT EXISTS cover_scans (
+    stem TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    status TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS playlists (
     name TEXT PRIMARY KEY,
     description TEXT NOT NULL DEFAULT '',
@@ -139,7 +155,7 @@ QUEUE_FAILED = "failed"
 _LEGACY_MIGRATED_KEY = "legacy_migrated"
 
 # Bumped when the schema changes; _migrate_schema applies incremental upgrades.
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 7
 
 
 def _now() -> str:
@@ -239,6 +255,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     # Playlists arrive in v3. connect() runs SCHEMA before this function, and
     # SCHEMA already creates the playlist tables, so only the version bump
     # below is needed to finish the migration.
+    # The cover scan cache arrives in v6; SCHEMA creates `cover_scans` on
+    # connect, so likewise only the version bump is needed.
+    # Remembered `dedupe` skips arrive in v7; SCHEMA creates `dedupe_skips`
+    # on connect, so again only the version bump is needed.
     if not _column_exists(conn, "songs", "duration"):
         # v4 tracks playback length for the stats command. Already present on
         # fresh databases (SCHEMA) and on tables rebuilt above.
@@ -622,6 +642,47 @@ def set_cover_status(
             c.close()
 
 
+def list_cover_scans(
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, tuple[int, int, str]]:
+    """Last recorded analysis of each cover image, keyed by stem.
+
+    The tuple is ``(size, mtime_ns, status)``; the crop command compares it
+    with the file on disk to decide whether the image needs analyzing again.
+    """
+    c, owner = _rw(conn)
+    try:
+        return {
+            row["stem"]: (row["size"], row["mtime_ns"], row["status"])
+            for row in c.execute("SELECT stem, size, mtime_ns, status FROM cover_scans")
+        }
+    finally:
+        if owner:
+            c.close()
+
+
+def set_cover_scan(
+    stem: str,
+    size: int,
+    mtime_ns: int,
+    status: str,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Remember a cover image's size/mtime and analysis outcome."""
+    c, owner = _rw(conn)
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO cover_scans (stem, size, mtime_ns, status)"
+            " VALUES (?, ?, ?, ?)",
+            (stem, size, mtime_ns, status),
+        )
+        if owner:
+            c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
 def reset_source_status(song_uuid: str, conn: sqlite3.Connection | None = None) -> None:
     """Clear a song's `findsource` outcome so it is searched again."""
     c, owner = _rw(conn)
@@ -912,6 +973,96 @@ def rename_false_positive(
         c.execute("DELETE FROM false_positives WHERE stem = ?", (old_stem,))
         if owner:
             c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
+def _decode_dedupe_variants(raw: str) -> frozenset[str]:
+    """Decode a stored skip fingerprint, tolerating malformed rows."""
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return frozenset()
+    if not isinstance(value, list):
+        return frozenset()
+    return frozenset(item for item in value if isinstance(item, str))
+
+
+def get_dedupe_skips(
+    conn: sqlite3.Connection | None = None,
+) -> dict[tuple[str, str, str], frozenset[str]]:
+    """Remembered ``dedupe`` Skips keyed by (field, group_key, scope).
+
+    The value is the set of exact spellings that made up the group when the
+    user skipped it, so a newly appeared spelling invalidates the skip.
+    """
+    c, owner = _rw(conn)
+    try:
+        return {
+            (row["field"], row["group_key"], row["scope"]): _decode_dedupe_variants(
+                row["variants"]
+            )
+            for row in c.execute(
+                "SELECT field, group_key, scope, variants FROM dedupe_skips"
+            )
+        }
+    finally:
+        if owner:
+            c.close()
+
+
+def record_dedupe_skip(
+    field: str,
+    group_key: str,
+    scope: str,
+    variants: list[str],
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Remember that the user skipped a ``dedupe`` group."""
+    c, owner = _rw(conn)
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO dedupe_skips"
+            " (field, group_key, scope, variants, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (field, group_key, scope, json.dumps(sorted(set(variants))), _now()),
+        )
+        if owner:
+            c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
+def remove_dedupe_skip(
+    field: str,
+    group_key: str,
+    scope: str,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Forget a skipped group (for example after it is actually merged)."""
+    c, owner = _rw(conn)
+    try:
+        c.execute(
+            "DELETE FROM dedupe_skips WHERE field = ? AND group_key = ? AND scope = ?",
+            (field, group_key, scope),
+        )
+        if owner:
+            c.commit()
+    finally:
+        if owner:
+            c.close()
+
+
+def clear_dedupe_skips(conn: sqlite3.Connection | None = None) -> int:
+    """Forget every skipped ``dedupe`` group, returning how many were cleared."""
+    c, owner = _rw(conn)
+    try:
+        cur = c.execute("DELETE FROM dedupe_skips")
+        if owner:
+            c.commit()
+        return cur.rowcount
     finally:
         if owner:
             c.close()

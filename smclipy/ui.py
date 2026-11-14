@@ -18,6 +18,7 @@ from prompt_toolkit.widgets import Button, CheckboxList, Dialog, Label
 
 from smclipy.config import settings
 from smclipy.downloader import get_author, matches_duration
+from smclipy.matching import duration_matches
 
 if TYPE_CHECKING:
     from smclipy.downloader import SourceCandidate
@@ -159,18 +160,19 @@ def _expand_song_token(token: str) -> list[int]:
     return list(range(start, end + 1))
 
 
-def prompt_song_selection(count: int) -> list[int]:
-    """Ask which songs to process, returning 0-indexed positions.
+def prompt_song_selection(count: int, noun: str = "song") -> list[int]:
+    """Ask which items to process, returning 0-indexed positions.
 
     Supports comma-separated numbers and ranges (``1,3,5``, ``1-100``,
     ``1-3,8,10-12``). Returns an empty list when the user cancels (blank,
-    ``q``, ``quit``, or ``0``).
+    ``q``, ``quit``, or ``0``). ``noun`` names the listed items (e.g.
+    ``"cover"`` for the crop command).
     """
     while True:
         try:
             answer: str = prompt(
-                "Song numbers/ranges (e.g. 1,3,5 or 2-10), 'all' for every song, "
-                "or 'q' to cancel: "
+                f"{noun.capitalize()} numbers/ranges (e.g. 1,3,5 or 2-10), "
+                f"'all' for every {noun}, or 'q' to cancel: "
             )
         except KeyboardInterrupt:
             print("\nInterrupted, exiting...")
@@ -221,16 +223,34 @@ def prompt_position_selection(count: int, message: str) -> int | None:
         return number - 1
 
 
-def prompt_match_selection(matches: list["MusicBrainzMatch"]) -> int | None:
-    """Let the user pick a candidate match, or None to skip the song."""
-    options: list[tuple[str, str]] = [("Skip this song", "Skip this song")]
+def prompt_match_selection(
+    matches: list["MusicBrainzMatch"], *, song_duration: float | None = None
+) -> int | None:
+    """Let the user pick a candidate match, or None to skip the song.
+
+    Matching durations are highlighted like the source picker so the most
+    plausible recording stands out.
+    """
+    options: list[tuple[str, Any]] = [("Skip this song", "Skip this song")]
     for index, match in enumerate(matches, start=1):
         label: str = ", ".join(match.artists) + f" - {match.title}"
         if match.album:
             label += f" | {match.album}"
         if match.date:
             label += f" ({match.date})"
-        options.append((str(index), label))
+        match_duration: float | None = getattr(match, "duration", None)
+        if match_duration:
+            label += f" ({format_duration(match_duration)})"
+        if duration_matches(match_duration, song_duration):
+            label = f"★ {label}  [same length]"
+            options.append(
+                (
+                    str(index),
+                    HTML(f"<ansigreen><b>{escape(label)}</b></ansigreen>"),
+                )
+            )
+        else:
+            options.append((str(index), label))
     selection: str = choice(
         message="Pick a matching recording (MusicBrainz):",
         options=options,
@@ -474,6 +494,29 @@ def prompt_field_selection(
         title="Select fields to modify",
         message="Space toggles a field, Enter applies the selected fields to the "
         "chosen song(s) (uncheck all to cancel):",
+        values=values,
+        default_values=[],
+        style=_DARK_DIALOG_STYLE,
+    ).run()
+    if selected is None:
+        return None
+    return list(dict.fromkeys(selected))
+
+
+def prompt_multi_selection(
+    values: list[tuple[str, str]], *, title: str, message: str
+) -> list[str] | None:
+    """Let the user tick multiple arbitrary rows.
+
+    Every row is unchecked by default. Pressing Enter applies the checked rows
+    immediately, Space toggles the focused row, and an empty selection is
+    returned as an empty list (the caller decides what that means).
+    """
+    if not values:
+        return []
+    selected: list[str] = _checkbox_dialog(
+        title=title,
+        message=message,
         values=values,
         default_values=[],
         style=_DARK_DIALOG_STYLE,

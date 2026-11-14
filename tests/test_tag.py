@@ -163,6 +163,26 @@ def test_process_song_skip_returns_false(monkeypatch, app_settings):
     assert tag.process_song(song) is False
 
 
+def test_process_song_forwards_duration_to_search_and_picker(monkeypatch, app_settings):
+    monkeypatch.setattr(tag, "read_song_duration", lambda path: 245.0)
+    song = tag.LibrarySong(app_settings.music_folder / "missing.mp3")
+    seen: dict[str, Any] = {}
+
+    def fake_search(title, artists, album, **kwargs):
+        seen["search_duration"] = kwargs.get("duration")
+        return [a_match()]
+
+    def fake_picker(matches, **kwargs):
+        seen["picker_duration"] = kwargs.get("song_duration")
+        return None
+
+    monkeypatch.setattr(tag, "search_recordings", fake_search)
+    monkeypatch.setattr(tag, "prompt_match_selection", fake_picker)
+
+    assert tag.process_song(song) is False
+    assert seen == {"search_duration": 245.0, "picker_duration": 245.0}
+
+
 def test_process_song_records_not_found_status(monkeypatch, app_settings):
     app_settings.music_folder.mkdir(parents=True, exist_ok=True)
     write_tagged_mp3(

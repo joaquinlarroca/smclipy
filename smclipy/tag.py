@@ -23,6 +23,7 @@ from smclipy.metadata import (
     apply_tag_update,
     has_cover,
     iter_audio_files,
+    read_song_duration,
     read_song_profile,
     read_song_uuid,
     scan_library,
@@ -154,6 +155,16 @@ class LibrarySong:
         self.path = path
         self.uuid: str | None = read_song_uuid(path)
         self.current, self.has_cover = read_song_profile(path)
+        self._duration: float | None = None
+        self._duration_loaded: bool = False
+
+    @property
+    def duration(self) -> float | None:
+        """Playback length in seconds, read lazily when a search needs it."""
+        if not self._duration_loaded:
+            self._duration = read_song_duration(self.path)
+            self._duration_loaded = True
+        return self._duration
 
     @property
     def display_name(self) -> str:
@@ -347,7 +358,9 @@ def process_song(
             )
 
     try:
-        matches: list[MusicBrainzMatch] = search_recordings(title, artists, album)
+        matches: list[MusicBrainzMatch] = search_recordings(
+            title, artists, album, duration=song.duration
+        )
     except MusicBrainzUnavailable:
         print(
             "MusicBrainz is unreachable, skipping without recording a result "
@@ -362,7 +375,9 @@ def process_song(
         return False
 
     if mode == "interactive":
-        selected: int | None = prompt_match_selection(matches)
+        selected: int | None = prompt_match_selection(
+            matches, song_duration=song.duration
+        )
         if selected is None:
             print("Skipped.")
             _record_mb_outcome(song.uuid, db.MB_STATUS_SKIPPED)

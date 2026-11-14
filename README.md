@@ -14,9 +14,9 @@
 - **Playlists (`playlist`):** Build playlists of your library songs (create/rename/delete/list/show), add/remove/move songs interactively, sort by metadata, and export them to `.m3u`, `.m3u-link` (one URL per line with artist/title labels), or `.json` — or import `.m3u`/`.m3u8`/`.m3u-link`/`.json` playlists by resolving the entries against your library (UUID first, then each path relative to the file, your music folder, or a unique matching filename). Playlists are stored in `smclipy.db` and reference songs by their tracking UUID, so renaming or relocating a song never breaks its playlists. When a JSON import leaves songs unmatched, it reports how many are missing and points to `smclipy download --file`, which downloads each missing song from its recorded `source_url` and applies the playlist metadata automatically (`--auto` also skips the cover-crop question). Use `smclipy findsource --file playlist.json` to search for and fill missing source URLs, and `smclipy modify --file playlist.json` to edit the exported entries by hand.
 - **Video Info Preview:** Before tagging, the video's title, artist/s, and the first `description_max_lines` lines of its description are shown for context.
 - **Cover Art Cropping:** Crop cover art to a perfect 1:1 square ratio during tagging, with a terminal preview of the art.
-- **Cover Rescan (`crop`):** Re-extracts covers from your existing audio files, detects pillarboxed art, lets you crop it to 1:1, and re-embeds it into the matching files. Images you decline to crop are remembered so you're not asked twice.
+- **Cover Rescan (`crop`):** Re-extracts covers from your existing audio files, detects pillarboxed art, lets you crop it to 1:1, and re-embeds it into the matching files. Pick a range from the listed covers or use `--all`, narrow the list with `--search TEXT` or `--specific FIELD`, preview with `--dry-run`, and run headless with `--auto --all`. Images you decline to crop are remembered so you're not asked twice.
 - **Manual Editing (`modify`):** Edit the tags of any library song by hand — title, artists, album, release date, genre, album artist, track number, cover art, and source URL. Pick a range to bulk-apply one set of values (e.g., the songs of an album) or a single number to edit one song; a blank answer keeps a field, and typing `/clear` empties it. The source URL is tracking metadata stored in `smclipy.db` (not written into the audio file). Narrow the list first with `--search TEXT` (matches title, album, or any artist) or `--specific FIELD` (autocomplete an existing title, album, or artist), then pick among the matches.
-- **Name Deduplication (`dedupe`):** Find artist and album names that differ only in capitalization or spacing — `Artist`, `artist`, `a r t i s t` — pick the spelling to keep for each group, and smclipy rewrites the tags, renames the `artist-title` files and their cover images, and updates the tracking database. Every group is reviewed before anything is written; use `--artists`, `--albums`, or `--dry-run` to narrow or preview the run.
+- **Name Deduplication (`dedupe`):** Find artist and album names that differ only in capitalization or spacing — `Artist`, `artist`, `a r t i s t` — or albums that differ by a trailing bracketed qualifier such as `Album (test)` vs `Album` (part/disc/volume/live/remix markers stay distinct). Album groups are scoped by the album artist, falling back to the first song artist, so same-named albums by different artists stay separate. Pick the spelling to keep for each group, and smclipy rewrites the tags, renames the `artist-title` files and their cover images, and updates the tracking database. Every group is reviewed before anything is written; groups you skip are remembered so later runs don't ask again (use `--reset-skipped` to reconsider them), and use `--artists`, `--albums`, or `--dry-run` to narrow or preview the run.
 - **Interrupt & Retry Friendly:** Queues are saved as you paste them — pressing Ctrl+C saves what you've entered, queues survive interruptions, and `download` detects an unfinished queue and offers to resume. Videos that fail (e.g., HTTP errors) are kept pending for a later retry, with up to `max_download_attempts` total attempts per URL, after which they're marked permanently failed and reported; already-processed ones are never re-downloaded.
 - **Overwrite Protection:** Asks before overwriting an existing audio file with the same `artist-title` name, with a per-track `[i/N]` progress line while processing. A choice to keep your existing copy is remembered, so that track isn't re-asked on a later resume. In headless `--no-prompt` mode every prompt is skipped (title, album, artists, cover-crop, overwrite), so an existing file is simply kept and skipped.
 - **Clean Cleanup:** Uses a `.temp` directory (inside your music folder's `smclipy` subfolder) during the download and tagging process to keep your main library clean.
@@ -79,13 +79,19 @@ Run it from your music library's parent directory:
 smclipy <command>
 ```
 
-You can also invoke it as a module: `python -m smclipy <command>`. Note that `download`, `crop`, `tag`, `findsource`, `modify`, `dedupe`, `restore`, and the interactive playlist actions (`add`, `remove`, `move`) require an interactive terminal, with four headless exceptions: `download --batch FILE --no-prompt`, `download --file FILE --auto` (or `--no-prompt`), `tag --auto --all`, and `findsource --auto --all`. `tag --specific` and `findsource --specific` always need a terminal (they autocomplete existing values), even alongside `--auto --all`; `--search` does not break the headless mode (`tag --auto --all --search TEXT`, `findsource --auto --all --search TEXT`). `update`, the JSON modes, and the remaining playlist actions never require a terminal, so they can be scripted or scheduled.
+You can also invoke it as a module: `python -m smclipy <command>`. Note that `download`, `crop`, `tag`, `findsource`, `modify`, `dedupe`, `restore`, and the interactive playlist actions (`add`, `remove`, `move`) require an interactive terminal, with five headless exceptions: `download --batch FILE --no-prompt`, `download --file FILE --auto` (or `--no-prompt`), `tag --auto --all`, `findsource --auto --all`, and `crop --auto --all`. `tag --specific`, `findsource --specific`, and `crop --specific` always need a terminal (they autocomplete existing values), even alongside `--auto --all`; `--search` does not break the headless mode (`tag --auto --all --search TEXT`, `findsource --auto --all --search TEXT`, `crop --auto --all --search TEXT`). `update`, the JSON modes, and the remaining playlist actions never require a terminal, so they can be scripted or scheduled.
 
 ### Commands
 
 - **`smclipy download`** — Batch download and tag songs from YouTube or SoundCloud. Pass `--batch FILE` to read URLs from a file and `--no-prompt` to accept the default title, album, and artists, which together make it safe for cron/scripts. Pass `--file FILE` with a v2 playlist JSON to download only its missing songs and apply each entry's title, artists, album, date, genre, album artist, and track number automatically; `--auto` is a synonym for `--no-prompt` that also skips the cover-crop question. Downloaded songs are not added to the playlist automatically — re-run `smclipy playlist import` afterwards.
-- **`smclipy crop`** — Re-extract covers from your audio files, find pillarboxed art, crop to 1:1 interactively, and re-embed into the matching files.
-- **`smclipy tag`** — Retag songs already in your library using MusicBrainz metadata. Songs you already tagged (recorded in the tracking database) are automatically skipped with a warning, so re-running over `all`, a range, or a single number only processes what's new. Songs imported from the older text-file tracking format are *not* treated as already tagged, so they are offered on the first run.
+- **`smclipy crop`** — Re-extract covers from your audio files, find pillarboxed art, crop to 1:1, and re-embed into the matching files. By default the pillarboxed covers are listed and you pick a range; `--all` selects every one. Images you decline to crop are remembered so you're not asked again.
+  - `smclipy crop --auto` (`-a`) — Crop every selected cover without the per-cover `Crop cover to 1:1?` question. Combine with `--all` (`smclipy crop --auto --all`) to run without an interactive terminal.
+  - `smclipy crop --all` — Skip the cover-range prompt and select every pillarboxed cover.
+  - `smclipy crop --dry-run` — Print the covers that would be cropped and the tracks that would receive them, without cropping, backing up, re-embedding, or writing database status.
+  - `smclipy crop --json` (`-j`) — Print a machine-readable JSON report to stdout (per-cover outcome and matched tracks) while human progress goes to stderr. Requires `--auto --all`; exits with status 1 when any cover failed.
+  - `smclipy crop --search TEXT` — Only consider covers whose image name, or whose matching song's title, album, or any artist, contains `TEXT` (case-insensitive). Combine with `--auto --all` for a headless crop of the matches.
+  - `smclipy crop --specific FIELD` — Autocomplete the library's existing `title`, `album`, or `artists` values, pick one, and only crop covers matching it. Requires an interactive terminal. `--search` and `--specific` are mutually exclusive.
+- **`smclipy tag`** — Retag songs already in your library using MusicBrainz metadata. Candidates are ranked by official studio status, then matching length (within two seconds of the library file), artist and title similarity, album match, and finally MusicBrainz relevance; the interactive picker shows each result's length and highlights same-length matches. Songs you already tagged (recorded in the tracking database) are automatically skipped with a warning, so re-running over `all`, a range, or a single number only processes what's new. Songs imported from the older text-file tracking format are *not* treated as already tagged, so they are offered on the first run.
   - `smclipy tag --auto` (`-a`) — **Full-auto:** after you pick the song range, the top MusicBrainz match is applied to each selected song automatically with no further prompts, writing every enabled `tag_fields` value (including the title). Shows a per-song progress line instead of the match picker and confirm dialog.
   - `smclipy tag --semi` (`-s`) — **Semi-auto:** the top match is picked automatically per song, but you still review and confirm each change set (checkbox dialog) before it is applied.
   - `smclipy tag --all` — Skip the range prompt and select every untagged song. Combine with `--auto` (`smclipy tag --auto --all`) to retag the whole library without an interactive terminal.
@@ -113,9 +119,10 @@ You can also invoke it as a module: `python -m smclipy <command>`. Note that `do
   - `smclipy modify --specific FIELD` — Autocomplete the library's existing `title`, `album`, or `artists` values, pick one, and only consider songs that match it. `--search` and `--specific` are mutually exclusive.
   - `smclipy modify --file FILE` (`-f`) — Edit a single audio file directly (inside the music folder it is tracked first; outside it tags are still written, with a warning), or edit the entries of a v2 playlist JSON. Playlist mode supports every field except cover art and changes only the JSON file; source URL stays a JSON field there. `--reset-mb` and cover editing apply only to audio files.
   - `smclipy modify --reset-mb` — Also forget the MusicBrainz match of every selected song, so a later `smclipy tag` run offers it again. This happens even when you leave every field unchanged, so it also works to retry a song that was tagged without cover art.
-- **`smclipy dedupe`** — Find artist and album names whose only difference is capitalization or spacing (for example `Artist`, `artist`, and `a r t i s t`). Each group gets a single-choice dialog to pick the spelling to keep; the program then rewrites the tags, renames the affected `artist-title` audio files and cover images, and updates the tracking database. Nothing is written until every group has been reviewed.
+- **`smclipy dedupe`** — Find artist and album names whose only difference is capitalization or spacing (for example `Artist`, `artist`, and `a r t i s t`), plus albums whose only difference is a trailing bracketed qualifier such as `Album (test)` vs `Album` (part/disc/volume/live/remix markers keep albums distinct). Album groups are scoped by album artist (falling back to the first song artist), so same-named albums by different artists stay separate. Each group gets a single-choice dialog to pick the spelling to keep; the program then rewrites the tags, renames the affected `artist-title` audio files and cover images, and updates the tracking database. Nothing is written until every group has been reviewed.
   - `smclipy dedupe --artists` / `--albums` — Only look for artist or only for album spellings (default: both).
-  - `smclipy dedupe --dry-run` — Print the planned tag, filename, cover, and database changes without writing anything.
+  - `smclipy dedupe --dry-run` — Print the planned tag, filename, cover, and database changes without writing anything. Dry runs never record your Skip choices.
+  - `smclipy dedupe --reset-skipped` — Forget the groups skipped on previous runs and offer them all again. A skipped group stays hidden until its set of spellings changes (a new variant makes it reappear) or you use this flag.
 - **`smclipy restore`** — Browse one list of restore points, newest first, and undo a mistaken `tag`, `modify`, `crop`, or `dedupe` change. Every mutation records a backup of the song's previous tags and cover art first; each row names the song, the operation that followed the backup, when it was taken, and the values it would restore, and a full before/after preview (including cover changes) is shown before anything is written. The restore itself is backed up too. Filename renames made by `dedupe` are not undone. Also handy after a bad `tag --auto` run caught in time.
   - `smclipy restore --all` — Show every restore point instead of only the newest 25.
   - `smclipy restore --limit N` — Show at most N restore points (default: 25).
@@ -247,6 +254,7 @@ examples:
   smclipy dedupe     Merge differently styled artist/album names
   smclipy dedupe --albums  Only merge album spellings
   smclipy dedupe --dry-run  Preview a merge without writing
+  smclipy dedupe --reset-skipped  Review groups skipped before
   smclipy restore    Roll back a song to an earlier tag backup
   smclipy restore --all  Show every recorded restore point
   smclipy restore --limit 5  Show only the newest 5 restore points
@@ -396,9 +404,12 @@ options:
                     album, or artists) and only process songs that match the
                     chosen value. Needs an interactive terminal.
 
-Metadata is provided by MusicBrainz (core data is CC0, supplementary data and
-docs are CC BY-NC-SA 3.0; https://musicbrainz.org ), and cover art is served
-by the Cover Art Archive (coverartarchive.org).
+Matches are ranked by official studio status, then matching length,
+artist/title similarity, and album match, with MusicBrainz relevance as the
+final tie-breaker; same-length results are highlighted in the picker. Metadata
+is provided by MusicBrainz (core data is CC0, supplementary data and docs are
+CC BY-NC-SA 3.0; https://musicbrainz.org ), and cover art is served by the
+Cover Art Archive (coverartarchive.org).
 ```
 
 #### `smclipy findsource`
@@ -492,19 +503,28 @@ options:
 
 ```text
 usage: smclipy dedupe [-h] [--artists] [--albums] [--dry-run]
+                      [--reset-skipped]
 
 Find artist and album names that differ only by case or spacing (for example
-'Artist', 'artist', and 'a r t i s t'), pick the spelling to keep for each
-group, then rewrite the tags, the artist-title filenames, matching cover
-images, and the tracking database. Nothing is written until every group has
-been reviewed.
+'Artist', 'artist', and 'a r t i s t'). Album names also ignore trailing
+bracketed qualifiers such as 'Album (test)', while part/disc/volume/live/remix
+markers keep albums distinct. Album groups are scoped by album artist (falling
+back to the first song artist), so same-named albums by different artists stay
+separate. Pick the spelling to keep for each group, then rewrite the tags, the
+artist-title filenames, matching cover images, and the tracking database.
+Groups you skip are remembered so later runs do not ask again (use --reset-
+skipped to review them). Nothing is written until every group has been
+reviewed.
 
 options:
-  -h, --help  show this help message and exit
-  --artists   Only look for artist names (default: artists and albums).
-  --albums    Only look for album names (default: artists and albums).
-  --dry-run   Show the planned tag, filename, cover, and database changes
-              without writing anything.
+  -h, --help       show this help message and exit
+  --artists        Only look for artist names (default: artists and albums).
+  --albums         Only look for album names (default: artists and albums).
+  --dry-run        Show the planned tag, filename, cover, and database changes
+                   without writing anything.
+  --reset-skipped  Forget groups skipped on previous runs and offer them
+                   again. Skipped groups stay hidden by default until their
+                   spellings change.
 ```
 
 #### `smclipy restore`
@@ -529,13 +549,35 @@ options:
 #### `smclipy crop`
 
 ```text
-usage: smclipy crop [-h]
+usage: smclipy crop [-h] [-a] [--all] [--dry-run] [-j]
+                    [--search TEXT | --specific FIELD]
 
-Scan saved cover images for pillarboxing, crop them to a 1:1 ratio
-interactively, and re-embed each result into its matching audio file.
+Scan saved cover images for pillarboxing, crop them to a 1:1 ratio, and re-
+embed each result into its matching audio file. By default the pillarboxed
+covers are listed so you can pick a range; --all selects every one. Use
+--search or --specific to narrow the list by song metadata, and --auto --all
+to crop a whole selection without any interactive prompts.
 
 options:
-  -h, --help  show this help message and exit
+  -h, --help        show this help message and exit
+  -a, --auto        Crop every selected cover without asking the per-cover
+                    crop question. Combine with --all to run without an
+                    interactive terminal.
+  --all             Crop every pillarboxed cover instead of asking for a
+                    range. Combine with --auto to run without an interactive
+                    terminal.
+  --dry-run         Show the covers that would be cropped and the tracks that
+                    would receive them, without writing anything.
+  -j, --json        Print a machine-readable JSON report to stdout while human
+                    messages go to stderr. Requires --auto --all (headless
+                    crop). Exits with status 1 when any cover failed.
+  --search TEXT     Only process covers whose name, or whose matching song's
+                    title, album, or any artist, contains TEXT (case-
+                    insensitive). Combine with --auto --all for a headless
+                    crop of the matches.
+  --specific FIELD  Autocomplete the library's existing FIELD values (title,
+                    album, or artists) and only process covers matching the
+                    chosen value. Needs an interactive terminal.
 ```
 
 #### `smclipy playlist create`

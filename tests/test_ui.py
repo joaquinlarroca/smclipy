@@ -14,6 +14,19 @@ def _patch_prompt(monkeypatch, answers):
     monkeypatch.setattr(ui, "prompt", fake_prompt)
 
 
+def test_prompt_song_selection_noun(monkeypatch):
+    messages = []
+
+    def fake_prompt(message, **kwargs):
+        messages.append(message)
+        return "1"
+
+    monkeypatch.setattr(ui, "prompt", fake_prompt)
+    assert ui.prompt_song_selection(3, noun="cover") == [0]
+    assert "Cover numbers/ranges" in messages[0]
+    assert "'all' for every cover" in messages[0]
+
+
 def test_prompt_song_selection_all(monkeypatch):
     _patch_prompt(monkeypatch, ["all"])
     assert ui.prompt_song_selection(3) == [0, 1, 2]
@@ -127,11 +140,18 @@ def _fake_match(
     artists=("Twenty One Pilots",),
     album="Trench",
     date="2018",
+    duration=None,
 ):
     return type(
         "Match",
         (),
-        {"title": title, "artists": list(artists), "album": album, "date": date},
+        {
+            "title": title,
+            "artists": list(artists),
+            "album": album,
+            "date": date,
+            "duration": duration,
+        },
     )()
 
 
@@ -148,6 +168,25 @@ def test_prompt_match_selection_shows_metadata_labels(monkeypatch):
         ("1", "Twenty One Pilots - Choker | Trench (2018)"),
         ("2", "Korn - Korn | Korn (1994)"),
     ]
+
+
+def test_prompt_match_selection_shows_duration(monkeypatch):
+    captured = _patch_choice(monkeypatch, "Skip this song")
+    matches = [_fake_match(duration=245.0)]
+    assert ui.prompt_match_selection(matches) is None
+    assert captured["options"] == [
+        ("Skip this song", "Skip this song"),
+        ("1", "Twenty One Pilots - Choker | Trench (2018) (4:05)"),
+    ]
+
+
+def test_prompt_match_selection_highlights_same_length(monkeypatch):
+    captured = _patch_choice(monkeypatch, "Skip this song")
+    matches = [_fake_match(duration=245.0)]
+    assert ui.prompt_match_selection(matches, song_duration=246.0) is None
+    label = captured["options"][1][1]
+    assert "★" in label.value
+    assert "[same length]" in label.value
 
 
 def test_prompt_match_selection_defaults_to_skip_when_no_matches(monkeypatch):
@@ -242,6 +281,27 @@ def test_prompt_field_selection_cancel_returns_none(monkeypatch):
 
 def test_prompt_field_selection_empty_is_cancel():
     assert ui.prompt_field_selection([]) == []
+
+
+def test_prompt_multi_selection_unchecked_by_default(monkeypatch):
+    captured = _patch_checkboxlist(monkeypatch, ["one", "two"])
+    result = ui.prompt_multi_selection(
+        [("one", "One  [Album]"), ("two", "Two  [no album]")],
+        title="Songs by Artist",
+        message="Space toggles a song, Enter applies the selection:",
+    )
+    assert result == ["one", "two"]
+    assert captured["default_values"] == []
+    assert captured["title"] == "Songs by Artist"
+
+
+def test_prompt_multi_selection_cancel_returns_none(monkeypatch):
+    _patch_checkboxlist(monkeypatch, None)
+    assert ui.prompt_multi_selection([("one", "One")], title="t", message="m") is None
+
+
+def test_prompt_multi_selection_empty_is_empty():
+    assert ui.prompt_multi_selection([], title="t", message="m") == []
 
 
 def test_prompt_field_value_prefills_default(monkeypatch):

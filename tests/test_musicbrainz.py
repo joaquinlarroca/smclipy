@@ -44,8 +44,9 @@ def sample_recording(
     status="Official",
     album="The Wall",
     date="1979-11-30",
+    length=None,
 ) -> dict:
-    return {
+    recording = {
         "id": "rec-1",
         "title": title,
         "ext:score": score,
@@ -73,6 +74,9 @@ def sample_recording(
             }
         ],
     }
+    if length is not None:
+        recording["length"] = length
+    return recording
 
 
 def test_search_recordings_empty_title_returns_none(monkeypatch):
@@ -163,7 +167,7 @@ def test_match_missing_release_has_empty_fields(monkeypatch):
 def test_rank_recording_tolerates_non_numeric_score():
     rec = sample_recording(score="N/A")
     rank = mb._rank_recording(rec)
-    assert rank[2] == 0
+    assert rank[-1] == 0
 
 
 def test_rank_recording_prefers_official_status():
@@ -477,6 +481,75 @@ def test_rank_recording_penalizes_version_qualifiers_in_the_title():
     live = sample_recording(title="Comfortably Numb (Live at Wembley)")
 
     assert mb._rank_recording(studio) > mb._rank_recording(live)
+
+
+def test_recording_duration_parses_milliseconds():
+    assert mb._recording_duration(sample_recording(length=245000)) == 245.0
+    assert mb._recording_duration(sample_recording(length="180000")) == 180.0
+    assert mb._recording_duration(sample_recording()) is None
+    assert mb._recording_duration(sample_recording(length=0)) is None
+    assert mb._recording_duration(sample_recording(length="bad")) is None
+
+
+def test_rank_recording_prefers_matching_duration():
+    matching = sample_recording(length=245000)
+    mismatching = sample_recording(length=120000)
+
+    rank = mb._rank_recording(matching, duration=245.0)
+    assert rank > mb._rank_recording(mismatching, duration=245.0)
+
+
+def test_rank_recording_treats_unknown_duration_as_neutral():
+    matching = sample_recording(length=245000)
+    unknown = sample_recording()
+    mismatching = sample_recording(length=120000)
+
+    assert (
+        mb._rank_recording(matching, duration=245.0)
+        > mb._rank_recording(unknown, duration=245.0)
+        > mb._rank_recording(mismatching, duration=245.0)
+    )
+
+
+def test_rank_recording_prefers_artist_match():
+    matching = sample_recording(artist="Pink Floyd")
+    unrelated = sample_recording(artist="Some Cover Band")
+
+    assert mb._rank_recording(matching, artists=["Pink Floyd"]) > mb._rank_recording(
+        unrelated, artists=["Pink Floyd"]
+    )
+
+
+def test_rank_recording_prefers_title_match():
+    matching = sample_recording(title="Comfortably Numb")
+    unrelated = sample_recording(title="Numb (Remix)")
+
+    assert mb._rank_recording(matching, title="Comfortably Numb") > mb._rank_recording(
+        unrelated, title="Comfortably Numb"
+    )
+
+
+def test_rank_recording_prefers_album_match():
+    matching = sample_recording(album="The Wall")
+    unrelated = sample_recording(album="Greatest Hits")
+
+    assert mb._rank_recording(matching, album="The Wall") > mb._rank_recording(
+        unrelated, album="The Wall"
+    )
+
+
+def test_search_recordings_ranks_by_duration_and_exposes_it(monkeypatch):
+    matching = sample_recording(length=245000)
+    mismatching = sample_recording(length=120000)
+    monkeypatch.setattr(
+        "smclipy.musicbrainz.musicbrainzngs.search_recordings",
+        lambda **kwargs: {"recording-list": [mismatching, matching]},
+    )
+
+    matches = mb.search_recordings("Comfortably Numb", ["Pink Floyd"], duration=245.0)
+
+    assert matches[0].duration == 245.0
+    assert matches[1].duration == 120.0
 
 
 def test_search_recordings_prefers_release_matching_the_searched_album(monkeypatch):

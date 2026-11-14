@@ -9,6 +9,7 @@ import yt_dlp.utils
 from smclipy.config import settings
 from smclipy.formats import FORMAT_TO_NATIVE_CODEC
 from smclipy.helpers import normalize_author, sanitize_filename, split_authors
+from smclipy.matching import MATCH_DURATION_TOLERANCE, duration_matches
 
 YT_STEM_PREFIX = "yt-"
 SC_STEM_PREFIX = "sc-"
@@ -40,14 +41,12 @@ class SourceCandidate:
     url: str
 
 
-SOURCE_DURATION_TOLERANCE = 2.0
+SOURCE_DURATION_TOLERANCE = MATCH_DURATION_TOLERANCE
 
 
 def matches_duration(candidate: SourceCandidate, song_duration: float | None) -> bool:
     """Whether a candidate's length is close enough to the library song's."""
-    if song_duration is None or song_duration <= 0 or candidate.duration is None:
-        return False
-    return abs(candidate.duration - song_duration) <= SOURCE_DURATION_TOLERANCE
+    return duration_matches(candidate.duration, song_duration)
 
 
 SOURCE_SEARCH_PREFIXES: dict[str, str] = {

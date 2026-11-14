@@ -20,10 +20,21 @@ def write_tagged_mp3(path, title="Song", artist="Artist", album="Album") -> None
     audio.save(path)
 
 
-def fake_song(title: str, artists: str, album: str = "", stem: str = "song"):
+def fake_song(
+    title: str,
+    artists: str,
+    album: str = "",
+    stem: str = "song",
+    album_artist: str = "",
+):
     return SimpleNamespace(
         path=Path(f"{stem}.mp3"),
-        current={"title": title, "artists": artists, "album": album},
+        current={
+            "title": title,
+            "artists": artists,
+            "album": album,
+            "album_artist": album_artist,
+        },
     )
 
 
@@ -77,6 +88,97 @@ def test_find_album_groups_skips_empty_and_matches_spacing():
     assert {spelling for spelling, _ in groups[0].variants} == {"Album", "a l b u m"}
 
 
+def test_find_album_groups_ignores_trailing_bracketed_qualifiers():
+    songs = [
+        fake_song("One", "Artist", "Album"),
+        fake_song("Two", "Artist", "Album (test)"),
+        fake_song("Three", "Artist", "Album [test]"),
+    ]
+    groups = dedupe.find_album_groups(songs)
+    assert len(groups) == 1
+    assert groups[0].key == "album"
+    assert [spelling for spelling, _ in groups[0].variants][0] == "Album"
+    assert {spelling for spelling, _ in groups[0].variants} == {
+        "Album",
+        "Album (test)",
+        "Album [test]",
+    }
+
+
+def test_find_album_groups_prefers_bare_spelling_over_more_qualified_songs():
+    songs = [
+        fake_song("One", "Artist", "Album (test)"),
+        fake_song("Two", "Artist", "Album (test)"),
+        fake_song("Three", "Artist", "Album (test)"),
+        fake_song("Four", "Artist", "Album"),
+    ]
+    groups = dedupe.find_album_groups(songs)
+    assert groups[0].variants[0] == ("Album", 1)
+
+
+def test_find_album_groups_keeps_edition_suffixes_distinct():
+    songs = [fake_song("One", "Artist", "Album")]
+    for suffix in ("Part 1", "Part 2", "Disc 2", "Volume 3", "Live", "Remix"):
+        songs.append(fake_song(suffix, "Artist", f"Album ({suffix})"))
+    assert dedupe.find_album_groups(songs) == []
+
+
+def test_find_album_groups_strips_multiple_trailing_qualifiers():
+    songs = [
+        fake_song("One", "Artist", "Album"),
+        fake_song("Two", "Artist", "Album (test) (copy)"),
+    ]
+    groups = dedupe.find_album_groups(songs)
+    assert len(groups) == 1
+    assert groups[0].key == "album"
+    assert {spelling for spelling, _ in groups[0].variants} == {
+        "Album",
+        "Album (test) (copy)",
+    }
+
+
+def test_find_album_groups_keeps_albums_by_different_first_artists_apart():
+    songs = [
+        fake_song("One", "Artist A", "Album (test)"),
+        fake_song("Two", "Artist B", "Album"),
+    ]
+    assert dedupe.find_album_groups(songs) == []
+
+
+def test_find_album_groups_scopes_by_first_artist():
+    songs = [
+        fake_song("One", "Artist, Guest A", "Album (test)"),
+        fake_song("Two", "Artist, Guest B", "Album"),
+    ]
+    groups = dedupe.find_album_groups(songs)
+    assert len(groups) == 1
+    assert groups[0].scope == "artist"
+    assert {spelling for spelling, _ in groups[0].variants} == {
+        "Album",
+        "Album (test)",
+    }
+
+
+def test_find_album_groups_matches_album_artist_with_fallback_first_artist():
+    songs = [
+        fake_song("One", "Artist", "Album (test)", album_artist="Artist"),
+        fake_song("Two", "Artist", "Album"),
+    ]
+    groups = dedupe.find_album_groups(songs)
+    assert len(groups) == 1
+    assert groups[0].scope == "artist"
+
+
+def test_find_album_groups_prefers_album_artist_over_first_artist():
+    songs = [
+        fake_song("One", "Artist A", "Album (test)", album_artist="Shared"),
+        fake_song("Two", "Artist B", "Album", album_artist="Shared"),
+    ]
+    groups = dedupe.find_album_groups(songs)
+    assert len(groups) == 1
+    assert groups[0].scope == "shared"
+
+
 def test_no_groups_when_spellings_are_distinct():
     songs = [fake_song("One", "Artist", "Album"), fake_song("Two", "Other", "Other")]
     assert dedupe.find_artist_groups(songs, []) == []
@@ -102,7 +204,9 @@ def test_plan_song_change_does_not_rename_when_only_later_artist_changes(
             "album_artist": "guest",
         },
     )
-    change = dedupe.plan_song_change(song, {"guest": "Guest"}, {"album": "Album"})
+    change = dedupe.plan_song_change(
+        song, {"guest": "Guest"}, {("album", "guest"): "Album"}
+    )
     assert change is not None
     assert change.new_artists == ("Artist", "Guest")
     assert change.new_album == "Album"
@@ -111,6 +215,51 @@ def test_plan_song_change_does_not_rename_when_only_later_artist_changes(
     assert change.cover_old is None
 
     assert dedupe.plan_song_change(song, {}, {}) is None
+
+
+def test_plan_song_change_maps_qualified_album(app_settings):
+    song = SimpleNamespace(
+        path=app_settings.music_folder / "Artist-Song.mp3",
+        current={
+            "title": "Song",
+            "artists": "Artist",
+            "album": "Album (test)",
+            "album_artist": "",
+        },
+    )
+    change = dedupe.plan_song_change(song, {}, {("album", "artist"): "Album"})
+    assert change is not None
+    assert change.new_album == "Album"
+    assert change.target is None
+
+
+def test_plan_song_change_skips_album_for_a_different_artist(app_settings):
+    song = SimpleNamespace(
+        path=app_settings.music_folder / "Artist-B-Song.mp3",
+        current={
+            "title": "Song",
+            "artists": "Artist B",
+            "album": "Album (test)",
+            "album_artist": "",
+        },
+    )
+    change = dedupe.plan_song_change(song, {}, {("album", "artist a"): "Album"})
+    assert change is None
+
+
+def test_plan_song_change_uses_album_artist_scope(app_settings):
+    song = SimpleNamespace(
+        path=app_settings.music_folder / "Artist-B-Song.mp3",
+        current={
+            "title": "Song",
+            "artists": "Artist B",
+            "album": "Album (test)",
+            "album_artist": "Shared",
+        },
+    )
+    change = dedupe.plan_song_change(song, {}, {("album", "shared"): "Album"})
+    assert change is not None
+    assert change.new_album == "Album"
 
 
 def test_plan_song_change_renames_with_canonical_first_artist(app_settings):
@@ -243,6 +392,38 @@ def test_cmd_dedupe_albums_dry_run_writes_nothing(monkeypatch, app_settings, cap
     assert (music / "Artist-Two.mp3").is_file()
 
 
+def test_cmd_dedupe_merges_trailing_album_qualifier(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-One.mp3", title="One", artist="Artist", album="Album"
+    )
+    write_tagged_mp3(
+        music / "Artist-Two.mp3",
+        title="Two",
+        artist="Artist",
+        album="Album (test)",
+    )
+    defaults: list[str] = []
+
+    def fake_prompt(label, variants, default):
+        defaults.append(default)
+        return "Album"
+
+    monkeypatch.setattr(dedupe, "prompt_canonical_spelling", fake_prompt)
+
+    dedupe.cmd_dedupe(argparse.Namespace(albums=True, dry_run=True))
+
+    assert defaults == ["Album"]
+    assert str(ID3(music / "Artist-Two.mp3")["TALB"]) == "Album (test)"
+    capsys.readouterr()
+
+    dedupe.cmd_dedupe(argparse.Namespace(albums=True))
+
+    assert str(ID3(music / "Artist-One.mp3")["TALB"]) == "Album"
+    assert str(ID3(music / "Artist-Two.mp3")["TALB"]) == "Album"
+
+
 def test_cmd_dedupe_keeps_song_unchanged_when_target_exists(
     monkeypatch, app_settings, capsys
 ):
@@ -341,6 +522,120 @@ def test_cmd_dedupe_skipped_group_writes_nothing(monkeypatch, app_settings, caps
     assert "Nothing to merge." in capsys.readouterr().out
 
 
+def test_cmd_dedupe_remembers_skipped_group(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="Artist")
+    write_tagged_mp3(music / "artist-Two.mp3", title="Two", artist="artist")
+    prompts: list[str] = []
+
+    def skip(label, variants, default):
+        prompts.append(label)
+        return None
+
+    monkeypatch.setattr(dedupe, "prompt_canonical_spelling", skip)
+
+    dedupe.cmd_dedupe(argparse.Namespace())
+    assert len(prompts) == 1
+    assert "remembered" in capsys.readouterr().out
+    assert db.get_dedupe_skips() == {
+        ("artists", "artist", ""): frozenset({"Artist", "artist"})
+    }
+
+    prompts.clear()
+    dedupe.cmd_dedupe(argparse.Namespace())
+
+    assert prompts == []
+    out = capsys.readouterr().out
+    assert "All 1 name group(s) were skipped on previous runs." in out
+    assert "--reset-skipped" in out
+
+
+def test_cmd_dedupe_reset_skipped_reoffers_groups(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="Artist")
+    write_tagged_mp3(music / "artist-Two.mp3", title="Two", artist="artist")
+    monkeypatch.setattr(
+        dedupe, "prompt_canonical_spelling", lambda label, variants, default: None
+    )
+    dedupe.cmd_dedupe(argparse.Namespace())
+    assert db.get_dedupe_skips()
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        dedupe, "prompt_canonical_spelling", lambda label, variants, default: "Artist"
+    )
+    dedupe.cmd_dedupe(argparse.Namespace(reset_skipped=True))
+
+    assert db.get_dedupe_skips() == {}
+    assert ID3(music / "Artist-Two.mp3")["TPE1"].text == ["Artist"]
+    out = capsys.readouterr().out
+    assert "Forgot 1 previously skipped group(s)." in out
+
+
+def test_cmd_dedupe_reoffers_skipped_group_for_new_variant(
+    monkeypatch, app_settings, capsys
+):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="Artist")
+    write_tagged_mp3(music / "artist-Two.mp3", title="Two", artist="artist")
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        dedupe,
+        "prompt_canonical_spelling",
+        lambda label, variants, default: prompts.append(label) or None,
+    )
+    dedupe.cmd_dedupe(argparse.Namespace())
+    assert len(prompts) == 1
+    capsys.readouterr()
+
+    write_tagged_mp3(music / "weird-Three.mp3", title="Three", artist="a r t i s t")
+    dedupe.cmd_dedupe(argparse.Namespace())
+
+    assert len(prompts) == 2
+    out = capsys.readouterr().out
+    assert "Found 1 name group(s) with inconsistent spelling:" in out
+    assert "previous runs" not in out
+    assert db.get_dedupe_skips() == {
+        ("artists", "artist", ""): frozenset({"Artist", "artist", "a r t i s t"})
+    }
+
+
+def test_cmd_dedupe_dry_run_does_not_remember_skip(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="Artist")
+    write_tagged_mp3(music / "artist-Two.mp3", title="Two", artist="artist")
+    monkeypatch.setattr(
+        dedupe, "prompt_canonical_spelling", lambda label, variants, default: None
+    )
+
+    dedupe.cmd_dedupe(argparse.Namespace(dry_run=True))
+
+    assert db.get_dedupe_skips() == {}
+    assert "not remembered" in capsys.readouterr().out
+
+
+def test_cmd_dedupe_merge_removes_remembered_skip(monkeypatch, app_settings, capsys):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(music / "Artist-One.mp3", title="One", artist="Artist")
+    write_tagged_mp3(music / "artist-Two.mp3", title="Two", artist="artist")
+    db.record_dedupe_skip(
+        "artists", "artist", "", ["Artist", "artist", "stale spelling"]
+    )
+    monkeypatch.setattr(
+        dedupe, "prompt_canonical_spelling", lambda label, variants, default: "Artist"
+    )
+
+    dedupe.cmd_dedupe(argparse.Namespace(artists=True))
+
+    assert db.get_dedupe_skips() == {}
+    assert ID3(music / "Artist-Two.mp3")["TPE1"].text == ["Artist"]
+
+
 def test_cmd_dedupe_keeps_going_when_one_song_fails(monkeypatch, app_settings, capsys):
     music = app_settings.music_folder
     music.mkdir(parents=True, exist_ok=True)
@@ -375,3 +670,109 @@ def test_cmd_dedupe_keeps_going_when_one_song_fails(monkeypatch, app_settings, c
     assert "could not process 'artist-One.mp3'" in captured.err
     assert "1 failure(s)" in captured.out
     assert "Dedupe complete" in captured.out
+
+
+def _patch_group_albums(monkeypatch, answers, selected_prefixes, confirm=False):
+    answer_iter = iter(answers)
+    monkeypatch.setattr(
+        dedupe,
+        "prompt_search_value",
+        lambda label, values, default="": next(answer_iter),
+    )
+
+    def fake_multi(values, *, title, message):
+        return [
+            key
+            for key, label in values
+            if any(label.startswith(prefix) for prefix in selected_prefixes)
+        ]
+
+    monkeypatch.setattr(dedupe, "prompt_multi_selection", fake_multi)
+    monkeypatch.setattr(
+        dedupe, "prompt_confirm", lambda message, default=False: confirm
+    )
+
+
+def test_cmd_dedupe_group_albums_rewrites_selected_songs(
+    monkeypatch, app_settings, capsys
+):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-One.mp3", title="One", artist="Artist", album="Alpha"
+    )
+    write_tagged_mp3(
+        music / "Artist-Two.mp3", title="Two", artist="Artist", album="Beta"
+    )
+    write_tagged_mp3(
+        music / "Artist-Three.mp3", title="Three", artist="Artist", album="Gamma"
+    )
+    _patch_group_albums(monkeypatch, ["Artist", "Album"], ["One  ", "Two  "])
+
+    dedupe.cmd_dedupe(argparse.Namespace(group_albums=True))
+
+    assert ID3(music / "Artist-One.mp3")["TALB"].text == ["Album"]
+    assert ID3(music / "Artist-Two.mp3")["TALB"].text == ["Album"]
+    assert ID3(music / "Artist-Three.mp3")["TALB"].text == ["Gamma"]
+    assert db.get_song_by_path("Artist-One.mp3")[0]["album"] == "Album"
+    assert db.get_song_by_path("Artist-Two.mp3")[0]["album"] == "Album"
+    assert db.get_song_by_path("Artist-Three.mp3")[0]["album"] == "Gamma"
+    out = capsys.readouterr().out
+    assert "Dedupe complete" in out
+    assert "2 song(s) updated" in out
+
+
+def test_cmd_dedupe_group_albums_dry_run_writes_nothing(
+    monkeypatch, app_settings, capsys
+):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-One.mp3", title="One", artist="Artist", album="Alpha"
+    )
+    write_tagged_mp3(
+        music / "Artist-Two.mp3", title="Two", artist="Artist", album="Beta"
+    )
+    _patch_group_albums(monkeypatch, ["Artist", "Album"], ["One  ", "Two  "])
+
+    dedupe.cmd_dedupe(argparse.Namespace(group_albums=True, dry_run=True))
+
+    assert ID3(music / "Artist-One.mp3")["TALB"].text == ["Alpha"]
+    assert ID3(music / "Artist-Two.mp3")["TALB"].text == ["Beta"]
+    assert db.get_song_by_path("Artist-One.mp3")[0]["album"] == "Alpha"
+    assert db.get_song_by_path("Artist-Two.mp3")[0]["album"] == "Beta"
+    out = capsys.readouterr().out
+    assert "Dry run complete" in out
+    assert "2 song(s) would be updated" in out
+
+
+def test_cmd_dedupe_group_albums_blank_author_does_nothing(
+    monkeypatch, app_settings, capsys
+):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-One.mp3", title="One", artist="Artist", album="Alpha"
+    )
+    _patch_group_albums(monkeypatch, [""], [])
+
+    dedupe.cmd_dedupe(argparse.Namespace(group_albums=True))
+
+    assert ID3(music / "Artist-One.mp3")["TALB"].text == ["Alpha"]
+    assert "Nothing to merge." in capsys.readouterr().out
+
+
+def test_cmd_dedupe_group_albums_empty_selection_skips(
+    monkeypatch, app_settings, capsys
+):
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    write_tagged_mp3(
+        music / "Artist-One.mp3", title="One", artist="Artist", album="Alpha"
+    )
+    _patch_group_albums(monkeypatch, ["Artist"], [])
+
+    dedupe.cmd_dedupe(argparse.Namespace(group_albums=True))
+
+    assert ID3(music / "Artist-One.mp3")["TALB"].text == ["Alpha"]
+    assert "No songs selected" in capsys.readouterr().out

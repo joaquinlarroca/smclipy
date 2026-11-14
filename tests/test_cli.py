@@ -447,6 +447,20 @@ def make_pillarbox_png(path) -> None:
     img.save(path)
 
 
+def _crop_args(**overrides: object) -> argparse.Namespace:
+    """Crop CLI args with the selection prompt bypassed (all covers)."""
+    values: dict[str, object] = {
+        "auto": False,
+        "all": True,
+        "dry_run": False,
+        "json": False,
+        "search": None,
+        "specific": None,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
 def _patch_crop_flow(monkeypatch, change_cover: Mock) -> None:
     import smclipy.cli as cli
 
@@ -464,7 +478,7 @@ def test_cmd_crop_missing_mp3_does_not_reembed(monkeypatch, app_settings):
     change_cover = Mock()
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     change_cover.assert_not_called()
 
@@ -480,7 +494,7 @@ def test_cmd_crop_reembeds_when_mp3_exists(monkeypatch, app_settings):
     change_cover = Mock()
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     change_cover.assert_called_once()
 
@@ -496,7 +510,7 @@ def test_cmd_crop_reembeds_dotted_title_cover(monkeypatch, app_settings):
     change_cover = Mock()
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     change_cover.assert_called_once()
 
@@ -524,7 +538,7 @@ def test_cmd_crop_reembeds_into_renamed_mp3(monkeypatch, app_settings):
     change_cover = Mock()
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     change_cover.assert_called_once()
     assert change_cover.call_args.args[1] == music / "Renamed.mp3"
@@ -1401,7 +1415,7 @@ def test_cmd_crop_reembeds_jpg_cover(monkeypatch, app_settings):
     change_cover = Mock()
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     change_cover.assert_called_once()
 
@@ -1417,7 +1431,7 @@ def test_cmd_crop_reembeds_webp_cover(monkeypatch, app_settings):
     change_cover = Mock()
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     change_cover.assert_called_once()
 
@@ -1430,7 +1444,7 @@ def test_cmd_crop_skips_corrupt_cover(monkeypatch, app_settings, capsys):
     change_cover = Mock()
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     change_cover.assert_not_called()
     assert "could not analyze" in capsys.readouterr().out
@@ -1500,7 +1514,7 @@ def test_cmd_crop_records_cropped_status(monkeypatch, app_settings):
     change_cover = Mock()
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] == "cropped"
     change_cover.assert_called_once()
@@ -1524,7 +1538,7 @@ def test_cmd_crop_scans_library_before_recording_status(monkeypatch, app_setting
     change_cover = Mock()
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] == "cropped"
     change_cover.assert_called_once()
@@ -1548,13 +1562,13 @@ def test_cmd_crop_records_false_positive(monkeypatch, app_settings, capsys):
     change_cover = Mock()
     monkeypatch.setattr(cli, "change_cover", change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     assert db.get_false_positives() == {"Artist-Song"}
     assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] == "false_positive"
     change_cover.assert_not_called()
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
     change_cover.assert_not_called()
     assert "No images to crop" in capsys.readouterr().out
 
@@ -1568,9 +1582,344 @@ def test_cmd_crop_records_not_pillarbox(monkeypatch, app_settings):
     (music / "Artist-Song.mp3").write_bytes(b"audio")
     db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] == "not_pillarbox"
+
+
+def test_cmd_crop_skips_unchanged_not_pillarbox(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (100, 100), "red").save(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    spy = Mock(side_effect=cli.is_image_pillarbox)
+    monkeypatch.setattr(cli, "is_image_pillarbox", spy)
+
+    cmd_crop(_crop_args())
+    cmd_crop(_crop_args())
+
+    assert spy.call_count == 1
+
+
+def test_cmd_crop_rescans_changed_cover(monkeypatch, app_settings):
+    import os
+
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    cover = covers / "Artist-Song.png"
+    Image.new("RGB", (100, 100), "red").save(cover)
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    spy = Mock(side_effect=cli.is_image_pillarbox)
+    monkeypatch.setattr(cli, "is_image_pillarbox", spy)
+
+    cmd_crop(_crop_args())
+    stat = cover.stat()
+    os.utime(cover, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    cmd_crop(_crop_args())
+
+    assert spy.call_count == 2
+
+
+def test_cmd_crop_does_not_rescan_cropped_cover(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+    spy = Mock(side_effect=cli.is_image_pillarbox)
+    monkeypatch.setattr(cli, "is_image_pillarbox", spy)
+
+    cmd_crop(_crop_args())
+    cmd_crop(_crop_args())
+
+    assert spy.call_count == 1
+    change_cover.assert_called_once()
+
+
+def test_cmd_crop_all_selects_every_cover(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "A-One.png")
+    make_pillarbox_png(covers / "B-Two.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "A-One.mp3").write_bytes(b"audio")
+    (music / "B-Two.mp3").write_bytes(b"audio")
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+    monkeypatch.setattr(
+        cli, "prompt_song_selection", Mock(side_effect=AssertionError("no prompt"))
+    )
+
+    cmd_crop(_crop_args())
+
+    assert change_cover.call_count == 2
+
+
+def test_cmd_crop_prompts_for_cover_range(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "A-One.png")
+    make_pillarbox_png(covers / "B-Two.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "A-One.mp3").write_bytes(b"audio")
+    (music / "B-Two.mp3").write_bytes(b"audio")
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+    prompt = Mock(return_value=[1])
+    monkeypatch.setattr(cli, "prompt_song_selection", prompt)
+
+    cmd_crop(_crop_args(all=False))
+
+    prompt.assert_called_once_with(2, noun="cover")
+    assert change_cover.call_count == 1
+
+
+def test_cmd_crop_search_filters_covers(monkeypatch, app_settings):
+    from types import SimpleNamespace
+
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Only-Song.png")
+    make_pillarbox_png(covers / "Other-Tune.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Only-Song.mp3").write_bytes(b"audio")
+    (music / "Other-Tune.mp3").write_bytes(b"audio")
+    db.insert_song(
+        song_uuid="uuid-only",
+        current_path="Only-Song.mp3",
+        title="Song",
+        artists="Only",
+    )
+    db.insert_song(
+        song_uuid="uuid-other",
+        current_path="Other-Tune.mp3",
+        title="Tune",
+        artists="Other",
+    )
+
+    songs = [
+        SimpleNamespace(
+            uuid="uuid-only",
+            current={"title": "Song", "album": "", "artists": "Only"},
+            path=Path("Only-Song.mp3"),
+        ),
+        SimpleNamespace(
+            uuid="uuid-other",
+            current={"title": "Tune", "album": "", "artists": "Other"},
+            path=Path("Other-Tune.mp3"),
+        ),
+    ]
+    monkeypatch.setattr(cli, "list_library_songs", lambda: songs)
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+
+    cmd_crop(_crop_args(search="Only"))
+
+    assert change_cover.call_count == 1
+    assert change_cover.call_args.args[1].name == "Only-Song.mp3"
+
+
+def test_cmd_crop_specific_filters_covers(monkeypatch, app_settings):
+    from types import SimpleNamespace
+
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Only-Song.png")
+    make_pillarbox_png(covers / "Other-Tune.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Only-Song.mp3").write_bytes(b"audio")
+    (music / "Other-Tune.mp3").write_bytes(b"audio")
+    db.insert_song(
+        song_uuid="uuid-only",
+        current_path="Only-Song.mp3",
+        title="Song",
+        artists="Only",
+    )
+    db.insert_song(
+        song_uuid="uuid-other",
+        current_path="Other-Tune.mp3",
+        title="Tune",
+        artists="Other",
+    )
+
+    song_only = SimpleNamespace(
+        uuid="uuid-only",
+        current={"title": "Song", "album": "Only", "artists": "Only"},
+        path=Path("Only-Song.mp3"),
+    )
+    song_other = SimpleNamespace(
+        uuid="uuid-other",
+        current={"title": "Tune", "album": "Other", "artists": "Other"},
+        path=Path("Other-Tune.mp3"),
+    )
+    monkeypatch.setattr(cli, "list_library_songs", lambda: [song_only, song_other])
+    monkeypatch.setattr(cli, "filter_specific", lambda songs, field: [song_only])
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+
+    cmd_crop(_crop_args(specific="album"))
+
+    assert change_cover.call_count == 1
+    assert change_cover.call_args.args[1].name == "Only-Song.mp3"
+
+
+def test_cmd_crop_auto_skips_prompt_and_false_positives(monkeypatch, app_settings):
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+    monkeypatch.setattr(
+        cli, "prompt_crop", Mock(side_effect=AssertionError("no crop prompt"))
+    )
+
+    cmd_crop(_crop_args(auto=True))
+
+    change_cover.assert_called_once()
+    assert db.get_false_positives() == set()
+
+
+def test_cmd_crop_dry_run_writes_nothing(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+    crop = Mock()
+    backup = Mock(return_value=True)
+    add_false_positive = Mock()
+    monkeypatch.setattr(cli, "crop_image_1_to_1", crop)
+    monkeypatch.setattr(cli, "backup_cover", backup)
+    monkeypatch.setattr(cli.db, "add_false_positive", add_false_positive)
+
+    cmd_crop(_crop_args(dry_run=True))
+
+    crop.assert_not_called()
+    backup.assert_not_called()
+    change_cover.assert_not_called()
+    add_false_positive.assert_not_called()
+    assert "Would crop" in capsys.readouterr().out
+    assert db.get_song_by_path("Artist-Song.mp3")[0]["cover_status"] is None
+
+
+def test_cmd_crop_json_report(monkeypatch, app_settings, capsys):
+
+    covers = app_settings.covers_folder
+    covers.mkdir(parents=True, exist_ok=True)
+    make_pillarbox_png(covers / "Artist-Song.png")
+    music = app_settings.music_folder
+    music.mkdir(parents=True, exist_ok=True)
+    (music / "Artist-Song.mp3").write_bytes(b"audio")
+    db.insert_song(current_path="Artist-Song.mp3", title="Song", artists="Artist")
+
+    change_cover = Mock()
+    _patch_crop_flow(monkeypatch, change_cover)
+
+    cmd_crop(_crop_args(auto=True, json=True))
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["selected"] == 1
+    assert report["cropped"] == 1
+    assert report["failed"] == 0
+    assert report["covers"][0]["cover"] == "Artist-Song"
+    assert report["covers"][0]["status"] == "cropped"
+
+
+def test_main_crop_auto_all_runs_without_tty(monkeypatch, app_settings, capsys):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_crop", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    cli.main(["crop", "--auto", "--all"])
+
+    assert len(calls) == 1
+    assert calls[0].auto is True
+    assert calls[0].all is True
+    assert "interactive terminal" not in capsys.readouterr().out
+
+
+def test_main_crop_all_without_auto_requires_tty(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["crop", "--all"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_crop_specific_requires_tty(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["crop", "--specific", "album", "--auto", "--all"])
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "interactive terminal" in captured.out + captured.err
+
+
+def test_main_crop_json_requires_auto_and_all(monkeypatch, capsys):
+    import smclipy.cli as cli
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["crop", "--json", "--all"])
+    assert exc.value.code == 2
+    assert "--json requires --auto and --all" in capsys.readouterr().err
 
 
 def test_main_dispatches_playlist(monkeypatch, app_settings):
@@ -1981,11 +2330,24 @@ def test_cli_parses_dedupe_flags(monkeypatch):
     monkeypatch.setattr(cli, "cmd_dedupe", lambda args: calls.append(args))
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
-    cli.main(["dedupe", "--dry-run", "--artists"])
+    cli.main(["dedupe", "--dry-run", "--artists", "--reset-skipped"])
 
     assert calls[0].dry_run is True
     assert calls[0].artists is True
     assert calls[0].albums is False
+    assert calls[0].reset_skipped is True
+
+
+def test_cli_parses_dedupe_group_albums_flag(monkeypatch):
+    import smclipy.cli as cli
+
+    calls = []
+    monkeypatch.setattr(cli, "cmd_dedupe", lambda args: calls.append(args))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    cli.main(["dedupe", "--group-albums"])
+
+    assert calls[0].group_albums is True
 
 
 def test_cli_dedupe_requires_tty(monkeypatch, capsys):
@@ -2035,7 +2397,7 @@ def test_cmd_crop_does_not_crop_when_backup_fails(monkeypatch, app_settings, cap
     monkeypatch.setattr(cli, "crop_image_1_to_1", crop)
     monkeypatch.setattr(cli, "backup_cover", lambda path: False)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     # Cropping is in place, so without a backup it must be skipped entirely.
     crop.assert_not_called()
@@ -2057,7 +2419,7 @@ def test_cmd_crop_does_not_record_cropped_when_reembed_fails(
     change_cover = Mock(return_value=False)
     _patch_crop_flow(monkeypatch, change_cover)
 
-    cmd_crop(argparse.Namespace())
+    cmd_crop(_crop_args())
 
     assert change_cover.call_count == 1
     assert "could not re-embed" in capsys.readouterr().out

@@ -12,6 +12,7 @@ import musicbrainzngs
 from PIL import Image as PILImage
 
 from smclipy import __version__
+from smclipy.matching import duration_rank, name_score, title_score
 
 _AGENT_CONFIGURED = False
 
@@ -69,6 +70,7 @@ class MusicBrainzMatch:
     recording_id: str
     release_group_id: str | None
     genre: str = ""
+    duration: float | None = None
 
 
 # Disambiguations and bracketed/suffixed title qualifiers mark alternate
@@ -197,6 +199,18 @@ def _release_details(
     return album, date, album_artist, track_number, release_group_id
 
 
+def _recording_duration(recording: dict[str, Any]) -> float | None:
+    """Playback length in seconds; MusicBrainz reports it in milliseconds."""
+    raw: Any = recording.get("length")
+    try:
+        milliseconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if milliseconds <= 0:
+        return None
+    return milliseconds / 1000.0
+
+
 def _match_from_recording(
     recording: dict[str, Any], album: str | None = None
 ) -> MusicBrainzMatch:
@@ -215,11 +229,24 @@ def _match_from_recording(
         track_number=track_number,
         recording_id=str(recording.get("id", "")),
         release_group_id=release_group_id,
+        duration=_recording_duration(recording),
     )
 
 
-def _rank_recording(recording: dict[str, Any]) -> tuple[int, int, int]:
-    """Rank an official studio recording above covers and live tracks."""
+def _rank_recording(
+    recording: dict[str, Any],
+    *,
+    title: str | None = None,
+    artists: list[str] | tuple[str, ...] = (),
+    album: str | None = None,
+    duration: float | None = None,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    """Rank recordings from a search, preferring the studio version of the song.
+
+    The key is ordered like the source-candidate ranking: version quality,
+    then length, artist/title similarity, and album match, with MusicBrainz's
+    own relevance score as the final tie-breaker.
+    """
     raw_score: Any = recording.get("ext:score", "") or ""
     try:
         score = int(str(raw_score))
@@ -227,15 +254,44 @@ def _rank_recording(recording: dict[str, Any]) -> tuple[int, int, int]:
         score = 0
     official: Literal[0, 1] = 1 if _has_official_release(recording) else 0
     score_part: int = score if official else max(0, score - 20)
-    title: str = str(recording.get("title", ""))
+    candidate_title: str = str(recording.get("title", ""))
     disambiguation: str = str(recording.get("disambiguation", ""))
     alternate_version: bool = bool(_ALT_VERSION_WORDS.search(disambiguation)) or any(
         _ALT_VERSION_WORDS.search(qualifier)
-        for qualifier in _ALT_VERSION_TAG.findall(title)
+        for qualifier in _ALT_VERSION_TAG.findall(candidate_title)
     )
     if alternate_version:
         score_part -= 20
-    return (score_part, official, score)
+    candidate_artists: list[str] = _artist_credit(recording)
+    artist_score: int = max(
+        (
+            name_score(wanted, candidate)
+            for wanted in artists
+            for candidate in candidate_artists
+        ),
+        default=0,
+    )
+    title_match: int = title_score(title, candidate_title) if title else 0
+    wanted_album: str = album.strip().casefold() if album else ""
+    album_match: int = (
+        1
+        if wanted_album
+        and any(
+            _release_matches_album(release, wanted_album)
+            for release in recording.get("release-list", [])
+        )
+        else 0
+    )
+    return (
+        1 if not alternate_version else 0,
+        official,
+        2 - duration_rank(_recording_duration(recording), duration),
+        artist_score,
+        title_match,
+        album_match,
+        score_part,
+        score,
+    )
 
 
 def _clean_query_value(value: str) -> str:
@@ -244,7 +300,12 @@ def _clean_query_value(value: str) -> str:
 
 
 def search_recordings(
-    title: str, artists: list[str], album: str | None = None, limit: int = _SEARCH_LIMIT
+    title: str,
+    artists: list[str],
+    album: str | None = None,
+    limit: int = _SEARCH_LIMIT,
+    *,
+    duration: float | None = None,
 ) -> list[MusicBrainzMatch]:
     """Search MusicBrainz for a recording and return ranked candidates."""
     _configure_agent()
@@ -270,7 +331,16 @@ def search_recordings(
             "The MusicBrainz web service could not be reached."
         ) from None
     recordings = result.get("recording-list", [])
-    recordings.sort(key=_rank_recording, reverse=True)
+    recordings.sort(
+        key=lambda recording: _rank_recording(
+            recording,
+            title=cleaned_title,
+            artists=artists,
+            album=album,
+            duration=duration,
+        ),
+        reverse=True,
+    )
     return [_match_from_recording(recording, album) for recording in recordings]
 
 

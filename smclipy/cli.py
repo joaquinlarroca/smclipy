@@ -3,9 +3,10 @@ import json
 import shlex
 import sys
 import uuid
-from contextlib import suppress
+from contextlib import nullcontext, redirect_stdout, suppress
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import smclipy.db as db
 from smclipy import __version__
@@ -62,15 +63,16 @@ from smclipy.playlists import (
     song_meta_from_entry,
 )
 from smclipy.restore import cmd_restore
-from smclipy.search import SPECIFIC_FIELDS
+from smclipy.search import SPECIFIC_FIELDS, filter_by_query, filter_specific
 from smclipy.stats import DEFAULT_TOP, cmd_stats
-from smclipy.tag import TAG_COVER_PREFIX, cmd_tag
+from smclipy.tag import TAG_COVER_PREFIX, cmd_tag, list_library_songs
 from smclipy.ui import (
     msg,
     prompt_album,
     prompt_authors,
     prompt_crop,
     prompt_resume,
+    prompt_song_selection,
     prompt_title,
     show_video_info,
 )
@@ -598,6 +600,47 @@ def _record_cover_status(
         db.log_event(song_uuid, "cover", {"status": status, "path": filename})
 
 
+_COVER_SETTLED_STATUSES = frozenset(
+    {db.COVER_STATUS_NOT_PILLARBOX, db.COVER_STATUS_CROPPED}
+)
+
+
+def _cover_scan_signature(file: Path) -> tuple[int, int] | None:
+    try:
+        stat = file.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _cover_scan_is_current(file: Path, scans: dict[str, tuple[int, int, str]]) -> bool:
+    """Whether an unchanged cover was already analyzed and needs no crop.
+
+    Size and mtime gate the cache so artwork replaced by a re-tag or a fresh
+    download is analyzed again instead of being silently skipped.
+    """
+    signature = _cover_scan_signature(file)
+    if signature is None:
+        return False
+    recorded = scans.get(file.stem)
+    return (
+        recorded is not None
+        and recorded[0] == signature[0]
+        and recorded[1] == signature[1]
+        and recorded[2] in _COVER_SETTLED_STATUSES
+    )
+
+
+def _record_cover_scan(
+    file: Path, status: str, scans: dict[str, tuple[int, int, str]]
+) -> None:
+    signature = _cover_scan_signature(file)
+    if signature is None:
+        return
+    scans[file.stem] = (signature[0], signature[1], status)
+    db.set_cover_scan(file.stem, signature[0], signature[1], status)
+
+
 def _crop_target_tracks(
     s: Settings, filename: str, *, index: dict[str, list[str]] | None = None
 ) -> list[Path]:
@@ -640,7 +683,77 @@ def _cover_overlaps_many_songs(filename: str, *, index: dict[str, list[str]]) ->
     return len(seen) > 1
 
 
-def cmd_crop(_args: argparse.Namespace) -> None:
+def _filter_covers(
+    cover_files: list[Path],
+    args: argparse.Namespace,
+    cover_uuids: dict[str, list[str]],
+) -> tuple[list[Path], bool]:
+    """Narrow covers by ``--search``/``--specific``, like tag/findsource.
+
+    A cover matches when its own name contains the search text (so covers whose
+    song is no longer tracked stay selectable) or when any song it maps to
+    matches. ``--specific`` first autocompletes an existing library value.
+    """
+    search_raw: object = getattr(args, "search", None)
+    specific_raw: object = getattr(args, "specific", None)
+    if search_raw is None and specific_raw is None:
+        return cover_files, False
+
+    query: str = ""
+    if search_raw is not None:
+        query = str(search_raw).strip()
+        if not query:
+            print("error: --search needs non-empty text.", file=sys.stderr)
+            raise SystemExit(2)
+
+    songs = list_library_songs()
+    matching = (
+        filter_specific(songs, str(specific_raw))
+        if specific_raw is not None
+        else filter_by_query(songs, query)
+    )
+    matching_uuids: set[str] = {song.uuid for song in matching if song.uuid is not None}
+
+    needle: str = query.casefold()
+    selected: list[Path] = []
+    for cover in cover_files:
+        stem_matches: bool = bool(needle) and needle in cover.stem.casefold()
+        mapped: set[str] = set(_song_uuids_for_cover(cover.stem, index=cover_uuids))
+        if stem_matches or mapped & matching_uuids:
+            selected.append(cover)
+
+    if not selected:
+        print("No covers match the given filter.")
+        return [], True
+    print(f"Showing {len(selected)} of {len(cover_files)} cover(s).")
+    return selected, True
+
+
+def _record_crop_report(
+    report: list[dict[str, Any]] | None,
+    filename: str,
+    status: str,
+    *,
+    tracks: list[str] | None = None,
+    error: str | None = None,
+) -> None:
+    if report is None:
+        return
+    entry: dict[str, Any] = {"cover": filename, "status": status}
+    if tracks:
+        entry["tracks"] = tracks
+    if error is not None:
+        entry["error"] = error
+    report.append(entry)
+
+
+def _run_crop(
+    args: argparse.Namespace,
+    *,
+    auto: bool,
+    dry_run: bool,
+    report: list[dict[str, Any]] | None,
+) -> dict[str, int]:
     s: Settings = init()
 
     print("Scanning music files...")
@@ -651,6 +764,7 @@ def cmd_crop(_args: argparse.Namespace) -> None:
     false_positives: set[str] = db.get_false_positives()
 
     cover_uuids: dict[str, list[str]] = _cover_to_song_uuids()
+    cover_scans: dict[str, tuple[int, int, str]] = db.list_cover_scans()
 
     print("Scanning images files...")
     cover_patterns = tuple(f"*{ext}" for ext in COVER_EXTENSIONS)
@@ -659,46 +773,99 @@ def cmd_crop(_args: argparse.Namespace) -> None:
         for file in s.covers_folder.glob(pattern):
             if not file.is_file() or file.stem.strip() in false_positives:
                 continue
+            if _cover_scan_is_current(file, cover_scans):
+                continue
             try:
                 if is_image_pillarbox(file):
                     cover_files.append(file)
-                else:
+                elif not dry_run:
                     _record_cover_status(
                         file.stem, db.COVER_STATUS_NOT_PILLARBOX, index=cover_uuids
                     )
+                    _record_cover_scan(file, db.COVER_STATUS_NOT_PILLARBOX, cover_scans)
             except Exception as exc:
                 print(f"Warning: could not analyze '{file.name}', skipping: {exc!r}")
 
+    cover_files, filtered = _filter_covers(cover_files, args, cover_uuids)
+
+    counts: dict[str, int] = {
+        "selected": 0,
+        "cropped": 0,
+        "false_positive": 0,
+        "would_crop": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
     if not cover_files:
         print("No images to crop...")
+        return counts
+
+    print("\nCovers to crop:" if filtered else "\nCovers found:")
+    for index, cover in enumerate(cover_files, start=1):
+        print(f"{index:3}. {cover.stem}")
+
+    select_all: bool = bool(getattr(args, "all", False))
+    if select_all:
+        selected: list[int] = list(range(len(cover_files)))
     else:
-        for cover in cover_files:
-            filename: str = cover.stem
-            try:
-                display_image(cover)
-                if not prompt_crop(default=True):
+        selected = prompt_song_selection(len(cover_files), noun="cover")
+    counts["selected"] = len(selected)
+
+    for position, index in enumerate(selected, start=1):
+        cover = cover_files[index]
+        filename: str = cover.stem
+        status: str = "skipped"
+        track_names: list[str] = []
+        try:
+            targets: list[Path] = _crop_target_tracks(s, filename, index=cover_uuids)
+            track_names = [track.name for track in targets]
+            ambiguous: bool = _cover_overlaps_many_songs(filename, index=cover_uuids)
+            if dry_run:
+                print(f"[{position}/{len(selected)}] Would crop '{cover.name}'.")
+                if ambiguous:
+                    print(
+                        f"{filename}: cover matches multiple different songs, "
+                        "would skip re-embed"
+                    )
+                elif track_names:
+                    print(f"    re-embed into: {', '.join(track_names)}")
+                else:
+                    print(f"{filename}: track not found, would skip re-embed")
+                status = "would_crop"
+                counts["would_crop"] += 1
+            else:
+                if not auto:
+                    display_image(cover)
+                if not auto and not prompt_crop(default=True):
                     false_positives.add(filename)
                     db.add_false_positive(filename)
                     _record_cover_status(
                         filename, db.COVER_STATUS_FALSE_POSITIVE, index=cover_uuids
                     )
+                    status = "false_positive"
+                    counts["false_positive"] += 1
                 elif not backup_cover(cover):
                     # Cropping is in place; without a backup a bad crop would
                     # destroy the only copy of the artwork.
                     print(
                         f"Warning: could not back up '{cover.name}', not cropping it."
                     )
+                    status = "backup_failed"
+                    counts["skipped"] += 1
                 else:
                     crop_image_1_to_1(cover)
-                    targets: list[Path] = _crop_target_tracks(
-                        s, filename, index=cover_uuids
-                    )
+                    # The image is square now; remember it before the
+                    # re-embed so a later failure does not cause a rescan.
+                    _record_cover_scan(cover, db.COVER_STATUS_CROPPED, cover_scans)
+                    counts["cropped"] += 1
+                    status = "cropped"
                     reembed_failed: bool = False
-                    if _cover_overlaps_many_songs(filename, index=cover_uuids):
+                    if ambiguous:
                         print(
                             f"{filename}: cover matches multiple different songs, "
                             "skipping re-embed"
                         )
+                        status = "multi_song"
                     elif targets:
                         for track_file in targets:
                             snapshot_song(
@@ -710,17 +877,60 @@ def cmd_crop(_args: argparse.Namespace) -> None:
                                     "Warning: could not re-embed the cropped cover "
                                     f"into '{track_file.name}'."
                                 )
+                        if reembed_failed:
+                            status = "reembed_failed"
                     else:
                         print(f"{filename}: track not found, skipping cover re-embed")
-                    if not reembed_failed:
+                        status = "no_track"
+                    if reembed_failed:
+                        counts["failed"] += 1
+                    else:
                         # The songs don't have the cropped art when the embed
                         # failed, so recording "cropped" would be misleading.
                         _record_cover_status(
                             filename, db.COVER_STATUS_CROPPED, index=cover_uuids
                         )
-            except Exception as exc:
-                print(f"Warning: could not process '{filename}': {exc!r}")
+        except Exception as exc:
+            print(f"Warning: could not process '{filename}': {exc!r}")
+            counts["failed"] += 1
+            _record_crop_report(
+                report, filename, "error", tracks=track_names, error=repr(exc)
+            )
             print("\n\n")
+            continue
+        _record_crop_report(report, filename, status, tracks=track_names)
+        print("\n\n")
+
+    return counts
+
+
+def cmd_crop(args: argparse.Namespace) -> None:
+    auto: bool = bool(getattr(args, "auto", False))
+    as_json: bool = bool(getattr(args, "json", False))
+    dry_run: bool = bool(getattr(args, "dry_run", False))
+
+    report: list[dict[str, Any]] | None = [] if as_json else None
+    counts: dict[str, int]
+    with redirect_stdout(sys.stderr) if as_json else nullcontext():
+        counts = _run_crop(args, auto=auto, dry_run=dry_run, report=report)
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "selected": counts["selected"],
+                    "cropped": counts["cropped"],
+                    "false_positive": counts["false_positive"],
+                    "would_crop": counts["would_crop"],
+                    "skipped": counts["skipped"],
+                    "failed": counts["failed"],
+                    "covers": report or [],
+                },
+                indent=2,
+            )
+        )
+        if counts["failed"]:
+            raise SystemExit(1)
 
 
 def cmd_directories(args: argparse.Namespace) -> None:
@@ -789,7 +999,7 @@ def cmd_update(args: argparse.Namespace) -> None:
 
 
 _TTY_REQUIRED_COMMANDS: frozenset[str] = frozenset(
-    {"download", "crop", "tag", "findsource", "modify", "dedupe", "restore"}
+    {"download", "tag", "findsource", "modify", "dedupe", "restore"}
 )
 _TTY_REQUIRED_PLAYLIST_ACTIONS: frozenset[str] = frozenset({"add", "remove", "move"})
 
@@ -805,7 +1015,7 @@ def _requires_tty(args: argparse.Namespace) -> bool:
         if getattr(args, "batch", None) or getattr(args, "file", None):
             return not headless
         return True
-    if args.command in ("tag", "findsource"):
+    if args.command in ("tag", "findsource", "crop"):
         if getattr(args, "specific", None):
             # The autocomplete prompt always needs a terminal, even alongside
             # --auto --all.
@@ -850,11 +1060,16 @@ def main(argv: list[str] | None = None) -> None:
             "  smclipy modify --file playlist.json  Edit exported playlist entries\n"
             "  smclipy dedupe     Merge differently styled artist/album names\n"
             "  smclipy dedupe --albums  Only merge album spellings\n"
+            "  smclipy dedupe --group-albums  Group an author's songs under one album\n"
             "  smclipy dedupe --dry-run  Preview a merge without writing\n"
             "  smclipy restore    Roll back a song to an earlier tag backup\n"
             "  smclipy restore --all  Show every recorded restore point\n"
             "  smclipy restore --limit 5  Show only the newest 5 restore points\n"
             "  smclipy crop       Crop pillarboxed cover images and re-embed them\n"
+            "  smclipy crop --search TEXT  Only crop covers matching TEXT\n"
+            "  smclipy crop --specific album  Autocomplete an album, then crop it\n"
+            "  smclipy crop --dry-run  Preview the covers without cropping\n"
+            "  smclipy crop --auto --all  Headless crop of every pillarboxed cover\n"
             "  smclipy update     Rescan the library and sync the tracking database\n"
             "  smclipy update --json  Machine-readable scan report on stdout\n"
             "  smclipy stats      Totals, playtime, top albums and artists\n"
@@ -933,12 +1148,72 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
 
-    subparsers.add_parser(
+    crop_parser: argparse.ArgumentParser = subparsers.add_parser(
         "crop",
         help="Crop pillarboxed cover images and re-embed them.",
         description=(
-            "Scan saved cover images for pillarboxing, crop them to a 1:1 ratio "
-            "interactively, and re-embed each result into its matching audio file."
+            "Scan saved cover images for pillarboxing, crop them to a 1:1 ratio, "
+            "and re-embed each result into its matching audio file. By default "
+            "the pillarboxed covers are listed so you can pick a range; --all "
+            "selects every one. Use --search or --specific to narrow the list "
+            "by song metadata, and --auto --all to crop a whole selection "
+            "without any interactive prompts."
+        ),
+    )
+    crop_parser.add_argument(
+        "-a",
+        "--auto",
+        action="store_true",
+        help=(
+            "Crop every selected cover without asking the per-cover crop "
+            "question. Combine with --all to run without an interactive "
+            "terminal."
+        ),
+    )
+    crop_parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Crop every pillarboxed cover instead of asking for a range. "
+            "Combine with --auto to run without an interactive terminal."
+        ),
+    )
+    crop_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Show the covers that would be cropped and the tracks that would "
+            "receive them, without writing anything."
+        ),
+    )
+    crop_parser.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help=(
+            "Print a machine-readable JSON report to stdout while human "
+            "messages go to stderr. Requires --auto --all (headless crop). "
+            "Exits with status 1 when any cover failed."
+        ),
+    )
+    crop_filter = crop_parser.add_mutually_exclusive_group()
+    crop_filter.add_argument(
+        "--search",
+        metavar="TEXT",
+        help=(
+            "Only process covers whose name, or whose matching song's title, "
+            "album, or any artist, contains TEXT (case-insensitive). Combine "
+            "with --auto --all for a headless crop of the matches."
+        ),
+    )
+    crop_filter.add_argument(
+        "--specific",
+        choices=SPECIFIC_FIELDS,
+        metavar="FIELD",
+        help=(
+            "Autocomplete the library's existing FIELD values (title, album, "
+            "or artists) and only process covers matching the chosen value. "
+            "Needs an interactive terminal."
         ),
     )
 
@@ -951,9 +1226,13 @@ def main(argv: list[str] | None = None) -> None:
             "release date, genre, track number, album artist, and cover art changes."
         ),
         epilog=(
-            "Metadata is provided by MusicBrainz (core data is CC0, supplementary "
-            "data and docs are CC BY-NC-SA 3.0; https://musicbrainz.org ), and "
-            "cover art is served by the Cover Art Archive (coverartarchive.org)."
+            "Matches are ranked by official studio status, then matching length, "
+            "artist/title similarity, and album match, with MusicBrainz relevance "
+            "as the final tie-breaker; same-length results are highlighted in the "
+            "picker. Metadata is provided by MusicBrainz (core data is CC0, "
+            "supplementary data and docs are CC BY-NC-SA 3.0; "
+            "https://musicbrainz.org ), and cover art is served by the Cover Art "
+            "Archive (coverartarchive.org)."
         ),
     )
     tag_mode: argparse._MutuallyExclusiveGroup = (
@@ -1211,10 +1490,18 @@ def main(argv: list[str] | None = None) -> None:
         help="Merge differently formatted artist and album names.",
         description=(
             "Find artist and album names that differ only by case or spacing "
-            "(for example 'Artist', 'artist', and 'a r t i s t'), pick the "
-            "spelling to keep for each group, then rewrite the tags, the "
-            "artist-title filenames, matching cover images, and the tracking "
-            "database. Nothing is written until every group has been reviewed."
+            "(for example 'Artist', 'artist', and 'a r t i s t'). Album names "
+            "also ignore trailing bracketed qualifiers such as 'Album (test)', "
+            "while part/disc/volume/live/remix markers keep albums distinct. "
+            "Album groups are scoped by album artist (falling back to the first "
+            "song artist), so same-named albums by different artists stay "
+            "separate. Pick the spelling to keep for each group, then rewrite "
+            "the tags, "
+            "the artist-title filenames, matching cover images, and the "
+            "tracking database. Groups you skip are remembered so later runs "
+            "do not ask again (use --reset-skipped to review them). Nothing is "
+            "written until every group has been reviewed. Use --group-albums "
+            "to instead pick an author, choose songs, and set their album."
         ),
     )
     dedupe_parser.add_argument(
@@ -1228,11 +1515,28 @@ def main(argv: list[str] | None = None) -> None:
         help="Only look for album names (default: artists and albums).",
     )
     dedupe_parser.add_argument(
+        "--group-albums",
+        action="store_true",
+        help=(
+            "Interactively pick an author, multi-select that author's songs, "
+            "then set them all to one album name (replaces the automatic "
+            "group review for this run)."
+        ),
+    )
+    dedupe_parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
             "Show the planned tag, filename, cover, and database changes "
             "without writing anything."
+        ),
+    )
+    dedupe_parser.add_argument(
+        "--reset-skipped",
+        action="store_true",
+        help=(
+            "Forget groups skipped on previous runs and offer them again. "
+            "Skipped groups stay hidden by default until their spellings change."
         ),
     )
 
@@ -1493,13 +1797,17 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("the following arguments are required: command")
 
     if (
-        args.command in ("tag", "findsource")
+        args.command in ("tag", "findsource", "crop")
         and getattr(args, "json", False)
         and not (
             bool(getattr(args, "auto", False)) and bool(getattr(args, "all", False))
         )
     ):
-        action = "retag" if args.command == "tag" else "source search"
+        action = {
+            "tag": "retag",
+            "findsource": "source search",
+            "crop": "crop",
+        }[args.command]
         parser.error(f"--json requires --auto and --all (run a headless {action})")
 
     if (
